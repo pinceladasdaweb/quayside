@@ -43,13 +43,28 @@ app.post('/payments', async (req, res) => {
 - **Exactly-once effect.** The first `execute` for a key atomically writes an `in-progress` record — that write *is* the lock. Success stores the serialized result for `resultTtl`; every later call replays it.
 - **Two TTLs, not one.** `lockTtl` (default 30s) bounds crash recovery: if the process dies mid-flight, the key unblocks when the lock expires. `resultTtl` (default 24h) is the replay window. Long-running functions can heartbeat with `ctx.extend()`.
 - **Fencing tokens.** Storage transitions (`complete`, `release`, `extend`) are fenced: a holder that lost its lock cannot overwrite the new holder's result — its late write fails with `FencingError`.
-- **Failures are not idempotent** by default: a rejection deletes the record and retries run fresh. `persistFailures: true` opts into storing and replaying the error (for non-retryable business failures).
+- **Failures are not idempotent** by default: a rejection deletes the record and retries run fresh. `persistFailures: true` opts into storing and replaying the error (for non-retryable business failures). A replayed failure is a reconstruction that preserves `name`, `message`, `stack`, own enumerable properties (`code`, `statusCode`, ...) and the `cause` chain — check `error.code`/fields on replay, not `instanceof`.
+- **Payload fingerprints validate intent.** Pass `payload` alongside the key and quayside hashes it canonically (key-order, machine and locale independent): the same key with a different payload fails with `IdempotencyKeyReuseError` instead of silently replaying a result for another request.
+- **No client key? Derive one.** `execute({ payload }, fn)` derives the key from the canonical payload hash — ideal for queue consumers — with `ignoreFields`/`pickFields` to exclude volatile fields (timestamps, request ids). The explicit key stays the primary mechanism; derivation is an opt-in convenience.
+- **Key hygiene.** Namespace and key segments are percent-encoded before composition (a client-supplied key can never impersonate another namespace) and composed keys longer than `maxKeyLength` (default 512) are rejected — never truncated, because truncation is a silent collision.
 - **Concurrency is a policy.** `onConflict: 'reject'` (default) throws `ConcurrentExecutionError` immediately; `'wait'` blocks until the winner finishes and replays its outcome, bounded by `waitTimeout`.
-- **Fail closed.** If the storage is unreachable the call throws `StorageUnavailableError` instead of running without the guarantee.
+- **Fail closed.** If the storage is unreachable the call throws `StorageUnavailableError` instead of running without the guarantee. `onStorageError: 'open'` opts into availability instead: the function runs unguarded and every bypass emits a `storage-bypass` event.
 
 ## API sketch
 
 ```ts
+// payload fingerprint: same key + different body => IdempotencyKeyReuseError
+await idempotency.execute(
+  { key: req.headers['idempotency-key'] as string, payload: req.body },
+  () => createPayment(req.body)
+)
+
+// no client key: derive it from the payload (consumers, jobs)
+await idempotency.execute(
+  { payload: message.value, ignoreFields: ['meta.timestamp', 'requestId'] },
+  () => processOrder(message.value)
+)
+
 // decorate once, call everywhere
 const createOnce = idempotency.wrap(createPayment, {
   key: (input) => `payment:${input.invoiceId}`

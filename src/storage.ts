@@ -9,6 +9,7 @@ export type RecordStatus = (typeof RECORD_STATUS)[keyof typeof RECORD_STATUS]
 export interface PendingRecord {
   key: string
   token: string
+  fingerprint?: string
   storedAt: number
 }
 
@@ -20,6 +21,7 @@ export interface StoredRecord {
   key: string
   token: string
   status: RecordStatus
+  fingerprint?: string
   result?: string
   error?: string
   storedAt: number

@@ -146,6 +146,19 @@ export function runStorageContract (name: string, createStorage: StorageFactory)
       )
     })
 
+    test('acquire stores the fingerprint and it survives completion', async () => {
+      const storage = await createStorage()
+      const fingerprint = 'f'.repeat(64)
+      await storage.acquire({ ...pending('k1'), fingerprint }, 1_000)
+      const held = await storage.get('k1')
+      assert.ok(held)
+      assert.equal(held.fingerprint, fingerprint)
+      await storage.complete('k1', 'token-1', { status: 'completed', result: '"ok"' }, 1_000)
+      const completed = await storage.get('k1')
+      assert.ok(completed)
+      assert.equal(completed.fingerprint, fingerprint)
+    })
+
     test('delete removes the record unconditionally', async () => {
       const storage = await createStorage()
       await storage.acquire(pending('k1'), 1_000)

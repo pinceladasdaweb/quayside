@@ -51,7 +51,10 @@ export type ExecuteFunction<T> = (ctx: ExecutionContext) => T | Promise<T>;
 //
 // @public (undocumented)
 export type ExecuteInput = string | {
-    key: string;
+    key?: string;
+    payload?: unknown;
+    ignoreFields?: string[];
+    pickFields?: string[];
 };
 
 // Warning: (ae-missing-release-tag) "ExecutionContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -127,7 +130,7 @@ export interface IdempotencyEvent {
 // Warning: (ae-missing-release-tag) "IdempotencyEventType" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
-export type IdempotencyEventType = 'acquired' | 'replayed' | 'conflict' | 'completed' | 'failed' | 'expired-recovery';
+export type IdempotencyEventType = 'acquired' | 'replayed' | 'conflict' | 'completed' | 'failed' | 'expired-recovery' | 'storage-bypass';
 
 // Warning: (ae-missing-release-tag) "IdempotencyKeyReuseError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -147,12 +150,14 @@ export interface IdempotencyOptions {
     // (undocumented)
     codec?: Codec;
     lockTtl?: Duration;
+    maxKeyLength?: number;
     // (undocumented)
     metrics?: MetricsCollector;
     namespace?: string;
     onConflict?: 'reject' | 'wait';
     // (undocumented)
     onEvent?(event: IdempotencyEvent): void;
+    onStorageError?: 'closed' | 'open';
     persistFailures?: boolean;
     resultTtl?: Duration;
     // (undocumented)
@@ -212,6 +217,8 @@ export interface MetricsCollector {
     onFailed?(event: IdempotencyEvent): void;
     // (undocumented)
     onReplayed?(event: IdempotencyEvent): void;
+    // (undocumented)
+    onStorageBypass?(event: IdempotencyEvent): void;
 }
 
 // Warning: (ae-missing-release-tag) "Outcome" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -234,6 +241,8 @@ export function parseDuration(duration: Duration): number;
 //
 // @public (undocumented)
 export interface PendingRecord {
+    // (undocumented)
+    fingerprint?: string;
     // (undocumented)
     key: string;
     // (undocumented)
@@ -296,6 +305,8 @@ export interface StoredRecord {
     error?: string;
     // (undocumented)
     expiresAt: number;
+    // (undocumented)
+    fingerprint?: string;
     // (undocumented)
     key: string;
     // (undocumented)

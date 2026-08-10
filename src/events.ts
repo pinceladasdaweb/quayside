@@ -5,6 +5,7 @@ export type IdempotencyEventType =
   | 'completed'
   | 'failed'
   | 'expired-recovery'
+  | 'storage-bypass'
 
 export interface IdempotencyEvent {
   type: IdempotencyEventType
@@ -21,6 +22,7 @@ export interface MetricsCollector {
   onCompleted? (event: IdempotencyEvent): void
   onFailed? (event: IdempotencyEvent): void
   onExpiredRecovery? (event: IdempotencyEvent): void
+  onStorageBypass? (event: IdempotencyEvent): void
 }
 
 export const METRIC_HANDLERS = {
@@ -29,5 +31,6 @@ export const METRIC_HANDLERS = {
   conflict: 'onConflict',
   completed: 'onCompleted',
   failed: 'onFailed',
-  'expired-recovery': 'onExpiredRecovery'
+  'expired-recovery': 'onExpiredRecovery',
+  'storage-bypass': 'onStorageBypass'
 } as const satisfies Record<IdempotencyEventType, keyof MetricsCollector>

@@ -23,6 +23,7 @@ export class MemoryStorage implements IdempotencyStorage {
       key: record.key,
       token: record.token,
       status: RECORD_STATUS.inProgress,
+      fingerprint: record.fingerprint,
       storedAt: record.storedAt,
       expiresAt: Date.now() + lockTtlMs
     })

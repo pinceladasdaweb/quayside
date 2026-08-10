@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 
+import { fingerprintsEqual, hashCanonical } from './canonical'
 import { jsonCodec, type Codec } from './codec'
 import { parseDuration, type Duration } from './duration'
 import {
   ConcurrentExecutionError,
+  IdempotencyKeyReuseError,
   QuaysideError,
   StorageUnavailableError,
   WaitTimeoutError
@@ -12,7 +14,21 @@ import {
 import { METRIC_HANDLERS, type IdempotencyEvent, type IdempotencyEventType, type MetricsCollector } from './events'
 import { RECORD_STATUS, type IdempotencyStorage, type RecordStatus, type StoredRecord } from './storage'
 
-export type ExecuteInput = string | { key: string }
+export type ExecuteInput =
+  | string
+  | {
+    /** Explicit intent key. Optional only when a payload derives one. */
+    key?: string
+    /**
+     * Fingerprinted to validate key reuse; when no key is given, the
+     * canonical hash of the payload becomes the key (opt-in convenience).
+     */
+    payload?: unknown
+    /** Dot-separated payload paths excluded from the fingerprint. */
+    ignoreFields?: string[]
+    /** Dot-separated payload paths that alone form the fingerprint. */
+    pickFields?: string[]
+  }
 
 export interface ExecutionContext {
   key: string
@@ -54,31 +70,87 @@ export interface IdempotencyOptions {
   waitTimeout?: Duration
   /** Key prefix that isolates domains sharing one storage. */
   namespace?: string
+  /** Maximum length of the composed storage key; longer keys are rejected. Default: 512. */
+  maxKeyLength?: number
   codec?: Codec
   /** Store and replay failures instead of allowing retries. Default: false. */
   persistFailures?: boolean
+  /**
+   * 'closed' (default) refuses to run when the storage is unavailable.
+   * 'open' runs without the exactly-once guarantee and emits a
+   * 'storage-bypass' event for every unguarded execution.
+   */
+  onStorageError?: 'closed' | 'open'
   onEvent? (event: IdempotencyEvent): void
   metrics?: MetricsCollector
 }
 
-function encodeErrorValue (error: unknown): string {
-  if (error instanceof Error) {
-    return JSON.stringify({ name: error.name, message: error.message, stack: error.stack })
+interface SerializedError {
+  name: string
+  message: string
+  stack?: string
+  properties?: Record<string, unknown>
+  cause?: SerializedError
+}
+
+const ERROR_CORE_FIELDS = new Set(['name', 'message', 'stack', 'cause'])
+const MAX_CAUSE_DEPTH = 5
+
+function serializeError (error: unknown, depth = 0): SerializedError {
+  if (!(error instanceof Error)) {
+    let message: string
+    try {
+      message = String(error)
+    } catch {
+      message = 'unknown failure'
+    }
+    return { name: 'Error', message }
   }
-  return JSON.stringify({ name: 'Error', message: String(error) })
+  const serialized: SerializedError = { name: error.name, message: error.message }
+  if (typeof error.stack === 'string') serialized.stack = error.stack
+  const properties: Record<string, unknown> = {}
+  for (const field of Object.keys(error)) {
+    if (ERROR_CORE_FIELDS.has(field)) continue
+    // Best-effort: a property that does not survive JSON is dropped; the
+    // failure path must never raise a serialization error that masks the
+    // original failure.
+    try {
+      properties[field] = JSON.parse(JSON.stringify((error as unknown as Record<string, unknown>)[field]))
+    } catch {}
+  }
+  if (Object.keys(properties).length > 0) serialized.properties = properties
+  if (error.cause !== undefined && depth < MAX_CAUSE_DEPTH) {
+    serialized.cause = serializeError(error.cause, depth + 1)
+  }
+  return serialized
+}
+
+function encodeErrorValue (error: unknown): string {
+  try {
+    return JSON.stringify(serializeError(error))
+  } catch {
+    return JSON.stringify({ name: 'Error', message: 'failure could not be serialized' })
+  }
+}
+
+function reviveError (serialized: SerializedError): Error {
+  const options: ErrorOptions = {}
+  if (serialized.cause !== undefined) options.cause = reviveError(serialized.cause)
+  const error = new Error(serialized.message, options)
+  error.name = serialized.name
+  if (serialized.stack !== undefined) error.stack = serialized.stack
+  if (serialized.properties !== undefined) Object.assign(error, serialized.properties)
+  return error
 }
 
 function decodeErrorValue (encoded: string): Error {
-  let parsed: { name?: string, message?: string, stack?: string }
+  let parsed: SerializedError
   try {
-    parsed = JSON.parse(encoded) as { name?: string, message?: string, stack?: string }
+    parsed = JSON.parse(encoded) as SerializedError
   } catch {
-    parsed = { message: encoded }
+    parsed = { name: 'Error', message: encoded }
   }
-  const error = new Error(parsed.message ?? 'replayed failure')
-  if (parsed.name !== undefined) error.name = parsed.name
-  if (parsed.stack !== undefined) error.stack = parsed.stack
-  return error
+  return reviveError(parsed)
 }
 
 export class Idempotency {
@@ -88,8 +160,10 @@ export class Idempotency {
   private readonly onConflict: 'reject' | 'wait'
   private readonly waitTimeoutMs: number
   private readonly namespace: string | undefined
+  private readonly maxKeyLength: number
   private readonly codec: Codec
   private readonly persistFailures: boolean
+  private readonly onStorageError: 'closed' | 'open'
   private readonly onEvent: ((event: IdempotencyEvent) => void) | undefined
   private readonly metrics: MetricsCollector | undefined
 
@@ -100,8 +174,10 @@ export class Idempotency {
     this.onConflict = options.onConflict ?? 'reject'
     this.waitTimeoutMs = parseDuration(options.waitTimeout ?? '10s')
     this.namespace = options.namespace
+    this.maxKeyLength = options.maxKeyLength ?? 512
     this.codec = options.codec ?? jsonCodec
     this.persistFailures = options.persistFailures ?? false
+    this.onStorageError = options.onStorageError ?? 'closed'
     this.onEvent = options.onEvent
     this.metrics = options.metrics
   }
@@ -147,14 +223,27 @@ export class Idempotency {
     fn: ExecuteFunction<T>,
     correlationId: string
   ): Promise<ExecutionResult<T>> {
-    const key = this.normalizeKey(typeof input === 'string' ? input : input.key)
+    const { key, fingerprint } = this.resolveTarget(input)
     const storageKey = this.composeKey(key)
     const token = randomUUID()
-    const pending = { key: storageKey, token, storedAt: Date.now() }
+    const pending = { key: storageKey, token, fingerprint, storedAt: Date.now() }
 
-    const existing = await this.storageCall(() => this.storage.acquire(pending, this.lockTtlMs))
+    let existing: StoredRecord | null
+    try {
+      existing = await this.storageCall(() => this.storage.acquire(pending, this.lockTtlMs))
+    } catch (error) {
+      if (error instanceof StorageUnavailableError && this.onStorageError === 'open') {
+        return this.runUnguarded(key, fn, correlationId)
+      }
+      throw error
+    }
+
     if (existing === null) {
       return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId)
+    }
+
+    if (!fingerprintsEqual(existing.fingerprint, fingerprint)) {
+      throw new IdempotencyKeyReuseError(key)
     }
 
     if (existing.status === RECORD_STATUS.completed) {
@@ -213,9 +302,39 @@ export class Idempotency {
       throw error
     }
 
-    await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, this.resultTtlMs))
+    try {
+      await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, this.resultTtlMs))
+    } catch (error) {
+      if (error instanceof StorageUnavailableError && this.onStorageError === 'open') {
+        // The function already ran; in fail-open mode the caller gets its
+        // result even though it could not be stored for replay.
+        this.emit('storage-bypass', key, correlationId)
+        return { value, replayed: false, storedAt }
+      }
+      this.emit('failed', key, correlationId)
+      throw error
+    }
     this.emit('completed', key, correlationId)
     return { value, replayed: false, storedAt }
+  }
+
+  // Fail-open execution: the storage is unreachable and the instance opted
+  // into availability over the exactly-once guarantee. Nothing is locked or
+  // stored; every bypassed execution is observable via 'storage-bypass'.
+  private async runUnguarded<T> (
+    key: string,
+    fn: ExecuteFunction<T>,
+    correlationId: string
+  ): Promise<ExecutionResult<T>> {
+    this.emit('storage-bypass', key, correlationId)
+    const controller = new AbortController()
+    const value = await fn({
+      key,
+      replayed: false,
+      signal: controller.signal,
+      extend: async () => {}
+    })
+    return { value, replayed: false, storedAt: Date.now() }
   }
 
   private async waitForOutcome<T> (
@@ -270,6 +389,27 @@ export class Idempotency {
     }
   }
 
+  private resolveTarget (input: ExecuteInput): { key: string, fingerprint?: string } {
+    if (typeof input === 'string') {
+      return { key: this.normalizeKey(input) }
+    }
+    const { key, payload, ignoreFields, pickFields } = input
+    if (ignoreFields !== undefined && pickFields !== undefined) {
+      throw new TypeError('ignoreFields and pickFields are mutually exclusive')
+    }
+    if ((ignoreFields !== undefined || pickFields !== undefined) && payload === undefined) {
+      throw new TypeError('ignoreFields and pickFields require a payload')
+    }
+    const fingerprint = payload === undefined ? undefined : hashCanonical(payload, { ignoreFields, pickFields })
+    if (key !== undefined) {
+      return { key: this.normalizeKey(key), fingerprint }
+    }
+    if (fingerprint === undefined) {
+      throw new TypeError('an idempotency key or a payload to derive one from is required')
+    }
+    return { key: fingerprint, fingerprint }
+  }
+
   private async storageCall<T> (operation: () => Promise<T>): Promise<T> {
     try {
       return await operation()
@@ -290,8 +430,19 @@ export class Idempotency {
     return key
   }
 
+  // Segments are percent-encoded before composition so a client-supplied
+  // key can never inject the separator and impersonate another namespace;
+  // oversized keys are rejected, never truncated (truncation is a silent
+  // collision).
   private composeKey (key: string): string {
-    return this.namespace === undefined ? key : `${this.namespace}:${key}`
+    const encodedKey = encodeURIComponent(key)
+    const composed = this.namespace === undefined
+      ? encodedKey
+      : `${encodeURIComponent(this.namespace)}:${encodedKey}`
+    if (composed.length > this.maxKeyLength) {
+      throw new TypeError(`composed idempotency key is ${composed.length} characters long and exceeds maxKeyLength (${this.maxKeyLength})`)
+    }
+    return composed
   }
 
   private emit (type: IdempotencyEventType, key: string, correlationId: string): void {

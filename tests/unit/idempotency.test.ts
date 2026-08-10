@@ -196,6 +196,32 @@ describe('Idempotency failures', () => {
     assert.equal(calls, 1)
   })
 
+  test('replayed failures preserve own properties and the cause chain', async () => {
+    const idempotency = instance({ persistFailures: true })
+    const fn = async () => {
+      const cause = new Error('insufficient funds')
+      const error = new Error('card declined') as Error & { code: string, statusCode: number, skipped?: () => void }
+      error.name = 'PaymentDeclinedError'
+      error.code = 'CARD_DECLINED'
+      error.statusCode = 402
+      error.skipped = () => 1
+      error.cause = cause
+      throw error
+    }
+    await assert.rejects(idempotency.execute('k', fn), /card declined/)
+    await assert.rejects(idempotency.execute('k', fn), (error: unknown) => {
+      const replayed = error as Error & { code?: string, statusCode?: number, skipped?: unknown }
+      assert.ok(replayed instanceof Error)
+      assert.equal(replayed.name, 'PaymentDeclinedError')
+      assert.equal(replayed.code, 'CARD_DECLINED')
+      assert.equal(replayed.statusCode, 402)
+      assert.equal(replayed.skipped, undefined)
+      assert.ok(replayed.cause instanceof Error)
+      assert.equal((replayed.cause as Error).message, 'insufficient funds')
+      return true
+    })
+  })
+
   test('a non-serializable result surfaces SerializationError and releases the key', async () => {
     const idempotency = instance()
     let calls = 0
