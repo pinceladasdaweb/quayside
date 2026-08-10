@@ -29,7 +29,7 @@ The core knows nothing about HTTP: REST handlers, queue consumers, cron jobs, wo
 ## Requirements
 
 - Node.js >= 22
-- ESM only
+- Ships both ESM and CJS builds
 
 ## License
 
