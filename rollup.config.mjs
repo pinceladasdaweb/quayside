@@ -5,17 +5,27 @@ import { dts } from 'rollup-plugin-dts'
 // the library's own source (deps, node builtins) stays external.
 const external = (id) => !id.startsWith('.') && !id.startsWith('/')
 
-// One pair of configs per public entry point (storage and framework
-// adapters will each add their own pair as they land).
-const entry = (input, name) => [
+// A subpath entry that uses core RUNTIME (the storage adapters throw the
+// core error classes) must import the shipped core bundle, never carry a
+// private copy: instanceof checks on the error taxonomy have to hold across
+// entry points. Types are not affected; the dts bundles keep inlining,
+// interfaces have no identity.
+const CORE_SPECIFIER = '../index'
+const corePaths = (format) => (id) =>
+  id.endsWith('/src/index') || id === CORE_SPECIFIER ? (format === 'es' ? './index.mjs' : './index.cjs') : id
+
+// One pair of configs per public entry point. Each subpath bundles its own
+// tree; `core: true` is the exception above: the code bundle then imports
+// the core entry instead of duplicating it.
+const entry = (input, name, { core = false } = {}) => [
   {
     input,
     output: [
-      { file: `dist/${name}.cjs`, format: 'cjs', exports: 'named' },
-      { file: `dist/${name}.mjs`, format: 'es', exports: 'named' }
+      { file: `dist/${name}.cjs`, format: 'cjs', exports: 'named', ...(core && { paths: corePaths('cjs') }) },
+      { file: `dist/${name}.mjs`, format: 'es', exports: 'named', ...(core && { paths: corePaths('es') }) }
     ],
     plugins: [typescript({ include: ['src/**/*.ts'] })],
-    external
+    external: core ? (id) => external(id) || id === CORE_SPECIFIER : external
   },
   {
     input,
@@ -32,5 +42,6 @@ const entry = (input, name) => [
 ]
 
 export default [
-  ...entry('src/index.ts', 'index')
+  ...entry('src/index.ts', 'index'),
+  ...entry('src/memory/index.ts', 'memory', { core: true })
 ]

@@ -4,6 +4,329 @@
 
 ```ts
 
+// Warning: (ae-missing-release-tag) "Codec" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface Codec {
+    // (undocumented)
+    decode(encoded: string): unknown;
+    // (undocumented)
+    encode(value: unknown): string;
+}
+
+// Warning: (ae-missing-release-tag) "ConcurrentExecutionError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class ConcurrentExecutionError extends QuaysideError {
+    constructor(key: string);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.inProgress;
+    // (undocumented)
+    readonly key: string;
+}
+
+// Warning: (ae-missing-release-tag) "Duration" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type Duration = number | string;
+
+// Warning: (ae-missing-release-tag) "ERROR_CODES" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export const ERROR_CODES: {
+    readonly inProgress: "IDEMPOTENCY_IN_PROGRESS";
+    readonly keyReuse: "IDEMPOTENCY_KEY_REUSE";
+    readonly waitTimeout: "IDEMPOTENCY_WAIT_TIMEOUT";
+    readonly fencing: "IDEMPOTENCY_FENCING";
+    readonly serialization: "IDEMPOTENCY_SERIALIZATION";
+    readonly storageUnavailable: "IDEMPOTENCY_STORAGE_UNAVAILABLE";
+};
+
+// Warning: (ae-missing-release-tag) "ExecuteFunction" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type ExecuteFunction<T> = (ctx: ExecutionContext) => T | Promise<T>;
+
+// Warning: (ae-missing-release-tag) "ExecuteInput" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type ExecuteInput = string | {
+    key: string;
+};
+
+// Warning: (ae-missing-release-tag) "ExecutionContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface ExecutionContext {
+    // (undocumented)
+    extend(ttl?: Duration): Promise<void>;
+    // (undocumented)
+    key: string;
+    // (undocumented)
+    replayed: boolean;
+    // (undocumented)
+    signal: AbortSignal;
+}
+
+// Warning: (ae-missing-release-tag) "ExecutionResult" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface ExecutionResult<T> {
+    // (undocumented)
+    replayed: boolean;
+    // (undocumented)
+    storedAt: number;
+    // (undocumented)
+    value: T;
+}
+
+// Warning: (ae-missing-release-tag) "FencingError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class FencingError extends QuaysideError {
+    constructor(key: string);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.fencing;
+    // (undocumented)
+    readonly key: string;
+}
+
+// Warning: (ae-missing-release-tag) "Idempotency" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class Idempotency {
+    constructor(options: IdempotencyOptions);
+    // (undocumented)
+    execute<T>(input: ExecuteInput, fn: ExecuteFunction<T>): Promise<T>;
+    // (undocumented)
+    executeWithMetadata<T>(input: ExecuteInput, fn: ExecuteFunction<T>): Promise<ExecutionResult<T>>;
+    // (undocumented)
+    get(key: string): Promise<IdempotencyRecord | null>;
+    // (undocumented)
+    invalidate(key: string): Promise<void>;
+    // (undocumented)
+    wrap<TArgs extends unknown[], TResult>(fn: (...args: TArgs) => TResult | Promise<TResult>, options: WrapOptions<TArgs>): (...args: TArgs) => Promise<TResult>;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyEvent" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface IdempotencyEvent {
+    // (undocumented)
+    correlationId: string;
+    // (undocumented)
+    key: string;
+    // (undocumented)
+    namespace?: string;
+    // (undocumented)
+    timestamp: number;
+    // (undocumented)
+    type: IdempotencyEventType;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyEventType" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type IdempotencyEventType = 'acquired' | 'replayed' | 'conflict' | 'completed' | 'failed' | 'expired-recovery';
+
+// Warning: (ae-missing-release-tag) "IdempotencyKeyReuseError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class IdempotencyKeyReuseError extends QuaysideError {
+    constructor(key: string);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.keyReuse;
+    // (undocumented)
+    readonly key: string;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface IdempotencyOptions {
+    // (undocumented)
+    codec?: Codec;
+    lockTtl?: Duration;
+    // (undocumented)
+    metrics?: MetricsCollector;
+    namespace?: string;
+    onConflict?: 'reject' | 'wait';
+    // (undocumented)
+    onEvent?(event: IdempotencyEvent): void;
+    persistFailures?: boolean;
+    resultTtl?: Duration;
+    // (undocumented)
+    storage: IdempotencyStorage;
+    waitTimeout?: Duration;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyRecord" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface IdempotencyRecord {
+    // (undocumented)
+    error?: Error;
+    // (undocumented)
+    expiresAt: number;
+    // (undocumented)
+    key: string;
+    // (undocumented)
+    status: RecordStatus;
+    // (undocumented)
+    storedAt: number;
+    // (undocumented)
+    value?: unknown;
+}
+
+// Warning: (ae-missing-release-tag) "IdempotencyStorage" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface IdempotencyStorage {
+    acquire(record: PendingRecord, lockTtlMs: number): Promise<StoredRecord | null>;
+    complete(key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void>;
+    delete(key: string): Promise<void>;
+    extend(key: string, token: string, lockTtlMs: number): Promise<void>;
+    // (undocumented)
+    get(key: string): Promise<StoredRecord | null>;
+    release(key: string, token: string): Promise<void>;
+}
+
+// Warning: (ae-missing-release-tag) "jsonCodec" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export const jsonCodec: Codec;
+
+// Warning: (ae-missing-release-tag) "MetricsCollector" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface MetricsCollector {
+    // (undocumented)
+    onAcquired?(event: IdempotencyEvent): void;
+    // (undocumented)
+    onCompleted?(event: IdempotencyEvent): void;
+    // (undocumented)
+    onConflict?(event: IdempotencyEvent): void;
+    // (undocumented)
+    onExpiredRecovery?(event: IdempotencyEvent): void;
+    // (undocumented)
+    onFailed?(event: IdempotencyEvent): void;
+    // (undocumented)
+    onReplayed?(event: IdempotencyEvent): void;
+}
+
+// Warning: (ae-missing-release-tag) "Outcome" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type Outcome = {
+    status: 'completed';
+    result: string;
+} | {
+    status: 'failed';
+    error: string;
+};
+
+// Warning: (ae-missing-release-tag) "parseDuration" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export function parseDuration(duration: Duration): number;
+
+// Warning: (ae-missing-release-tag) "PendingRecord" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface PendingRecord {
+    // (undocumented)
+    key: string;
+    // (undocumented)
+    storedAt: number;
+    // (undocumented)
+    token: string;
+}
+
+// Warning: (ae-missing-release-tag) "QuaysideError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class QuaysideError extends Error {
+    constructor(code: QuaysideErrorCode, message: string, options?: ErrorOptions);
+    // (undocumented)
+    readonly code: QuaysideErrorCode;
+}
+
+// Warning: (ae-missing-release-tag) "QuaysideErrorCode" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type QuaysideErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+// Warning: (ae-missing-release-tag) "RECORD_STATUS" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export const RECORD_STATUS: {
+    readonly inProgress: "in-progress";
+    readonly completed: "completed";
+    readonly failed: "failed";
+};
+
+// Warning: (ae-missing-release-tag) "RecordStatus" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export type RecordStatus = (typeof RECORD_STATUS)[keyof typeof RECORD_STATUS];
+
+// Warning: (ae-missing-release-tag) "SerializationError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class SerializationError extends QuaysideError {
+    constructor(message: string, options?: ErrorOptions);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.serialization;
+}
+
+// Warning: (ae-missing-release-tag) "StorageUnavailableError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class StorageUnavailableError extends QuaysideError {
+    constructor(message: string, options?: ErrorOptions);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.storageUnavailable;
+}
+
+// Warning: (ae-missing-release-tag) "StoredRecord" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface StoredRecord {
+    // (undocumented)
+    error?: string;
+    // (undocumented)
+    expiresAt: number;
+    // (undocumented)
+    key: string;
+    // (undocumented)
+    result?: string;
+    // (undocumented)
+    status: RecordStatus;
+    // (undocumented)
+    storedAt: number;
+    // (undocumented)
+    token: string;
+}
+
+// Warning: (ae-missing-release-tag) "WaitTimeoutError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export class WaitTimeoutError extends QuaysideError {
+    constructor(key: string, waitTimeoutMs: number);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.waitTimeout;
+    // (undocumented)
+    readonly key: string;
+}
+
+// Warning: (ae-missing-release-tag) "WrapOptions" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public (undocumented)
+export interface WrapOptions<TArgs extends unknown[]> {
+    // (undocumented)
+    key(...args: TArgs): string;
+}
+
 // (No @packageDocumentation comment for this package)
 
 ```

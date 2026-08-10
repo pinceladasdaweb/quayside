@@ -1,9 +1,14 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-describe('package entry point', () => {
-  test('loads as an ES module', async () => {
+describe('package entry points', () => {
+  test('core entry exposes the Idempotency class', async () => {
     const entry = await import('../../src/index')
-    assert.ok(entry)
+    assert.equal(typeof entry.Idempotency, 'function')
+  })
+
+  test('memory entry exposes the MemoryStorage adapter', async () => {
+    const entry = await import('../../src/memory/index')
+    assert.equal(typeof entry.MemoryStorage, 'function')
   })
 })

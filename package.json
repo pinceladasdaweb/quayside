@@ -16,6 +16,23 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    },
+    "./memory": {
+      "import": {
+        "types": "./dist/memory.d.ts",
+        "default": "./dist/memory.mjs"
+      },
+      "require": {
+        "types": "./dist/memory.d.cts",
+        "default": "./dist/memory.cjs"
+      }
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "memory": [
+        "dist/memory.d.ts"
+      ]
     }
   },
   "files": [
