@@ -26,12 +26,25 @@
         "types": "./dist/memory.d.cts",
         "default": "./dist/memory.cjs"
       }
+    },
+    "./redis": {
+      "import": {
+        "types": "./dist/redis.d.ts",
+        "default": "./dist/redis.mjs"
+      },
+      "require": {
+        "types": "./dist/redis.d.cts",
+        "default": "./dist/redis.cjs"
+      }
     }
   },
   "typesVersions": {
     "*": {
       "memory": [
         "dist/memory.d.ts"
+      ],
+      "redis": [
+        "dist/redis.d.ts"
       ]
     }
   },
@@ -86,6 +99,8 @@
     "@commitlint/cli": "^21.2.1",
     "@commitlint/config-conventional": "^21.2.0",
     "@microsoft/api-extractor": "^7.58.12",
+    "@pinceladasdaweb/redis": "^4.0.0",
+    "ioredis": "^6.0.0",
     "@rollup/plugin-typescript": "^12.3.0",
     "@types/node": "^26.1.1",
     "eslint": "^9.39.5",

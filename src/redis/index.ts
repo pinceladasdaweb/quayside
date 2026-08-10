@@ -1,0 +1,324 @@
+import { setTimeout as sleep } from 'node:timers/promises'
+
+// Runtime values come from the core entry point, never from deep module
+// paths: error identity (instanceof) must hold across entry points, so the
+// build maps '../index' onto the shipped core bundle instead of inlining a
+// private copy.
+import { FencingError, RECORD_STATUS } from '../index'
+import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
+
+/**
+ * Minimal ioredis-shaped command surface. Structural on purpose: any
+ * ioredis instance (standalone, sentinel or cluster) satisfies it without
+ * quayside declaring a dependency on a specific driver version.
+ */
+export interface RedisCommandClient {
+  options?: { db?: number, keyPrefix?: string }
+  set (key: string, value: string, px: 'PX', ttlMs: number, nx: 'NX'): Promise<'OK' | null>
+  get (key: string): Promise<string | null>
+  del (...keys: string[]): Promise<number>
+  eval (script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>
+  duplicate? (): RedisSubscriberClient
+}
+
+export interface RedisSubscriberClient {
+  subscribe (...channels: string[]): Promise<unknown>
+  unsubscribe (...channels: string[]): Promise<unknown>
+  on (event: 'message', listener: (channel: string, message: string) => void): unknown
+  quit (): Promise<unknown>
+  disconnect? (): void
+}
+
+/**
+ * The `@pinceladasdaweb/redis` RedisClient shape: raw driver behind
+ * `.client`, pub/sub on a dedicated connection that survives reconnects.
+ */
+export interface ManagedRedisClient {
+  client: RedisCommandClient | null
+  subscribe (channel: string, handler?: (message: string, channel: string, pattern?: string) => void | Promise<void>): Promise<unknown>
+  unsubscribe (channel: string): Promise<unknown>
+}
+
+export type RedisStorageClient = RedisCommandClient | ManagedRedisClient
+
+export interface RedisStorageOptions {
+  /**
+   * Use keyspace notifications to wake waiters early (requires
+   * `notify-keyspace-events` to include `K$gx` on the server; without it
+   * waiters simply fall back to polling). Default: true.
+   */
+  subscribe?: boolean
+}
+
+// The stored value is one JSON string per key so `SET NX PX` is the whole
+// acquire. Timestamps travel as strings because the fenced transitions
+// re-encode the record with cjson inside Lua, and cjson's number precision
+// must never be able to corrupt an epoch.
+interface WireRecord {
+  token: string
+  status: string
+  fingerprint?: string
+  result?: string
+  error?: string
+  storedAt: string
+  expiresAt: string
+}
+
+const FENCED_HEADER = `local current = redis.call('GET', KEYS[1])
+if not current then return 0 end
+local record = cjson.decode(current)
+if record.token ~= ARGV[1] or record.status ~= 'in-progress' then return 0 end`
+
+const COMPLETE_SCRIPT = `${FENCED_HEADER}
+record.status = ARGV[2]
+if ARGV[2] == 'completed' then record.result = ARGV[3] else record.error = ARGV[3] end
+record.expiresAt = ARGV[4]
+redis.call('SET', KEYS[1], cjson.encode(record), 'PX', ARGV[5])
+return 1`
+
+const RELEASE_SCRIPT = `${FENCED_HEADER}
+redis.call('DEL', KEYS[1])
+return 1`
+
+const EXTEND_SCRIPT = `${FENCED_HEADER}
+record.expiresAt = ARGV[2]
+redis.call('SET', KEYS[1], cjson.encode(record), 'PX', ARGV[3])
+return 1`
+
+const VALID_STATUS = new Set<string>(Object.values(RECORD_STATUS))
+const MAX_ACQUIRE_ATTEMPTS = 5
+
+function isManagedClient (client: RedisStorageClient): client is ManagedRedisClient {
+  return 'client' in client && typeof (client as { client: unknown }).client !== 'function'
+}
+
+function parseWireRecord (key: string, raw: string): StoredRecord {
+  const wire = JSON.parse(raw) as Partial<WireRecord>
+  if (typeof wire.token !== 'string' || typeof wire.status !== 'string' || !VALID_STATUS.has(wire.status)) {
+    throw new Error(`corrupt idempotency record under key "${key}"`)
+  }
+  const record: StoredRecord = {
+    key,
+    token: wire.token,
+    status: wire.status as RecordStatus,
+    storedAt: Number(wire.storedAt),
+    expiresAt: Number(wire.expiresAt)
+  }
+  if (typeof wire.fingerprint === 'string') record.fingerprint = wire.fingerprint
+  if (typeof wire.result === 'string') record.result = wire.result
+  if (typeof wire.error === 'string') record.error = wire.error
+  return record
+}
+
+/**
+ * Redis storage adapter: `SET NX PX` acquire (the atomic write is the
+ * lock) and Lua-fenced complete/release/extend, so every transition is
+ * atomic on the server and a stale holder can never overwrite a newer
+ * execution. Single-instance/cluster `SET NX` is the documented guarantee;
+ * this is not Redlock.
+ */
+export class RedisStorage implements IdempotencyStorage {
+  private readonly managed: ManagedRedisClient | undefined
+  private readonly rawClient: RedisCommandClient | undefined
+  private subscribeEnabled: boolean
+  private ownedSubscriber: RedisSubscriberClient | undefined
+  private readonly subscribedChannels = new Map<string, Promise<unknown>>()
+  private readonly waiters = new Map<string, Set<() => void>>()
+
+  constructor (client: RedisStorageClient, options: RedisStorageOptions = {}) {
+    if (isManagedClient(client)) {
+      this.managed = client
+    } else {
+      this.rawClient = client
+    }
+    this.subscribeEnabled = options.subscribe ?? true
+  }
+
+  async acquire (record: PendingRecord, lockTtlMs: number): Promise<StoredRecord | null> {
+    const wire: WireRecord = {
+      token: record.token,
+      status: RECORD_STATUS.inProgress,
+      storedAt: String(record.storedAt),
+      expiresAt: String(Date.now() + lockTtlMs)
+    }
+    if (record.fingerprint !== undefined) wire.fingerprint = record.fingerprint
+    const encoded = JSON.stringify(wire)
+    for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt += 1) {
+      const outcome = await this.raw().set(record.key, encoded, 'PX', lockTtlMs, 'NX')
+      if (outcome === 'OK') return null
+      const current = await this.raw().get(record.key)
+      if (current !== null) return parseWireRecord(record.key, current)
+      // The holder expired between SET NX and GET: contend again.
+    }
+    throw new Error(`could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+  }
+
+  async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
+    const payload = outcome.status === 'completed' ? outcome.result : outcome.error
+    const applied = await this.raw().eval(
+      COMPLETE_SCRIPT, 1, key,
+      token, outcome.status, payload, String(Date.now() + resultTtlMs), resultTtlMs
+    )
+    if (applied !== 1) throw new FencingError(key)
+  }
+
+  async release (key: string, token: string): Promise<void> {
+    const applied = await this.raw().eval(RELEASE_SCRIPT, 1, key, token)
+    if (applied !== 1) throw new FencingError(key)
+  }
+
+  async extend (key: string, token: string, lockTtlMs: number): Promise<void> {
+    const applied = await this.raw().eval(
+      EXTEND_SCRIPT, 1, key,
+      token, String(Date.now() + lockTtlMs), lockTtlMs
+    )
+    if (applied !== 1) throw new FencingError(key)
+  }
+
+  async get (key: string): Promise<StoredRecord | null> {
+    const current = await this.raw().get(key)
+    return current === null ? null : parseWireRecord(key, current)
+  }
+
+  async delete (key: string): Promise<void> {
+    await this.raw().del(key)
+  }
+
+  async waitForChange (key: string, timeoutMs: number): Promise<void> {
+    if (!this.subscribeEnabled) {
+      await sleep(timeoutMs)
+      return
+    }
+    let channel: string
+    try {
+      channel = await this.ensureSubscribed(key)
+    } catch {
+      // No subscription support (no duplicate(), subscribe refused):
+      // degrade permanently to plain polling.
+      this.subscribeEnabled = false
+      await sleep(timeoutMs)
+      return
+    }
+    await new Promise<void>((resolve) => {
+      const waiter = (): void => {
+        clearTimeout(timer)
+        this.waiters.get(channel)?.delete(waiter)
+        resolve()
+      }
+      const timer = setTimeout(waiter, timeoutMs)
+      let channelWaiters = this.waiters.get(channel)
+      if (channelWaiters === undefined) {
+        channelWaiters = new Set()
+        this.waiters.set(channel, channelWaiters)
+      }
+      channelWaiters.add(waiter)
+    })
+    this.releaseChannel(channel).catch(() => {})
+  }
+
+  /** Unsubscribes and disposes any subscriber connection this adapter owns. */
+  async close (): Promise<void> {
+    for (const waiterSet of this.waiters.values()) {
+      for (const waiter of [...waiterSet]) waiter()
+    }
+    this.waiters.clear()
+    const channels = [...this.subscribedChannels.keys()]
+    this.subscribedChannels.clear()
+    if (this.ownedSubscriber !== undefined) {
+      const subscriber = this.ownedSubscriber
+      this.ownedSubscriber = undefined
+      try {
+        await subscriber.quit()
+      } catch {
+        subscriber.disconnect?.()
+      }
+      return
+    }
+    if (this.managed !== undefined) {
+      for (const channel of channels) {
+        try {
+          await this.managed.unsubscribe(channel)
+        } catch {}
+      }
+    }
+  }
+
+  private raw (): RedisCommandClient {
+    if (this.managed !== undefined) {
+      const client = this.managed.client
+      if (client === null) {
+        throw new Error('the RedisClient is not connected; call connect() before using RedisStorage')
+      }
+      return client
+    }
+    return this.rawClient as RedisCommandClient
+  }
+
+  private channelFor (key: string): string {
+    const options = this.raw().options
+    const db = options?.db ?? 0
+    const prefix = options?.keyPrefix ?? ''
+    return `__keyspace@${db}__:${prefix}${key}`
+  }
+
+  private async ensureSubscribed (key: string): Promise<string> {
+    const channel = this.channelFor(key)
+    let subscription = this.subscribedChannels.get(channel)
+    if (subscription === undefined) {
+      subscription = this.subscribeTo(channel)
+      this.subscribedChannels.set(channel, subscription)
+    }
+    try {
+      await subscription
+    } catch (error) {
+      this.subscribedChannels.delete(channel)
+      throw error
+    }
+    return channel
+  }
+
+  private async subscribeTo (channel: string): Promise<unknown> {
+    if (this.managed !== undefined) {
+      return this.managed.subscribe(channel, (_message, notified) => {
+        this.notify(notified ?? channel)
+      })
+    }
+    const subscriber = this.subscriber()
+    return subscriber.subscribe(channel)
+  }
+
+  private subscriber (): RedisSubscriberClient {
+    if (this.ownedSubscriber !== undefined) return this.ownedSubscriber
+    const raw = this.raw()
+    if (typeof raw.duplicate !== 'function') {
+      throw new Error('this client cannot open a subscriber connection')
+    }
+    const subscriber = raw.duplicate()
+    subscriber.on('message', (channel) => {
+      this.notify(channel)
+    })
+    this.ownedSubscriber = subscriber
+    return subscriber
+  }
+
+  private notify (channel: string): void {
+    const channelWaiters = this.waiters.get(channel)
+    if (channelWaiters === undefined) return
+    for (const waiter of [...channelWaiters]) waiter()
+  }
+
+  private async releaseChannel (channel: string): Promise<void> {
+    if ((this.waiters.get(channel)?.size ?? 0) > 0) return
+    this.waiters.delete(channel)
+    if (!this.subscribedChannels.delete(channel)) return
+    try {
+      if (this.managed !== undefined) {
+        await this.managed.unsubscribe(channel)
+      } else if (this.ownedSubscriber !== undefined) {
+        await this.ownedSubscriber.unsubscribe(channel)
+      }
+    } catch {
+      // Best-effort: a failed unsubscribe only costs an idle subscription.
+    }
+  }
+}

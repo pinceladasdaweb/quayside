@@ -43,5 +43,6 @@ const entry = (input, name, { core = false } = {}) => [
 
 export default [
   ...entry('src/index.ts', 'index'),
-  ...entry('src/memory/index.ts', 'memory', { core: true })
+  ...entry('src/memory/index.ts', 'memory', { core: true }),
+  ...entry('src/redis/index.ts', 'redis', { core: true })
 ]

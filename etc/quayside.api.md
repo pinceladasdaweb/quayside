@@ -194,6 +194,7 @@ export interface IdempotencyStorage {
     // (undocumented)
     get(key: string): Promise<StoredRecord | null>;
     release(key: string, token: string): Promise<void>;
+    waitForChange?(key: string, timeoutMs: number): Promise<void>;
 }
 
 // Warning: (ae-missing-release-tag) "jsonCodec" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)

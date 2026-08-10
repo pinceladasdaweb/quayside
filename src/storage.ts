@@ -40,4 +40,11 @@ export interface IdempotencyStorage {
   get (key: string): Promise<StoredRecord | null>
   /** Unfenced delete (invalidate). */
   delete (key: string): Promise<void>
+  /**
+   * Optional low-latency wait: resolves when the record under `key` may
+   * have changed, or after `timeoutMs`, whichever comes first. Purely an
+   * optimization for the 'wait' conflict policy; correctness never depends
+   * on it, because the caller always re-reads the record after waking.
+   */
+  waitForChange? (key: string, timeoutMs: number): Promise<void>
 }

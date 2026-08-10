@@ -364,7 +364,18 @@ export class Idempotency {
       if (remaining <= 0) {
         throw new WaitTimeoutError(key, this.waitTimeoutMs)
       }
-      await sleep(Math.min(delay, remaining))
+      const pause = Math.min(delay, remaining)
+      if (typeof this.storage.waitForChange === 'function') {
+        // Storage-assisted wake-up with the polling pause as its upper
+        // bound; a broken notification channel degrades to plain polling.
+        try {
+          await this.storage.waitForChange(storageKey, pause)
+        } catch {
+          await sleep(pause)
+        }
+      } else {
+        await sleep(pause)
+      }
       delay = Math.min(delay * 2, 1_000)
     }
   }

@@ -4,7 +4,7 @@
 
 Generic idempotency for Node.js: execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.
 
-**Status: under construction.** The core engine and the in-memory storage are implemented; Redis/SQL storage and HTTP framework adapters are on the way.
+**Status: under construction.** The core engine plus the in-memory and Redis storages are implemented; SQL storage and HTTP framework adapters are on the way.
 
 ## Quick start
 
@@ -86,6 +86,22 @@ new Idempotency({
 ```
 
 All errors extend `QuaysideError` and carry a stable `code` (`IDEMPOTENCY_IN_PROGRESS`, `IDEMPOTENCY_WAIT_TIMEOUT`, `IDEMPOTENCY_FENCING`, ...), so callers can map them without string-matching messages.
+
+## Storage
+
+```ts
+import { MemoryStorage } from 'quayside/memory'   // tests and development
+import { RedisStorage } from 'quayside/redis'     // production
+
+// Bring your own client: any ioredis instance works, and so does a
+// @pinceladasdaweb/redis RedisClient (its dedicated pub/sub connection is
+// used for low-latency waits automatically).
+const storage = new RedisStorage(new Redis())
+```
+
+The Redis adapter acquires with `SET NX PX` — the atomic write *is* the lock — and runs every fenced transition (`complete`, `release`, `extend`) as a Lua script on the server, so a stale holder can never overwrite a newer execution. `onConflict: 'wait'` wakes waiters through keyspace notifications when the server has `notify-keyspace-events` covering `K$gx`, and falls back to polling with exponential backoff when it does not. Every adapter passes the same storage-contract suite against a real server (Testcontainers), including a server-side `CLIENT KILL` mid-execution and a `SIGKILL` crash-recovery case.
+
+Composing [breakwater](https://github.com/pinceladasdaweb/breakwater) resilience policies around storage calls is a documented recipe: see [docs/breakwater.md](docs/breakwater.md).
 
 ## Requirements
 
