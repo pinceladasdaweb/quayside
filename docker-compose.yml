@@ -1,0 +1,14 @@
+services:
+  redis:
+    image: redis:8-alpine
+    # K$$gx (escaped $) = keyspace channel + string commands + generic
+    # commands + expired events: everything quayside's low-latency wait
+    # path listens for. Without it the library still works (polling).
+    command: redis-server --notify-keyspace-events K$$gx
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 5

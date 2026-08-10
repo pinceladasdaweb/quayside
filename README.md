@@ -108,6 +108,20 @@ Composing [breakwater](https://github.com/pinceladasdaweb/breakwater) resilience
 - Node.js >= 22
 - Ships both ESM and CJS builds
 
+## Development
+
+```bash
+npm install
+npm test                  # unit tests, no external services needed
+npm run test:integration  # spins up real backends via Testcontainers (needs Docker)
+```
+
+To experiment against a local Redis (keyspace notifications already enabled):
+
+```bash
+docker compose up -d
+```
+
 ## License
 
 [MIT](LICENSE)
