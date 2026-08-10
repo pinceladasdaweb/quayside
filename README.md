@@ -116,12 +116,6 @@ npm test                  # unit tests, no external services needed
 npm run test:integration  # spins up real backends via Testcontainers (needs Docker)
 ```
 
-To experiment against a local Redis (keyspace notifications already enabled):
-
-```bash
-docker compose up -d
-```
-
 ## License
 
 [MIT](LICENSE)
