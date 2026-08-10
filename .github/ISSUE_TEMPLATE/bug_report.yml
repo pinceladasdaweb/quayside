@@ -1,0 +1,61 @@
+name: Bug report
+description: Something behaves differently from what the README promises
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Correctness bugs are the ones this library cares about most. If yours
+        involves a duplicate execution, a lost result or a crash mid-flight,
+        the details of *when* each call started and how the process or the
+        connection died are usually the whole bug — please include them.
+
+  - type: input
+    id: version
+    attributes:
+      label: Library version
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: runtime
+    attributes:
+      label: Node.js version and storage backend
+      placeholder: Node 22.11.0, quayside/redis on Redis 8 (docker)
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: Quote the README or the types if it documents the behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Include the full error with its stable `code` if it is a QuaysideError, and whether the function ran zero, one or more times.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The smallest snippet that shows it. Include the constructor options — `lockTtl`, `resultTtl`, `onConflict` and `namespace` in particular.
+      render: typescript
+    validations:
+      required: true
+
+  - type: textarea
+    id: interruption
+    attributes:
+      label: How the execution was interrupted (if relevant)
+      description: |
+        For example: process killed mid-flight, storage connection dropped,
+        lock expired under a long-running function, two workers racing the
+        same key. Skip if everything stayed up.

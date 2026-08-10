@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose an option, a storage adapter or a behavior
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The core primitive is deliberately small: `execute(key, fn)` plus a
+        pluggable storage contract. Framework adapters are protocol sugar and
+        storage adapters implement one shared contract — a feature earns its
+        place when it removes a correctness footgun, not when it wraps
+        something already reachable.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The use case, not the proposed API.
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What does it look like today?
+      description: Show how you solve it with the current API (custom storage, wrap, events), and what is awkward about that.
+      render: typescript
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: |
+        Keep it consistent with what is there: options objects, `??` for
+        defaults so zero survives, errors with a stable `code`, nothing
+        HTTP-shaped in the core.
+      render: typescript
