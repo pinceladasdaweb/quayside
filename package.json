@@ -1,0 +1,82 @@
+{
+  "name": "quayside",
+  "version": "0.0.0",
+  "description": "Generic idempotency for Node.js — execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "rollup -c rollup.config.mjs",
+    "hooks": "git config core.hooksPath .hooks",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "prepack": "npm run build",
+    "test": "node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
+    "test:coverage": "node --import tsx --experimental-test-coverage --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
+    "test:integration": "node --import tsx --test --test-timeout=120000 'tests/integration/**/*.test.ts'",
+    "check:types": "tsc --noEmit",
+    "check:types:next": "node node_modules/typescript7/bin/tsc --noEmit",
+    "api:update": "npm run build && api-extractor run --local",
+    "api:check": "npm run build && api-extractor run"
+  },
+  "keywords": [
+    "idempotency",
+    "idempotent",
+    "exactly-once",
+    "deduplication",
+    "idempotency-key",
+    "distributed-lock",
+    "fencing-token",
+    "redis",
+    "postgres",
+    "mysql"
+  ],
+  "author": "Pedro Rogério",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pinceladasdaweb/quayside.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pinceladasdaweb/quayside/issues"
+  },
+  "homepage": "https://github.com/pinceladasdaweb/quayside#readme",
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.2.1",
+    "@commitlint/config-conventional": "^21.2.0",
+    "@microsoft/api-extractor": "^7.58.12",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@types/node": "^26.1.1",
+    "eslint": "^9.39.5",
+    "lint-staged": "^17.2.0",
+    "neostandard": "^0.13.0",
+    "rollup": "^4.62.2",
+    "rollup-plugin-dts": "^6.4.1",
+    "testcontainers": "^11.12.0",
+    "tslib": "^2.8.1",
+    "tsx": "^4.23.1",
+    "typescript": "^6.0.3",
+    "typescript7": "npm:typescript@^7.0.2"
+  },
+  "lint-staged": {
+    "src/**/*.ts": "eslint",
+    "tests/**/*.ts": "eslint"
+  },
+  "sideEffects": false
+}

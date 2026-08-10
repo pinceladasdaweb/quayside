@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - development
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint, test & build (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24, 26]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run check:types
+
+      # The published .d.ts is read by both compilers, so both must agree on
+      # it. TypeScript 7 runs alongside rather than replacing 6: the tooling
+      # that consumes the compiler API (typescript-eslint, the rollup
+      # plugins) needs 6 until the 7.x programmatic API is stable.
+      - name: Type check (TypeScript 7)
+        run: npm run check:types:next
+
+      - name: Unit tests (with coverage)
+        run: npm run test:coverage
+
+      - name: Build
+        run: npm run build
+
+      # The public API is frozen: the build fails when exports drift from
+      # the committed API report (etc/quayside.api.md).
+      - name: API report check
+        run: npx api-extractor run
+
+  integration:
+    name: Integration tests (Testcontainers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Integration tests
+        run: npm run test:integration
