@@ -221,7 +221,8 @@ export class Idempotency {
   private async run<T> (
     input: ExecuteInput,
     fn: ExecuteFunction<T>,
-    correlationId: string
+    correlationId: string,
+    startedAt: number = Date.now()
   ): Promise<ExecutionResult<T>> {
     const { key, fingerprint } = this.resolveTarget(input)
     const storageKey = this.composeKey(key)
@@ -239,7 +240,7 @@ export class Idempotency {
     }
 
     if (existing === null) {
-      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId)
+      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId, startedAt)
     }
 
     if (!fingerprintsEqual(existing.fingerprint, fingerprint)) {
@@ -247,11 +248,11 @@ export class Idempotency {
     }
 
     if (existing.status === RECORD_STATUS.completed) {
-      this.emit('replayed', key, correlationId)
+      this.emit('replayed', key, correlationId, Date.now() - startedAt)
       return { value: this.decodeResult(existing) as T, replayed: true, storedAt: existing.storedAt }
     }
     if (existing.status === RECORD_STATUS.failed) {
-      this.emit('replayed', key, correlationId)
+      this.emit('replayed', key, correlationId, Date.now() - startedAt)
       throw decodeErrorValue(existing.error ?? '')
     }
 
@@ -259,7 +260,7 @@ export class Idempotency {
     if (this.onConflict === 'reject') {
       throw new ConcurrentExecutionError(key)
     }
-    return this.waitForOutcome(input, storageKey, key, fn, correlationId)
+    return this.waitForOutcome(input, storageKey, key, fn, correlationId, startedAt)
   }
 
   private async runOwned<T> (
@@ -268,7 +269,8 @@ export class Idempotency {
     token: string,
     storedAt: number,
     fn: ExecuteFunction<T>,
-    correlationId: string
+    correlationId: string,
+    startedAt: number
   ): Promise<ExecutionResult<T>> {
     this.emit('acquired', key, correlationId)
     const controller = new AbortController()
@@ -286,7 +288,7 @@ export class Idempotency {
       value = await fn(ctx)
     } catch (error) {
       await this.settleFailure(storageKey, token, error)
-      this.emit('failed', key, correlationId)
+      this.emit('failed', key, correlationId, Date.now() - startedAt)
       throw error
     }
 
@@ -298,7 +300,7 @@ export class Idempotency {
       // is released so callers may retry, and the error surfaces instead of
       // silently storing something else.
       await this.settleFailure(storageKey, token, error, { forceRelease: true })
-      this.emit('failed', key, correlationId)
+      this.emit('failed', key, correlationId, Date.now() - startedAt)
       throw error
     }
 
@@ -311,10 +313,10 @@ export class Idempotency {
         this.emit('storage-bypass', key, correlationId)
         return { value, replayed: false, storedAt }
       }
-      this.emit('failed', key, correlationId)
+      this.emit('failed', key, correlationId, Date.now() - startedAt)
       throw error
     }
-    this.emit('completed', key, correlationId)
+    this.emit('completed', key, correlationId, Date.now() - startedAt)
     return { value, replayed: false, storedAt }
   }
 
@@ -342,7 +344,8 @@ export class Idempotency {
     storageKey: string,
     key: string,
     fn: ExecuteFunction<T>,
-    correlationId: string
+    correlationId: string,
+    startedAt: number
   ): Promise<ExecutionResult<T>> {
     const deadline = Date.now() + this.waitTimeoutMs
     let delay = 25
@@ -350,14 +353,14 @@ export class Idempotency {
       const record = await this.storageCall(() => this.storage.get(storageKey))
       if (record === null) {
         // The holder failed (record deleted) or its lock expired: take over.
-        return this.run(input, fn, correlationId)
+        return this.run(input, fn, correlationId, startedAt)
       }
       if (record.status === RECORD_STATUS.completed) {
-        this.emit('replayed', key, correlationId)
+        this.emit('replayed', key, correlationId, Date.now() - startedAt)
         return { value: this.decodeResult(record) as T, replayed: true, storedAt: record.storedAt }
       }
       if (record.status === RECORD_STATUS.failed) {
-        this.emit('replayed', key, correlationId)
+        this.emit('replayed', key, correlationId, Date.now() - startedAt)
         throw decodeErrorValue(record.error ?? '')
       }
       const remaining = deadline - Date.now()
@@ -456,9 +459,10 @@ export class Idempotency {
     return composed
   }
 
-  private emit (type: IdempotencyEventType, key: string, correlationId: string): void {
+  private emit (type: IdempotencyEventType, key: string, correlationId: string, durationMs?: number): void {
     const event: IdempotencyEvent = { type, key, correlationId, timestamp: Date.now() }
     if (this.namespace !== undefined) event.namespace = this.namespace
+    if (durationMs !== undefined) event.durationMs = durationMs
     // Observability must never alter execution semantics: listener failures
     // are swallowed.
     try {

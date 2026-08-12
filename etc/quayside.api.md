@@ -117,6 +117,7 @@ export class Idempotency {
 export interface IdempotencyEvent {
     // (undocumented)
     correlationId: string;
+    durationMs?: number;
     // (undocumented)
     key: string;
     // (undocumented)

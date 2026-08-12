@@ -221,7 +221,16 @@ const idempotency = new Idempotency({
 })
 ```
 
-Listener failures never affect execution semantics. Prometheus and OpenTelemetry entry points (`quayside/prometheus`, `quayside/otel`) are 🔜 planned, following the same shape as [breakwater](https://github.com/pinceladasdaweb/breakwater)'s.
+Listener failures never affect execution semantics. Ready-made integrations follow the same shape as [breakwater](https://github.com/pinceladasdaweb/breakwater)'s:
+
+```ts
+import { prometheusMetrics } from 'quayside/prometheus' // counters + duration histogram
+import { otelSpans } from 'quayside/otel'               // spans with replay/conflict attributes
+
+new Idempotency({ storage, metrics: prometheusMetrics() })
+```
+
+Terminal events carry `durationMs` — a replayed duration approximates the time a waiter spent blocked. Details and the PromQL replay-ratio query: [docs/observability.md](docs/observability.md).
 
 ## Errors
 
@@ -263,6 +272,7 @@ Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, {
 ## Documentation
 
 - [Core semantics](docs/core.md) — state machine, TTLs, fingerprints, serialization rules, wait policy
+- [Observability](docs/observability.md) — events, Prometheus metrics, OpenTelemetry spans
 - [SQL storage](docs/sql.md) — migrations, lazy expiry, `sweep()`
 - [HTTP adapters](docs/http.md) — options, error mapping, cacheability rules
 - [NestJS](docs/nestjs.md) — module, interceptor, decorator

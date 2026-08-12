@@ -13,6 +13,12 @@ export interface IdempotencyEvent {
   namespace?: string
   correlationId: string
   timestamp: number
+  /**
+   * On terminal events (completed, replayed, failed): milliseconds since
+   * the execute call started. A replayed duration approximates the time a
+   * waiter spent blocked.
+   */
+  durationMs?: number
 }
 
 export interface MetricsCollector {
