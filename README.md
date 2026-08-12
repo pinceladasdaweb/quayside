@@ -1,10 +1,87 @@
 # quayside
 
-> The quay is where cargo lands **once** — unloaded, registered, never processed twice.
+> **Generic idempotency for Node.js** — execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.
 
-Generic idempotency for Node.js: execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.
+[![CI](https://github.com/pinceladasdaweb/quayside/actions/workflows/ci.yml/badge.svg)](https://github.com/pinceladasdaweb/quayside/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/quayside.svg)](https://www.npmjs.com/package/quayside)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Status: under construction.** The core engine, the Memory/Redis/Postgres/MySQL storages and the Express/Fastify/Hono/NestJS adapters are implemented; observability entry points and the 1.0 polish are on the way.
+> ⚠️ **Work in progress** — the public API is being built towards `1.0.0` and may change without notice until then.
+
+The quay is where cargo lands **once**: unloaded, registered, never processed twice. quayside is that quay for your operations — REST handlers, queue consumers, cron jobs, workers and CLI commands all get the same guarantee: *run this function once per key; if it already ran, return the stored result; if it is running right now, don't run it again.*
+
+```ts
+import { Idempotency } from 'quayside'
+import { RedisStorage } from 'quayside/redis'
+
+const idempotency = new Idempotency({
+  storage: new RedisStorage(redis),
+  resultTtl: '24h',   // how long a completed result stays replayable
+  lockTtl: '30s'      // how long a crashed execution blocks the key
+})
+
+const result = await idempotency.execute('invoice:123', async () => {
+  return createPayment()   // runs once; every later call replays the result
+})
+```
+
+## Table of contents
+
+- [Why another idempotency library?](#why-another-idempotency-library)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Core concepts](#core-concepts)
+- [Storage](#storage)
+- [HTTP adapters](#http-adapters)
+- [NestJS](#nestjs)
+- [Observability](#observability)
+- [Errors](#errors)
+- [API](#api)
+- [Documentation](#documentation)
+- [Development](#development)
+
+## Why another idempotency library?
+
+Every company eventually hand-rolls this. Behind the one-liner hide lock acquisition, concurrent execution, replay, TTLs, crash recovery, rollback, result serialization and multi-storage support — and the existing libraries each solve a slice:
+
+| | quayside | [steadykey](https://github.com/ebogdum/steadykey) | [Powertools](https://docs.powertools.aws.dev/lambda/typescript/latest/utilities/idempotency/) | [@node-idempotency](https://github.com/mahendraHegde/node-idempotency) | [express-idempotency](https://github.com/villelahdenvuo/express-idempotency) |
+|---|---|---|---|---|---|
+| **Fencing tokens** — a holder that lost its lock can **never** overwrite the new holder's result | ✅ enforced in-store, race-tested | ❌ README admits the operation may run twice | ➖ | ❌ | ❌ |
+| Framework-agnostic core (consumers, jobs, CLI) | ✅ | ✅ | ➖ Lambda-shaped | ➖ HTTP semantics baked in | ❌ Express only |
+| State machine with crash recovery (`lockTtl`) | ✅ | ✅ lease, unfenced | ✅ | ➖ partial | ❌ replay only |
+| Separate lock TTL vs result TTL | ✅ | ➖ | ✅ | ❌ | ❌ |
+| Payload fingerprint (same key + different body ⇒ error) | ✅ constant-time | ➖ payload *is* the key | ✅ | ✅ | ➖ deep-equal, HTTP only |
+| Concurrency policy: reject **and** wait | ✅ + storage-assisted wake-up | ➖ poll-only wait | ➖ throws only | ➖ throws only | ❌ |
+| Storage: memory / Redis / Postgres / MySQL | ✅ all four, one contract suite | ✅ many, thin contract | ➖ DynamoDB-first | ➖ memory, redis | ➖ plugin-ish |
+| HTTP adapters with IETF draft semantics (status/header replay, 409/422) | ✅ Express · Fastify · Hono | ➖ middleware, thinner | n/a | ✅ | ➖ stale |
+| NestJS module + `@Idempotent()` decorator | ✅ | ❌ | ✅ (Lambda) | ✅ | ❌ |
+| Typed events + pluggable metrics collector | ✅ native, `correlationId` | ➖ onHit/onMiss callbacks | ➖ CloudWatch-shaped | ❌ | ❌ |
+| Runtime dependencies | **0** | 0 | several | several | several |
+
+Design principles:
+
+- **The core knows nothing about HTTP.** `execute(key, fn)` is the primitive; HTTP is one adapter among many, and the raw core works in any framework from day 1.
+- **Semantics borrowed from the best.** The state machine and payload-fingerprint validation follow AWS Powertools and Stripe — the two implementations that got the hard cases right.
+- **Atomicity lives in the storage, never in JavaScript.** Fenced transitions are Lua scripts on Redis and token-conditional statements on SQL; a stale holder's late write *fails*, it never overwrites.
+- **Never magic.** Values that cannot be stored faithfully raise errors instead of being silently dropped; keys are rejected instead of truncated; failures degrade loudly.
+- **Zero runtime dependencies**, in the core and in every adapter — storage clients and frameworks are bring-your-own, typed structurally.
+
+Every claim above is enforced by the test suite — including a 50-way concurrency race, `SIGKILL` crash recovery and a split-brain fencing test against real Redis, Postgres and MySQL servers (Testcontainers).
+
+## Install
+
+```bash
+npm install quayside
+```
+
+Works with both module systems:
+
+```ts
+import { Idempotency } from 'quayside'          // ESM
+const { Idempotency } = require('quayside')     // CJS
+```
+
+Requires Node.js >= 22.
 
 ## Quick start
 
@@ -12,33 +89,94 @@ Generic idempotency for Node.js: execute any operation exactly once per key, wit
 import { Idempotency } from 'quayside'
 import { MemoryStorage } from 'quayside/memory'
 
-const idempotency = new Idempotency({
-  storage: new MemoryStorage(),
-  resultTtl: '24h',   // how long a completed result stays replayable
-  lockTtl: '30s'      // how long a crashed execution blocks the key
+const idempotency = new Idempotency({ storage: new MemoryStorage() })
+
+// 1. The primitive: execute once per key
+const payment = await idempotency.execute('invoice:123', () => createPayment())
+
+// 2. Payload fingerprint: same key + different body => IdempotencyKeyReuseError
+await idempotency.execute(
+  { key: req.headers['idempotency-key'] as string, payload: req.body },
+  () => createPayment(req.body)
+)
+
+// 3. No client key? Derive one from the payload (consumers, jobs)
+await idempotency.execute(
+  { payload: message.value, ignoreFields: ['meta.timestamp', 'requestId'] },
+  () => processOrder(message.value)
+)
+
+// 4. Decorate once, call everywhere
+const createOnce = idempotency.wrap(createPayment, {
+  key: (input) => `payment:${input.invoiceId}`
 })
 
-// First call runs the function; any further call with the same key
-// replays the stored result without running it again.
-const result = await idempotency.execute('invoice:123', async () => {
-  return createPayment()
-})
+// 5. Replay metadata, inspection, invalidation
+const { value, replayed, storedAt } = await idempotency.executeWithMetadata('invoice:123', fn)
+await idempotency.get('invoice:123')
+await idempotency.invalidate('invoice:123')
 ```
 
-Works in any framework — or no framework at all. REST handlers, queue consumers, cron jobs, workers, and CLI commands are all first-class callers:
+The same `execute` call works verbatim inside an Express route, a Fastify handler, a Hono handler, a Kafka/RabbitMQ consumer, a cron job or a CLI command. **Adapters are protocol sugar, not a requirement.**
+
+## Core concepts
+
+### The atomic write is the lock
+
+```
+                    ┌──────────────┐
+   execute(key) ──▶ │  IN_PROGRESS │──── fn resolves ────▶ COMPLETED (result stored for resultTtl)
+                    │  (lockTtl)   │──── fn rejects ─────▶ record deleted → retry allowed
+                    └──────────────┘──── process crash ──▶ lock expires → retry allowed
+```
+
+`IN_PROGRESS` is written atomically (create-if-absent) before your function runs — that write *is* the lock; there is no separate locking step. On success the record transitions to `COMPLETED` guarded by a **fencing token**: a holder that lost its lock (GC pause, slow I/O, expired TTL) gets `FencingError` from the store itself and can never overwrite the new holder's result.
+
+### Two TTLs, not one
+
+Conflating these is the single most common bug in homemade implementations:
+
+- **`lockTtl`** (default `30s`) bounds crash recovery: if the process dies mid-flight, the key unblocks when the lock expires. Long-running functions heartbeat with `ctx.extend()`.
+- **`resultTtl`** (default `24h`, Stripe's convention) is the replay window for completed results.
+
+### Intent first, content as validation
+
+The explicit key names the *intent* (an `Idempotency-Key` header, an invoice id). The payload fingerprint — a canonical, type-tagged, locale-independent hash — exists to *validate* it: the same key with a different payload fails with `IdempotencyKeyReuseError` instead of silently replaying a result for another request. When no client sends a key (queue consumers, jobs), deriving the key from the payload is an opt-in convenience with `ignoreFields`/`pickFields` for volatile fields.
+
+### Concurrency is a policy
+
+When a call finds the key `IN_PROGRESS`: `onConflict: 'reject'` (default, HTTP-safe) throws `ConcurrentExecutionError` immediately; `'wait'` blocks until the winner finishes and replays its outcome, bounded by `waitTimeout` — ideal for consumers and workers. Waiters poll with exponential backoff, and storages that support notifications (Redis keyspace events) wake them early.
+
+### Failures are not idempotent
+
+A rejection deletes the record; retries run fresh. `persistFailures: true` opts into storing and replaying the error for non-retryable business failures — the replay preserves `name`, `message`, `stack`, own enumerable properties (`code`, `statusCode`, ...) and the `cause` chain, so check `error.code` on replay, not `instanceof`.
+
+### Fail closed, bypass loudly
+
+If the storage is unreachable, `execute` throws `StorageUnavailableError` instead of running without the guarantee. `onStorageError: 'open'` flips the trade-off — the function runs unguarded and every bypass emits a `storage-bypass` event, so degradation is always observable.
+
+### Keys are never truncated
+
+Namespace and key segments are percent-encoded before composition (a client-supplied key cannot impersonate another namespace) and composed keys longer than `maxKeyLength` (default 512) are rejected — truncation would silently alias two keys into one record.
+
+Deep dive on all of the above: [docs/core.md](docs/core.md).
+
+## Storage
 
 ```ts
-// Raw usage in Express, no adapter needed
-app.post('/payments', async (req, res) => {
-  const result = await idempotency.execute(
-    { key: req.headers['idempotency-key'] as string },
-    () => createPayment(req.body)
-  )
-  res.json(result)
-})
+import { MemoryStorage } from 'quayside/memory'     // tests and development
+import { RedisStorage } from 'quayside/redis'       // SET NX PX + fenced Lua transitions
+import { PostgresStorage } from 'quayside/postgres' // ON CONFLICT DO NOTHING + token-conditional updates
+import { MysqlStorage } from 'quayside/mysql'       // INSERT IGNORE equivalent
 ```
 
-Adapters are protocol sugar, not a requirement. What they add is HTTP-draft semantics that are error-prone to hand-roll — faithful status/header replay, `409` + `Retry-After`, `422` on key reuse, `Idempotency-Replayed: true`:
+Bring your own client — any ioredis instance or `@pinceladasdaweb/redis` RedisClient, any `pg` Pool, any `mysql2/promise` Pool. The SQL adapters ship `CREATE TABLE` migrations (`migrate()` or an exported DDL string) and clean up expired rows lazily — no cron required, with an optional `sweep()` for bulk housekeeping.
+
+Every adapter passes the same storage-contract suite against a real server, including the two invariants that protect correctness: **expired-but-not-purged records read as absent**, and **keys are stored faithfully or rejected — never truncated**. Custom adapters implement one interface and inherit the suite: see [docs/sql.md](docs/sql.md) and [tests/contract](tests/contract/storage-contract.ts).
+
+## HTTP adapters
+
+All HTTP semantics live in one shared kernel implementing the IETF `Idempotency-Key` draft; each adapter is thin glue:
 
 ```ts
 import { ExpressMiddleware } from 'quayside/express'
@@ -48,101 +186,103 @@ import { HonoMiddleware } from 'quayside/hono'
 app.use(ExpressMiddleware(idempotency, { enforce: true }))
 ```
 
-See [docs/http.md](docs/http.md) for options and the cacheability rules, and [docs/writing-an-adapter.md](docs/writing-an-adapter.md) to add a framework in an afternoon.
+- **Faithful replay**: original status + selected headers + body, with `Idempotency-Replayed: true`. A `201` + `Location` replays as `201` + `Location`, never a generic `200`.
+- **Error mapping**: `409` + `Retry-After` while the first request runs, `422` on key reuse with a different payload, `503` fail-closed, optional `400` for missing keys.
+- **Safe caching**: binary, oversized (`maxBodyBytes`, default 1 MiB) and 5xx responses are served but never stored — and the endpoint keeps its concurrency protection on every attempt.
 
-NestJS gets first-class treatment — module, interceptor and decorator ([docs/nestjs.md](docs/nestjs.md)):
+Options and cacheability rules: [docs/http.md](docs/http.md). Adding another framework is an afternoon of work: [docs/writing-an-adapter.md](docs/writing-an-adapter.md).
+
+## NestJS
 
 ```ts
+QuaysideModule.forRoot({ storage: new RedisStorage(redis) })
+
 @Post('/payments')
 @Idempotent({ ttl: '24h' })
 createPayment () { ... }
 ```
 
-## Semantics in one minute
+Module (`forRoot`/`forRootAsync`), interceptor and decorator, with per-route key extractors, TTL overrides and `enforce`. Peer dependencies are `@nestjs/common` and `rxjs` only — already present in any Nest application. Full guide: [docs/nestjs.md](docs/nestjs.md).
 
-- **Exactly-once effect.** The first `execute` for a key atomically writes an `in-progress` record — that write *is* the lock. Success stores the serialized result for `resultTtl`; every later call replays it.
-- **Two TTLs, not one.** `lockTtl` (default 30s) bounds crash recovery: if the process dies mid-flight, the key unblocks when the lock expires. `resultTtl` (default 24h) is the replay window. Long-running functions can heartbeat with `ctx.extend()`.
-- **Fencing tokens.** Storage transitions (`complete`, `release`, `extend`) are fenced: a holder that lost its lock cannot overwrite the new holder's result — its late write fails with `FencingError`.
-- **Failures are not idempotent** by default: a rejection deletes the record and retries run fresh. `persistFailures: true` opts into storing and replaying the error (for non-retryable business failures). A replayed failure is a reconstruction that preserves `name`, `message`, `stack`, own enumerable properties (`code`, `statusCode`, ...) and the `cause` chain — check `error.code`/fields on replay, not `instanceof`.
-- **Payload fingerprints validate intent.** Pass `payload` alongside the key and quayside hashes it canonically (key-order, machine and locale independent): the same key with a different payload fails with `IdempotencyKeyReuseError` instead of silently replaying a result for another request.
-- **No client key? Derive one.** `execute({ payload }, fn)` derives the key from the canonical payload hash — ideal for queue consumers — with `ignoreFields`/`pickFields` to exclude volatile fields (timestamps, request ids). The explicit key stays the primary mechanism; derivation is an opt-in convenience.
-- **Key hygiene.** Namespace and key segments are percent-encoded before composition (a client-supplied key can never impersonate another namespace) and composed keys longer than `maxKeyLength` (default 512) are rejected — never truncated, because truncation is a silent collision.
-- **Concurrency is a policy.** `onConflict: 'reject'` (default) throws `ConcurrentExecutionError` immediately; `'wait'` blocks until the winner finishes and replays its outcome, bounded by `waitTimeout`.
-- **Fail closed.** If the storage is unreachable the call throws `StorageUnavailableError` instead of running without the guarantee. `onStorageError: 'open'` opts into availability instead: the function runs unguarded and every bypass emits a `storage-bypass` event.
+## Observability
 
-## API sketch
+Every execution emits typed events carrying a `correlationId`:
 
 ```ts
-// payload fingerprint: same key + different body => IdempotencyKeyReuseError
-await idempotency.execute(
-  { key: req.headers['idempotency-key'] as string, payload: req.body },
-  () => createPayment(req.body)
-)
-
-// no client key: derive it from the payload (consumers, jobs)
-await idempotency.execute(
-  { payload: message.value, ignoreFields: ['meta.timestamp', 'requestId'] },
-  () => processOrder(message.value)
-)
-
-// decorate once, call everywhere
-const createOnce = idempotency.wrap(createPayment, {
-  key: (input) => `payment:${input.invoiceId}`
-})
-
-// replay metadata
-const { value, replayed, storedAt } = await idempotency.executeWithMetadata('invoice:123', fn)
-
-// inspect / invalidate
-await idempotency.get('invoice:123')
-await idempotency.invalidate('invoice:123')
-
-// typed events + metrics
-new Idempotency({
+const idempotency = new Idempotency({
   storage,
-  onEvent: (event) => log.debug(event),          // acquired | replayed | conflict | completed | failed
-  metrics: { onReplayed: (event) => counter.inc() }
+  onEvent: (event) => log.debug(event),
+  // acquired | replayed | conflict | completed | failed | expired-recovery | storage-bypass
+  metrics: {
+    onReplayed: (event) => replayCounter.inc(),
+    onConflict: (event) => conflictCounter.inc(),
+    onStorageBypass: (event) => bypassCounter.inc()  // watch this one
+  }
 })
 ```
 
-All errors extend `QuaysideError` and carry a stable `code` (`IDEMPOTENCY_IN_PROGRESS`, `IDEMPOTENCY_WAIT_TIMEOUT`, `IDEMPOTENCY_FENCING`, ...), so callers can map them without string-matching messages.
+Listener failures never affect execution semantics. Prometheus and OpenTelemetry entry points (`quayside/prometheus`, `quayside/otel`) are 🔜 planned, following the same shape as [breakwater](https://github.com/pinceladasdaweb/breakwater)'s.
 
-## Storage
+## Errors
+
+All errors extend `QuaysideError` and carry a stable `code` — codes are contract, message text is not:
+
+| Error | `code` | HTTP mapping |
+|---|---|---|
+| `ConcurrentExecutionError` | `IDEMPOTENCY_IN_PROGRESS` | 409 |
+| `IdempotencyKeyReuseError` | `IDEMPOTENCY_KEY_REUSE` | 422 |
+| `WaitTimeoutError` | `IDEMPOTENCY_WAIT_TIMEOUT` | 409 |
+| `FencingError` | `IDEMPOTENCY_FENCING` | 500 |
+| `SerializationError` | `IDEMPOTENCY_SERIALIZATION` | 500 |
+| `StorageUnavailableError` | `IDEMPOTENCY_STORAGE_UNAVAILABLE` | 503 |
+
+## API
 
 ```ts
-import { MemoryStorage } from 'quayside/memory'     // tests and development
-import { RedisStorage } from 'quayside/redis'       // production
-import { PostgresStorage } from 'quayside/postgres' // production, SQL
-import { MysqlStorage } from 'quayside/mysql'       // production, SQL
-
-// Bring your own client: any ioredis instance works, and so does a
-// @pinceladasdaweb/redis RedisClient (its dedicated pub/sub connection is
-// used for low-latency waits automatically).
-const storage = new RedisStorage(new Redis())
-
-// SQL: any pg Pool or mysql2/promise Pool; migrate() ships the table.
-const sql = new PostgresStorage(pgPool)
-await sql.migrate()
+new Idempotency(options)
 ```
 
-The Redis adapter acquires with `SET NX PX` — the atomic write *is* the lock — and runs every fenced transition (`complete`, `release`, `extend`) as a Lua script on the server, so a stale holder can never overwrite a newer execution. `onConflict: 'wait'` wakes waiters through keyspace notifications when the server has `notify-keyspace-events` covering `K$gx`, and falls back to polling with exponential backoff when it does not. Every adapter passes the same storage-contract suite against a real server (Testcontainers), including a server-side `CLIENT KILL` mid-execution and a `SIGKILL` crash-recovery case.
+| Option | Default | Meaning |
+|---|---|---|
+| `storage` | — (required) | Any `IdempotencyStorage` implementation |
+| `resultTtl` | `'24h'` | Replay window for completed results |
+| `lockTtl` | `'30s'` | How long an in-progress record survives without completion |
+| `onConflict` | `'reject'` | `'reject'` throws immediately; `'wait'` blocks until the winner finishes |
+| `waitTimeout` | `'10s'` | Upper bound for `onConflict: 'wait'` |
+| `namespace` | — | Key prefix isolating domains that share one storage |
+| `maxKeyLength` | `512` | Longest composed storage key; longer keys are rejected |
+| `codec` | JSON | Result serialization (`Codec` interface for superjson/msgpack users) |
+| `persistFailures` | `false` | Store and replay failures instead of allowing retries |
+| `onStorageError` | `'closed'` | `'open'` runs without the guarantee and emits `storage-bypass` |
+| `onEvent` / `metrics` | — | Typed event listener / metrics collector |
 
-The SQL adapters use the same discipline — insert-if-absent as the lock, token-conditional transitions, lazy expiry with an optional `sweep()`, `CREATE TABLE` migrations included: see [docs/sql.md](docs/sql.md).
+Durations accept `ms` numbers or strings: `'500ms'`, `'30s'`, `'10m'`, `'24h'`, `'7d'`.
 
-Composing [breakwater](https://github.com/pinceladasdaweb/breakwater) resilience policies around storage calls is a documented recipe: see [docs/breakwater.md](docs/breakwater.md).
+Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, { key })` · `get(key)` · `invalidate(key)`. The `fn` receives a context: `{ key, replayed, signal, extend(ttl) }`.
 
-## Requirements
+## Documentation
 
-- Node.js >= 22
-- Ships both ESM and CJS builds
+- [Core semantics](docs/core.md) — state machine, TTLs, fingerprints, serialization rules, wait policy
+- [SQL storage](docs/sql.md) — migrations, lazy expiry, `sweep()`
+- [HTTP adapters](docs/http.md) — options, error mapping, cacheability rules
+- [NestJS](docs/nestjs.md) — module, interceptor, decorator
+- [Writing an adapter](docs/writing-an-adapter.md) — Koa as the worked example
+- [breakwater recipe](docs/breakwater.md) — resilience policies around storage calls
 
 ## Development
 
 ```bash
 npm install
+npm run hooks             # once per clone: lint + commit-message hooks
 npm test                  # unit tests, no external services needed
-npm run test:integration  # spins up real backends via Testcontainers (needs Docker)
+npm run test:integration  # real Redis/Postgres/MySQL via Testcontainers (needs Docker)
+npm run examples          # runnable, self-asserting examples
 ```
+
+## Requirements
+
+- Node.js >= 22
+- Ships both ESM and CJS builds
 
 ## License
 
