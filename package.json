@@ -36,6 +36,36 @@
         "types": "./dist/redis.d.cts",
         "default": "./dist/redis.cjs"
       }
+    },
+    "./express": {
+      "import": {
+        "types": "./dist/express.d.ts",
+        "default": "./dist/express.mjs"
+      },
+      "require": {
+        "types": "./dist/express.d.cts",
+        "default": "./dist/express.cjs"
+      }
+    },
+    "./fastify": {
+      "import": {
+        "types": "./dist/fastify.d.ts",
+        "default": "./dist/fastify.mjs"
+      },
+      "require": {
+        "types": "./dist/fastify.d.cts",
+        "default": "./dist/fastify.cjs"
+      }
+    },
+    "./hono": {
+      "import": {
+        "types": "./dist/hono.d.ts",
+        "default": "./dist/hono.mjs"
+      },
+      "require": {
+        "types": "./dist/hono.d.cts",
+        "default": "./dist/hono.cjs"
+      }
     }
   },
   "typesVersions": {
@@ -45,6 +75,15 @@
       ],
       "redis": [
         "dist/redis.d.ts"
+      ],
+      "express": [
+        "dist/express.d.ts"
+      ],
+      "fastify": [
+        "dist/fastify.d.ts"
+      ],
+      "hono": [
+        "dist/hono.d.ts"
       ]
     }
   },
@@ -100,10 +139,14 @@
     "@commitlint/config-conventional": "^21.2.0",
     "@microsoft/api-extractor": "^7.58.12",
     "@pinceladasdaweb/redis": "^4.0.0",
-    "ioredis": "^6.0.0",
     "@rollup/plugin-typescript": "^12.3.0",
+    "@types/express": "^5.0.6",
     "@types/node": "^26.1.1",
     "eslint": "^9.39.5",
+    "express": "^5.1.0",
+    "fastify": "^5.6.0",
+    "hono": "^4.10.0",
+    "ioredis": "^6.0.0",
     "lint-staged": "^17.2.0",
     "neostandard": "^0.13.0",
     "rollup": "^4.62.2",

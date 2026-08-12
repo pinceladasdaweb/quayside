@@ -64,5 +64,23 @@ export default [
         }
       ]
     }
+  },
+  {
+    // The core knows nothing about adapters or HTTP: top-level src modules
+    // may only import their siblings, never a subdirectory entry point.
+    files: ['src/*.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              group: ['./*/*', './*/**'],
+              message: 'the core must not import adapter or kernel modules; they depend on the core, never the reverse.'
+            }
+          ]
+        }
+      ]
+    }
   }
 ]
