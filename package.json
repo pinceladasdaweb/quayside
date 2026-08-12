@@ -66,6 +66,16 @@
         "types": "./dist/hono.d.cts",
         "default": "./dist/hono.cjs"
       }
+    },
+    "./nestjs": {
+      "import": {
+        "types": "./dist/nestjs.d.ts",
+        "default": "./dist/nestjs.mjs"
+      },
+      "require": {
+        "types": "./dist/nestjs.d.cts",
+        "default": "./dist/nestjs.cjs"
+      }
     }
   },
   "typesVersions": {
@@ -84,6 +94,9 @@
       ],
       "hono": [
         "dist/hono.d.ts"
+      ],
+      "nestjs": [
+        "dist/nestjs.d.ts"
       ]
     }
   },
@@ -101,6 +114,7 @@
     "test": "node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
     "test:coverage": "node --import tsx --experimental-test-coverage --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
     "test:integration": "node --import tsx --test --test-timeout=120000 'tests/integration/**/*.test.ts'",
+    "examples": "node --import tsx examples/nestjs.ts",
     "check:types": "tsc --noEmit",
     "check:types:next": "node node_modules/typescript7/bin/tsc --noEmit",
     "api:update": "npm run build && api-extractor run --local",
@@ -134,10 +148,26 @@
   "publishConfig": {
     "access": "public"
   },
+  "peerDependencies": {
+    "@nestjs/common": ">=10",
+    "rxjs": "^7"
+  },
+  "peerDependenciesMeta": {
+    "@nestjs/common": {
+      "optional": true
+    },
+    "rxjs": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@commitlint/cli": "^21.2.1",
     "@commitlint/config-conventional": "^21.2.0",
     "@microsoft/api-extractor": "^7.58.12",
+    "@nestjs/common": "^11.1.0",
+    "@nestjs/core": "^11.1.0",
+    "@nestjs/platform-express": "^11.1.0",
+    "@nestjs/testing": "^11.1.0",
     "@pinceladasdaweb/redis": "^4.0.0",
     "@rollup/plugin-typescript": "^12.3.0",
     "@types/express": "^5.0.6",
@@ -149,7 +179,9 @@
     "ioredis": "^6.0.0",
     "lint-staged": "^17.2.0",
     "neostandard": "^0.13.0",
+    "reflect-metadata": "^0.2.2",
     "rollup": "^4.62.2",
+    "rxjs": "^7.8.2",
     "rollup-plugin-dts": "^6.4.1",
     "testcontainers": "^11.12.0",
     "tslib": "^2.8.1",

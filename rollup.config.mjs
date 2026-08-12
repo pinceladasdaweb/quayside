@@ -47,5 +47,6 @@ export default [
   ...entry('src/redis/index.ts', 'redis', { core: true }),
   ...entry('src/express/index.ts', 'express', { core: true }),
   ...entry('src/fastify/index.ts', 'fastify', { core: true }),
-  ...entry('src/hono/index.ts', 'hono', { core: true })
+  ...entry('src/hono/index.ts', 'hono', { core: true }),
+  ...entry('src/nestjs/index.ts', 'nestjs', { core: true })
 ]

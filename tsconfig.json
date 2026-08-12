@@ -5,6 +5,7 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2024"],
     "types": ["node"],
+    "experimentalDecorators": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,
@@ -15,5 +16,5 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src", "tests"]
+  "include": ["src", "tests", "examples"]
 }

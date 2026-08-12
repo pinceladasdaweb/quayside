@@ -4,7 +4,7 @@
 
 Generic idempotency for Node.js: execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.
 
-**Status: under construction.** The core engine, the in-memory and Redis storages and the Express/Fastify/Hono adapters are implemented; NestJS and SQL storage are on the way.
+**Status: under construction.** The core engine, the in-memory and Redis storages and the Express/Fastify/Hono/NestJS adapters are implemented; SQL storage is on the way.
 
 ## Quick start
 
@@ -49,6 +49,14 @@ app.use(ExpressMiddleware(idempotency, { enforce: true }))
 ```
 
 See [docs/http.md](docs/http.md) for options and the cacheability rules, and [docs/writing-an-adapter.md](docs/writing-an-adapter.md) to add a framework in an afternoon.
+
+NestJS gets first-class treatment — module, interceptor and decorator ([docs/nestjs.md](docs/nestjs.md)):
+
+```ts
+@Post('/payments')
+@Idempotent({ ttl: '24h' })
+createPayment () { ... }
+```
 
 ## Semantics in one minute
 
