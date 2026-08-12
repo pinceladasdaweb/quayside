@@ -1,0 +1,151 @@
+// Runtime values come from the core entry point, never from deep module
+// paths: error identity (instanceof) must hold across entry points, so the
+// build maps '../index' onto the shipped core bundle instead of inlining a
+// private copy.
+import { FencingError, RECORD_STATUS } from '../index'
+import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
+
+/**
+ * The dialect-specific SQL. Both adapters share one algorithm; only the
+ * statement text (placeholders, insert-ignore syntax) differs.
+ */
+export interface SqlStatements {
+  /** Insert-if-absent. Params: key, token, fingerprint, storedAt, expiresAt. */
+  insert: string
+  /** Reclaim an expired row in place. Params: token, fingerprint, storedAt, expiresAt, key, now. */
+  takeover: string
+  /** Select a live row. Params: key, now. */
+  select: string
+  /** Fenced transition to completed. Params: result, expiresAt, key, token, now. */
+  completeResult: string
+  /** Fenced transition to failed. Params: error, expiresAt, key, token, now. */
+  completeError: string
+  /** Fenced delete. Params: key, token, now. */
+  release: string
+  /** Fenced lock extension. Params: expiresAt, key, token, now. */
+  extend: string
+  /** Unfenced delete. Params: key. */
+  remove: string
+  /** Bulk removal of expired rows. Params: now. */
+  sweep: string
+}
+
+export interface SqlRunResult {
+  affected: number
+  rows: Array<Record<string, unknown>>
+}
+
+export type SqlRunner = (sql: string, params: unknown[]) => Promise<SqlRunResult>
+
+const VALID_STATUS = new Set<string>(Object.values(RECORD_STATUS))
+const MAX_ACQUIRE_ATTEMPTS = 5
+
+export function assertSafeTableName (tableName: string): void {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) {
+    throw new TypeError(`invalid table name "${tableName}"; only letters, digits and underscores are allowed`)
+  }
+}
+
+function mapRow (key: string, row: Record<string, unknown>): StoredRecord {
+  const status = String(row.status)
+  if (!VALID_STATUS.has(status)) {
+    throw new Error(`corrupt idempotency record under key "${key}"`)
+  }
+  const record: StoredRecord = {
+    key,
+    token: String(row.token),
+    status: status as RecordStatus,
+    storedAt: Number(row.stored_at),
+    expiresAt: Number(row.expires_at)
+  }
+  if (typeof row.fingerprint === 'string') record.fingerprint = row.fingerprint
+  if (typeof row.result === 'string') record.result = row.result
+  if (typeof row.error === 'string') record.error = row.error
+  return record
+}
+
+/**
+ * Shared SQL storage algorithm: insert-if-absent is the lock, expired rows
+ * are reclaimed in place (lazy cleanup, no cron required) and every
+ * transition is a single token-conditional statement, so atomicity lives in
+ * the database, never in read-modify-write JavaScript.
+ */
+export class SqlStorageCore implements IdempotencyStorage {
+  private readonly run: SqlRunner
+  private readonly statements: SqlStatements
+  private readonly maxKeyBytes: number
+
+  constructor (run: SqlRunner, statements: SqlStatements, maxKeyBytes: number) {
+    this.run = run
+    this.statements = statements
+    this.maxKeyBytes = maxKeyBytes
+  }
+
+  async acquire (record: PendingRecord, lockTtlMs: number): Promise<StoredRecord | null> {
+    this.assertKeyFits(record.key)
+    const fingerprint = record.fingerprint ?? null
+    for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt += 1) {
+      const now = Date.now()
+      const inserted = await this.run(this.statements.insert, [record.key, record.token, fingerprint, record.storedAt, now + lockTtlMs])
+      if (inserted.affected === 1) return null
+      const reclaimed = await this.run(this.statements.takeover, [record.token, fingerprint, record.storedAt, now + lockTtlMs, record.key, now])
+      if (reclaimed.affected === 1) return null
+      const selected = await this.run(this.statements.select, [record.key, now])
+      const row = selected.rows[0]
+      if (row !== undefined) return mapRow(record.key, row)
+      // The row expired or vanished between statements: contend again.
+    }
+    throw new Error(`could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+  }
+
+  async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
+    const statement = outcome.status === 'completed' ? this.statements.completeResult : this.statements.completeError
+    const payload = outcome.status === 'completed' ? outcome.result : outcome.error
+    const applied = await this.run(statement, [payload, Date.now() + resultTtlMs, key, token, Date.now()])
+    if (applied.affected !== 1) throw new FencingError(key)
+  }
+
+  async release (key: string, token: string): Promise<void> {
+    const applied = await this.run(this.statements.release, [key, token, Date.now()])
+    if (applied.affected !== 1) throw new FencingError(key)
+  }
+
+  async extend (key: string, token: string, lockTtlMs: number): Promise<void> {
+    const applied = await this.run(this.statements.extend, [Date.now() + lockTtlMs, key, token, Date.now()])
+    if (applied.affected === 1) return
+    // MySQL reports zero affected rows for a no-change update (two extends
+    // inside the same millisecond); a held lock makes the extend a no-op
+    // success, anything else is a lost lock.
+    const selected = await this.run(this.statements.select, [key, Date.now()])
+    const row = selected.rows[0]
+    if (row === undefined || String(row.token) !== token || String(row.status) !== RECORD_STATUS.inProgress) {
+      throw new FencingError(key)
+    }
+  }
+
+  async get (key: string): Promise<StoredRecord | null> {
+    const selected = await this.run(this.statements.select, [key, Date.now()])
+    const row = selected.rows[0]
+    return row === undefined ? null : mapRow(key, row)
+  }
+
+  async delete (key: string): Promise<void> {
+    await this.run(this.statements.remove, [key])
+  }
+
+  /** Bulk-removes expired rows; never required for correctness. */
+  async sweep (): Promise<number> {
+    const swept = await this.run(this.statements.sweep, [Date.now()])
+    return swept.affected
+  }
+
+  // The key column is a bounded VARCHAR: anything the column cannot hold
+  // faithfully is rejected here, never truncated (truncation would alias
+  // two keys into one record, and MySQL in non-strict mode truncates
+  // silently).
+  private assertKeyFits (key: string): void {
+    if (Buffer.byteLength(key) > this.maxKeyBytes) {
+      throw new Error(`idempotency key is ${Buffer.byteLength(key)} bytes long and exceeds the ${this.maxKeyBytes}-byte key column; keys are rejected, never truncated`)
+    }
+  }
+}

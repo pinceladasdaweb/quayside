@@ -4,7 +4,7 @@
 
 Generic idempotency for Node.js: execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.
 
-**Status: under construction.** The core engine, the in-memory and Redis storages and the Express/Fastify/Hono/NestJS adapters are implemented; SQL storage is on the way.
+**Status: under construction.** The core engine, the Memory/Redis/Postgres/MySQL storages and the Express/Fastify/Hono/NestJS adapters are implemented; observability entry points and the 1.0 polish are on the way.
 
 ## Quick start
 
@@ -110,16 +110,24 @@ All errors extend `QuaysideError` and carry a stable `code` (`IDEMPOTENCY_IN_PRO
 ## Storage
 
 ```ts
-import { MemoryStorage } from 'quayside/memory'   // tests and development
-import { RedisStorage } from 'quayside/redis'     // production
+import { MemoryStorage } from 'quayside/memory'     // tests and development
+import { RedisStorage } from 'quayside/redis'       // production
+import { PostgresStorage } from 'quayside/postgres' // production, SQL
+import { MysqlStorage } from 'quayside/mysql'       // production, SQL
 
 // Bring your own client: any ioredis instance works, and so does a
 // @pinceladasdaweb/redis RedisClient (its dedicated pub/sub connection is
 // used for low-latency waits automatically).
 const storage = new RedisStorage(new Redis())
+
+// SQL: any pg Pool or mysql2/promise Pool; migrate() ships the table.
+const sql = new PostgresStorage(pgPool)
+await sql.migrate()
 ```
 
 The Redis adapter acquires with `SET NX PX` — the atomic write *is* the lock — and runs every fenced transition (`complete`, `release`, `extend`) as a Lua script on the server, so a stale holder can never overwrite a newer execution. `onConflict: 'wait'` wakes waiters through keyspace notifications when the server has `notify-keyspace-events` covering `K$gx`, and falls back to polling with exponential backoff when it does not. Every adapter passes the same storage-contract suite against a real server (Testcontainers), including a server-side `CLIENT KILL` mid-execution and a `SIGKILL` crash-recovery case.
+
+The SQL adapters use the same discipline — insert-if-absent as the lock, token-conditional transitions, lazy expiry with an optional `sweep()`, `CREATE TABLE` migrations included: see [docs/sql.md](docs/sql.md).
 
 Composing [breakwater](https://github.com/pinceladasdaweb/breakwater) resilience policies around storage calls is a documented recipe: see [docs/breakwater.md](docs/breakwater.md).
 
