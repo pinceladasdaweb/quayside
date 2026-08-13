@@ -32,6 +32,10 @@ before(() => {
     calls.boom = (calls.boom ?? 0) + 1
     throw new Error('handler exploded')
   })
+  // Expected handler errors answer 500 without reaching Hono's default
+  // error handler, which would dump the stack to stderr and drown out any
+  // real failure in the test output.
+  app.onError((_error, c) => c.json({ error: 'handler exploded' }, 500))
 })
 
 async function post (path: string, key: string | undefined, body: unknown): Promise<Response> {

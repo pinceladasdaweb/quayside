@@ -36,6 +36,14 @@ before(async () => {
     throw new Error('handler exploded')
   })
 
+  // Expected handler errors answer 500 without reaching Express's default
+  // error handler, which would dump the stack to stderr and drown out any
+  // real failure in the test output.
+  const silentErrors: express.ErrorRequestHandler = (_error, _req, res, _next) => {
+    res.status(500).json({ error: 'handler exploded' })
+  }
+  app.use(silentErrors)
+
   await new Promise<void>((resolve) => {
     server = app.listen(0, () => resolve())
   })
