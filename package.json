@@ -164,7 +164,7 @@
     "lint:fix": "eslint . --fix",
     "prepack": "npm run build",
     "test": "node --import tsx --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
-    "test:coverage": "node --import tsx --experimental-test-coverage --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
+    "test:coverage": "node --import tsx --experimental-test-coverage --test-coverage-include='src/**' --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
     "test:integration": "node --import tsx --test --test-timeout=120000 'tests/integration/**/*.test.ts'",
     "examples": "node --import tsx examples/nestjs.ts",
     "bench": "node --import tsx bench/run.ts",
