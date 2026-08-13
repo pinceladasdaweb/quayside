@@ -20,6 +20,7 @@ through Testcontainers, so the only external requirement is a running Docker.
 npm test                  # unit tests, no external services needed
 npm run test:coverage     # the same, with a coverage report
 npm run test:integration  # storage contract against real backends (Docker)
+npm run test:mutation     # the mutation gate (see below)
 npm run lint              # neostandard + the project rules
 npm run check:types       # TypeScript 6
 npm run check:types:next  # the same surface under TypeScript 7
@@ -79,6 +80,13 @@ Every change needs a test that fails without it. Beyond that:
   `// Regression:` comment explaining what used to happen.
 - **Observability changes** are asserted through the typed event stream and
   the `MetricsCollector`, not through log output.
+- **Mutation gate.** `npm run test:mutation` (Stryker) grades whether the
+  tests actually assert. It mutates the unit-covered source; the storage
+  adapters that only real servers can exercise (`src/redis`, `src/sql`,
+  `src/postgres`, `src/mysql`) are excluded and answer to the integration
+  contract suite instead. A surviving mutant is either a missing assertion
+  or an equivalent mutant — if it is the latter, say why in the pull
+  request.
 
 ## Commits and branches
 

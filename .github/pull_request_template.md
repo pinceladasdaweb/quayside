@@ -10,6 +10,7 @@
 - [ ] `npm test` (and `npm run test:integration` if the behavior touches a storage backend — needs Docker)
 - [ ] `npm run check:types` and `npm run check:types:next`
 - [ ] `npm run api:check` — or `npm run api:update` with the report committed, when the public API moved on purpose
+- [ ] `npm run test:mutation` — surviving mutants explained below, if any
 
 ## Checklist
 
