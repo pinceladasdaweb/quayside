@@ -167,6 +167,7 @@
     "test:coverage": "node --import tsx --experimental-test-coverage --test --test-timeout=10000 'tests/unit/**/*.test.ts'",
     "test:integration": "node --import tsx --test --test-timeout=120000 'tests/integration/**/*.test.ts'",
     "examples": "node --import tsx examples/nestjs.ts",
+    "bench": "node --import tsx bench/run.ts",
     "check:types": "tsc --noEmit",
     "check:types:next": "node node_modules/typescript7/bin/tsc --noEmit",
     "api:update": "npm run build && api-extractor run --local",

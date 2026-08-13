@@ -277,7 +277,15 @@ Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, {
 - [HTTP adapters](docs/http.md) — options, error mapping, cacheability rules
 - [NestJS](docs/nestjs.md) — module, interceptor, decorator
 - [Writing an adapter](docs/writing-an-adapter.md) — Koa as the worked example
-- [breakwater recipe](docs/breakwater.md) — resilience policies around storage calls
+- [Benchmarks](docs/benchmarks.md) — what the guarantee costs per storage
+
+Recipes — the non-HTTP callers are the headline:
+
+- [RabbitMQ consumers](docs/rabbitmq.md) — key from `messageId`, outcomes mapped to ack/retry/DLQ
+- [SQS consumers](docs/sqs.md) — dedup beyond FIFO's 5-minute window, on standard queues too
+- [BullMQ processors](docs/bullmq.md) — content/intent idempotency beyond `jobId` dedup
+- [Cron, workers and CLIs](docs/jobs.md) — one run per schedule slot, across replicas
+- [breakwater](docs/breakwater.md) — resilience policies around storage calls
 
 ## Development
 
