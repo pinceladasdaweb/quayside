@@ -57,6 +57,22 @@ describe('canonicalize', () => {
     )
   })
 
+  test('distinguishes nested undefined from null and invalid dates from valid ones', () => {
+    assert.notEqual(hashCanonical({ a: undefined }), hashCanonical({ a: null }))
+    const invalid = new Date('not a date')
+    assert.equal(hashCanonical(invalid), hashCanonical(new Date('still not')))
+    assert.notEqual(hashCanonical(invalid), hashCanonical(new Date(0)))
+  })
+
+  test('a pick path deeper than a sibling top-level key excludes that sibling', () => {
+    const first = { a: { b: 1 }, z: 1 }
+    const second = { a: { b: 1 }, z: 2 }
+    assert.equal(
+      hashCanonical(first, { pickFields: ['a.b'] }),
+      hashCanonical(second, { pickFields: ['a.b'] })
+    )
+  })
+
   test('pickFields keeps only the selected paths', () => {
     const first = { order: 7, requestId: 'r-1', meta: { retries: 0 } }
     const second = { order: 7, requestId: 'r-2', meta: { retries: 3 } }

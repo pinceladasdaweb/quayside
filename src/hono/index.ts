@@ -37,8 +37,9 @@ async function captureWebResponse (
   const declaredLength = response.headers.get('content-length')
   if (declaredLength !== null && Number(declaredLength) > kernel.maxBodyBytes) return null
 
-  const reader = response.clone().body
-  if (reader === null) return null
+  // The clone of a response whose body was checked non-null above is never
+  // null; the cast removes a branch no test could ever reach.
+  const reader = response.clone().body as ReadableStream<Uint8Array>
   const chunks: Uint8Array[] = []
   let size = 0
   const stream = reader.getReader()
@@ -84,7 +85,9 @@ export function HonoMiddleware (
       return
     }
     if (outcome.kind === 'respond') {
-      return new Response(outcome.response.body, {
+      // Null-body statuses (204, 304) reject any body, even an empty
+      // string; an empty replay body is a no-body response.
+      return new Response(outcome.response.body === '' ? null : outcome.response.body, {
         status: outcome.response.status,
         headers: outcome.response.headers
       })

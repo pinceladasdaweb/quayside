@@ -7,6 +7,8 @@ import { Body, Controller, Post, UseInterceptors } from '@nestjs/common'
 import type { INestApplication } from '@nestjs/common'
 import { Test } from '@nestjs/testing'
 
+import { Idempotency } from '../../src/index'
+import type { IdempotencyStorage } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 import { Idempotent, IdempotencyInterceptor, QuaysideModule } from '../../src/nestjs/index'
 import type { NestRequestLike } from '../../src/nestjs/index'
@@ -147,5 +149,163 @@ describe('nestjs adapter', () => {
     await post('/plain', 'nest-5', {})
     await post('/plain', 'nest-5', {})
     assert.equal(calls.plain, 2)
+  })
+
+  test('forRootAsync builds the module from a factory', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        QuaysideModule.forRootAsync({
+          useFactory: async () => ({ storage: new MemoryStorage(), header: 'X-Once' })
+        })
+      ],
+      controllers: [PaymentsController]
+    }).compile()
+    const asyncApp = moduleRef.createNestApplication()
+    await asyncApp.listen(0)
+    const url = (await asyncApp.getUrl()).replace('[::1]', '127.0.0.1')
+
+    const request = async () => fetch(`${url}/payments`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-once': 'async-1' },
+      body: JSON.stringify({ amount: 3 })
+    })
+    const startingCalls = calls.payments ?? 0
+    await request()
+    const second = await request()
+    assert.equal(second.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.payments, startingCalls + 1)
+    await asyncApp.close()
+  })
+})
+
+describe('nestjs interceptor glue', () => {
+  function fakeContext (headers: Record<string, unknown>, response: unknown, handler: () => unknown) {
+    return {
+      getType: () => 'http',
+      getHandler: () => handler,
+      switchToHttp: () => ({
+        getRequest: () => ({ headers, body: { n: 1 } }),
+        getResponse: () => response
+      })
+    }
+  }
+
+  function decorated (options: Parameters<typeof Idempotent>[0] = {}) {
+    const handler = () => 'handled'
+    Idempotent(options)({}, 'handler', { value: handler })
+    return handler
+  }
+
+  async function intercept (
+    interceptor: IdempotencyInterceptor,
+    context: ReturnType<typeof fakeContext>,
+    result: unknown = 'fresh'
+  ): Promise<unknown> {
+    const { lastValueFrom, of } = await import('rxjs')
+    return lastValueFrom(
+      interceptor.intercept(context as never, { handle: () => of(result) })
+    )
+  }
+
+  test('takes the first value of an array header and sets fastify-style headers', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated()
+    const headersSet: Record<string, string> = {}
+    const fastifyStyleResponse = { header: (name: string, value: string) => { headersSet[name] = value } }
+
+    const context = fakeContext({ 'idempotency-key': ['arr-1', 'ignored'] }, fastifyStyleResponse, handler)
+    assert.equal(await intercept(interceptor, context, 'first'), 'first')
+    assert.equal(await intercept(interceptor, context, 'second'), 'first')
+    assert.equal(headersSet['idempotency-replayed'], 'true')
+  })
+
+  test('maps fencing and storage failures onto 500 and 503', async () => {
+    const { HttpException } = await import('@nestjs/common')
+    const { FencingError } = await import('../../src/index')
+
+    const fencing: IdempotencyStorage = {
+      acquire: async () => null,
+      complete: async () => { throw new FencingError('k') },
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: fencing }),
+      { storage: fencing }
+    )
+    const handler = decorated()
+    await assert.rejects(
+      intercept(interceptor, fakeContext({ 'idempotency-key': 'f-1' }, {}, handler)),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        assert.equal(error.getStatus(), 500)
+        return true
+      }
+    )
+
+    const down: IdempotencyStorage = {
+      acquire: async () => { throw new Error('down') },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const unavailable = new IdempotencyInterceptor(
+      new Idempotency({ storage: down }),
+      { storage: down }
+    )
+    await assert.rejects(
+      intercept(unavailable, fakeContext({ 'idempotency-key': 'f-2' }, {}, decorated())),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        assert.equal(error.getStatus(), 503)
+        return true
+      }
+    )
+  })
+
+  test('module builders honor global, imports and inject options', async () => {
+    const scoped = QuaysideModule.forRoot({ storage: new MemoryStorage(), global: false })
+    assert.equal(scoped.global, false)
+    const globalByDefault = QuaysideModule.forRoot({ storage: new MemoryStorage() })
+    assert.equal(globalByDefault.global, true)
+
+    const asyncModule = QuaysideModule.forRootAsync({
+      imports: [],
+      inject: [],
+      useFactory: () => ({ storage: new MemoryStorage() })
+    })
+    assert.deepEqual(asyncModule.imports, [])
+    assert.equal(asyncModule.global, true)
+  })
+
+  test('a custom key extractor returning nothing runs unprotected', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated({ key: () => '' })
+    const context = fakeContext({}, {}, handler)
+    assert.equal(await intercept(interceptor, context, 'ran-1'), 'ran-1')
+    assert.equal(await intercept(interceptor, context, 'ran-2'), 'ran-2')
+  })
+
+  test('non-http contexts pass through untouched', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const { lastValueFrom, of } = await import('rxjs')
+    const context = { getType: () => 'rpc', getHandler: () => decorated() }
+    assert.equal(
+      await lastValueFrom(interceptor.intercept(context as never, { handle: () => of('rpc-result') })),
+      'rpc-result'
+    )
   })
 })

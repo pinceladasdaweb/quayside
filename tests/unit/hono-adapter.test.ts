@@ -32,6 +32,29 @@ before(() => {
     calls.boom = (calls.boom ?? 0) + 1
     throw new Error('handler exploded')
   })
+  app.post('/empty', (c) => {
+    calls.empty = (calls.empty ?? 0) + 1
+    return c.body(null, 204)
+  })
+  app.post('/stream-huge', (c) => {
+    calls.streamHuge = (calls.streamHuge ?? 0) + 1
+    // No content-length: the capture only discovers the overflow while
+    // reading the stream clone.
+    const chunk = new TextEncoder().encode('x'.repeat(700))
+    const stream = new ReadableStream<Uint8Array>({
+      start (controller) {
+        controller.enqueue(chunk)
+        controller.enqueue(chunk)
+        controller.close()
+      }
+    })
+    return c.body(stream, 200)
+  })
+  app.post('/declared-huge', (c) => {
+    calls.declaredHuge = (calls.declaredHuge ?? 0) + 1
+    // The declared length is what the capture trusts before reading.
+    return c.body('tiny body', 200, { 'content-length': '999999' })
+  })
   // Expected handler errors answer 500 without reaching Hono's default
   // error handler, which would dump the stack to stderr and drown out any
   // real failure in the test output.
@@ -86,5 +109,43 @@ describe('hono adapter', () => {
     const second = await post('/boom', 'hon-boom', {})
     assert.equal(second.status, 500)
     assert.equal(calls.boom, 2)
+  })
+
+  test('bodyless responses replay as empty bodies', async () => {
+    const first = await app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-204' } })
+    assert.equal(first.status, 204)
+    const second = await app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-204' } })
+    assert.equal(second.status, 204)
+    assert.equal(second.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.empty, 1)
+  })
+
+  test('a streamed body over the cap is served and never cached', async () => {
+    const first = await post('/stream-huge', 'hon-stream', {})
+    const second = await post('/stream-huge', 'hon-stream', {})
+    assert.equal((await first.text()).length, 1_400)
+    assert.equal((await second.text()).length, 1_400)
+    assert.equal(calls.streamHuge, 2)
+  })
+
+  test('a declared content-length over the cap is served and never cached', async () => {
+    const first = await post('/declared-huge', 'hon-declared', {})
+    const second = await post('/declared-huge', 'hon-declared', {})
+    assert.equal(await first.text(), 'tiny body')
+    assert.equal(await second.text(), 'tiny body')
+    assert.equal(calls.declaredHuge, 2)
+  })
+
+  test('methods outside the configured set pass through', async () => {
+    const response = await app.request('/empty', { method: 'GET' })
+    assert.equal(response.status, 404)
+  })
+
+  test('a request without a body runs unfingerprinted and replays', async () => {
+    const request = async () => app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-nobody' } })
+    await request()
+    const second = await request()
+    assert.equal(second.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.empty, 2)
   })
 })

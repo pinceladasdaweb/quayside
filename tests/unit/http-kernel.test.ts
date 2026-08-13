@@ -175,4 +175,68 @@ describe('http kernel cacheability', () => {
     assert.equal(calls, 2)
     assert.notEqual(second.kind, 'respond')
   })
+
+  test('a replayed uncacheable sentinel passes the request through unprotected', async () => {
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const kernel = new HttpIdempotencyKernel(idempotency)
+    // A concurrent waiter can read the FAILED sentinel before the kernel
+    // invalidates it; the stored shape is what settleFailure writes.
+    await storage.acquire({ key: 'k-1', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('k-1', 't', {
+      status: 'failed',
+      error: JSON.stringify({ name: 'QuaysideUncacheableResponse', message: 'not cacheable' })
+    }, 60_000)
+    const outcome = await kernel.handle(post({ key: 'k-1', body: undefined }), async () => ok())
+    assert.deepEqual(outcome, { kind: 'passthrough' })
+  })
+
+  test('a request without a body fingerprints nothing and still replays', async () => {
+    const kernel = kernelWith()
+    let calls = 0
+    const run = async () => { calls += 1; return ok() }
+    await kernel.handle(post({ body: undefined }), run)
+    const second = await kernel.handle(post({ body: undefined }), run)
+    assert.equal(calls, 1)
+    assert.equal(second.kind, 'respond')
+  })
+})
+
+describe('http kernel configuration', () => {
+  test('custom header and method set are honored', async () => {
+    const kernel = kernelWith({ header: 'X-Request-Once', methods: ['PUT'] })
+    let calls = 0
+    const run = async () => { calls += 1; return ok() }
+    const headers: Record<string, string | undefined> = { 'x-request-once': 'cfg-1' }
+    const request: HttpRequestFacts = { method: 'PUT', path: '/p', body: { a: 1 }, header: (name) => headers[name] }
+
+    assert.deepEqual(await kernel.handle({ ...request, method: 'POST' }, run), { kind: 'passthrough' })
+    assert.deepEqual(await kernel.handle(request, run), { kind: 'handled' })
+    const replay = await kernel.handle(request, run)
+    assert.equal(calls, 1)
+    assert.equal(replay.kind, 'respond')
+  })
+})
+
+describe('http kernel header selection', () => {
+  test('selects string, numeric and array header values and skips the rest', () => {
+    const kernel = kernelWith({ replayHeaders: ['content-type', 'content-length', 'location', 'x-empty', 'x-missing'] })
+    const values: Record<string, unknown> = {
+      'content-type': 'application/json',
+      'content-length': 42,
+      location: ['first', 'second'],
+      'x-empty': '',
+      'x-missing': undefined
+    }
+    assert.deepEqual(kernel.selectHeaders((name) => values[name]), {
+      'content-type': 'application/json',
+      'content-length': '42',
+      location: 'first, second'
+    })
+  })
+
+  test('skips empty array header values', () => {
+    const kernel = kernelWith({ replayHeaders: ['location'] })
+    assert.deepEqual(kernel.selectHeaders(() => []), {})
+  })
 })

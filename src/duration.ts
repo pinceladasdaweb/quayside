@@ -21,9 +21,10 @@ export function parseDuration (duration: Duration): number {
   if (match === null) {
     throw new TypeError(`invalid duration "${duration}"; expected a positive number of milliseconds or a string like "500ms", "30s", "10m", "24h" or "7d"`)
   }
-  const [, amount = '', unit = 'ms'] = match
-  const ms = Number(amount) * UNIT_MS[unit as keyof typeof UNIT_MS]
-  if (ms <= 0) {
+  // The pattern guarantees both groups; NaN from a hypothetical mismatch
+  // still lands in the guard below.
+  const ms = Number(match[1]) * UNIT_MS[match[2] as keyof typeof UNIT_MS]
+  if (!Number.isFinite(ms) || ms <= 0) {
     throw new RangeError(`invalid duration "${duration}"; it must be greater than zero`)
   }
   return Math.round(ms)

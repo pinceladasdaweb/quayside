@@ -16,6 +16,17 @@ function tracing () {
 }
 
 describe('otel collector', () => {
+  test('falls back to the global tracer and stays inert without an SDK', () => {
+    const collector = otelSpans()
+    const event = { type: 'completed', key: 'k', correlationId: 'c-1', timestamp: Date.now(), durationMs: 5 } as const
+    collector.onAcquired?.({ ...event, type: 'acquired' })
+    collector.onCompleted?.(event)
+    collector.onReplayed?.({ ...event, type: 'replayed' })
+    collector.onConflict?.({ ...event, type: 'conflict' })
+    // No recorded start and no duration: the span degrades to instant.
+    collector.onFailed?.({ type: 'failed', key: 'k', correlationId: 'c-2', timestamp: Date.now() })
+  })
+
   test('emits execute spans with replay and outcome attributes', async () => {
     const { exporter, tracer } = tracing()
     const idempotency = new Idempotency({

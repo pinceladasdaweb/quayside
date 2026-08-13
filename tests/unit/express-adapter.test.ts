@@ -35,6 +35,13 @@ before(async () => {
     calls.boom = (calls.boom ?? 0) + 1
     throw new Error('handler exploded')
   })
+  app.post('/stream', (_req, res) => {
+    calls.stream = (calls.stream ?? 0) + 1
+    res.status(200).type('text/plain')
+    res.write('hello ', 'utf8')
+    res.write(Buffer.from('streamed '))
+    res.end('world')
+  })
 
   // Expected handler errors answer 500 without reaching Express's default
   // error handler, which would dump the stack to stderr and drown out any
@@ -112,5 +119,88 @@ describe('express adapter', () => {
     const second = await post('/boom', 'exp-boom', {})
     assert.equal(second.status, 500)
     assert.equal(calls.boom, 2)
+  })
+
+  test('responses written in chunks are captured whole and replayed', async () => {
+    const first = await post('/stream', 'exp-stream', {})
+    assert.equal(await first.text(), 'hello streamed world')
+    const second = await post('/stream', 'exp-stream', {})
+    assert.equal(await second.text(), 'hello streamed world')
+    assert.equal(second.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.stream, 1)
+  })
+})
+
+describe('express adapter glue', () => {
+  function fakeResponse () {
+    const headers: Record<string, string> = {}
+    const res = {
+      statusCode: 200,
+      body: '',
+      setHeader (name: string, value: string) { headers[name] = value },
+      getHeader (name: string) { return headers[name] },
+      write (chunk: unknown) {
+        res.body += String(chunk)
+        return true
+      },
+      end (chunk?: unknown) {
+        if (chunk !== undefined && typeof chunk !== 'function') res.body += String(chunk)
+        return res
+      },
+      headers
+    }
+    return res
+  }
+
+  test('takes the first value of an array header', async () => {
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency)
+    let handled = 0
+    const request = {
+      method: 'POST',
+      path: '/fake',
+      body: { n: 1 },
+      headers: { 'idempotency-key': ['array-key', 'ignored'] }
+    }
+
+    const roundTrip = async () => await new Promise<ReturnType<typeof fakeResponse>>((resolve) => {
+      const res = fakeResponse()
+      middleware(request, res, () => {
+        handled += 1
+        res.statusCode = 201
+        res.end('created')
+        setImmediate(() => resolve(res))
+      })
+      // replays respond without calling next
+      setImmediate(() => setImmediate(() => resolve(res)))
+    })
+
+    await roundTrip()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const replayed = await roundTrip()
+    assert.equal(handled, 1)
+    assert.equal(replayed.headers['idempotency-replayed'], 'true')
+    assert.equal(replayed.body, 'created')
+  })
+
+  test('forwards a replayed persisted failure to the error chain', async () => {
+    const storage = new MemoryStorage()
+    await storage.acquire({ key: 'poisoned', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('poisoned', 't', {
+      status: 'failed',
+      error: JSON.stringify({ name: 'PaymentDeclinedError', message: 'card declined' })
+    }, 60_000)
+
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const middleware = ExpressMiddleware(idempotency)
+    const forwarded = await new Promise<unknown>((resolve) => {
+      middleware(
+        { method: 'POST', path: '/fake', body: undefined, headers: { 'idempotency-key': 'poisoned' } },
+        fakeResponse(),
+        (error?: unknown) => resolve(error)
+      )
+    })
+    assert.ok(forwarded instanceof Error)
+    assert.equal(forwarded.message, 'card declined')
   })
 })

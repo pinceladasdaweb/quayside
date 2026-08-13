@@ -83,6 +83,7 @@ describe('Idempotency.execute', () => {
       assert.equal(ctx.replayed, false)
       assert.ok(ctx.signal instanceof AbortSignal)
       await ctx.extend('1h')
+      await ctx.extend() // defaults to the instance lockTtl
       return 1
     })
   })
@@ -144,6 +145,66 @@ describe('Idempotency concurrency', () => {
     })
     open()
     await running
+  })
+
+  test('a waiter replays a persisted failure', async () => {
+    const idempotency = instance({ onConflict: 'wait', persistFailures: true })
+    const { open, opened } = gate()
+    const failing = idempotency.execute('k', async () => {
+      await opened
+      throw new Error('holder exploded')
+    })
+    failing.catch(() => {})
+    await new Promise((resolve) => setImmediate(resolve))
+    const waiting = idempotency.execute('k', async () => 'never')
+    setTimeout(open, 30)
+    await assert.rejects(failing, /holder exploded/)
+    await assert.rejects(waiting, /holder exploded/)
+  })
+
+  test('a storage with waitForChange drives the wait, and a broken one degrades to polling', async () => {
+    const makeStorage = (waitForChange: (key: string, timeoutMs: number) => Promise<void>) => {
+      const memory = new MemoryStorage()
+      const storage: IdempotencyStorage = {
+        acquire: (record, ttl) => memory.acquire(record, ttl),
+        complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+        release: (key, token) => memory.release(key, token),
+        extend: (key, token, ttl) => memory.extend(key, token, ttl),
+        get: (key) => memory.get(key),
+        delete: (key) => memory.delete(key),
+        waitForChange
+      }
+      return storage
+    }
+
+    let waits = 0
+    const notifying = new Idempotency({
+      storage: makeStorage(async (_key, timeoutMs) => {
+        waits += 1
+        await new Promise((resolve) => setTimeout(resolve, Math.min(timeoutMs, 10)))
+      }),
+      onConflict: 'wait'
+    })
+    const { open, opened } = gate()
+    const winner = notifying.execute('k', async () => { await opened; return 'w' })
+    await new Promise((resolve) => setImmediate(resolve))
+    const waiter = notifying.execute('k', async () => 'l')
+    setTimeout(open, 40)
+    assert.equal(await winner, 'w')
+    assert.equal(await waiter, 'w')
+    assert.ok(waits >= 1, 'expected the waiter to use waitForChange')
+
+    const broken = new Idempotency({
+      storage: makeStorage(async () => { throw new Error('subscriber down') }),
+      onConflict: 'wait'
+    })
+    const secondGate = gate()
+    const winner2 = broken.execute('k2', async () => { await secondGate.opened; return 'w2' })
+    await new Promise((resolve) => setImmediate(resolve))
+    const waiter2 = broken.execute('k2', async () => 'l2')
+    setTimeout(secondGate.open, 40)
+    assert.equal(await winner2, 'w2')
+    assert.equal(await waiter2, 'w2')
   })
 
   test('a waiter takes over after the holder fails', async () => {
@@ -222,6 +283,93 @@ describe('Idempotency failures', () => {
     })
   })
 
+  test('replays non-Error throws and survives hostile error shapes', async () => {
+    const idempotency = instance({ persistFailures: true })
+    // eslint-disable-next-line no-throw-literal -- non-Error throws are the case under test
+    await assert.rejects(idempotency.execute('plain', async () => { throw 'just a string' }), /just a string/)
+    await assert.rejects(idempotency.execute('plain', async () => 'never'), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.equal(error.message, 'just a string')
+      return true
+    })
+
+    const unstringable = { toString () { throw new Error('nope') } }
+    await assert.rejects(idempotency.execute('hostile', async () => { throw unstringable }))
+    await assert.rejects(idempotency.execute('hostile', async () => 'never'), /unknown failure/)
+
+    const poisoned = new Error('base')
+    Object.defineProperty(poisoned, 'name', { get () { throw new Error('gotcha') } })
+    await assert.rejects(idempotency.execute('poisoned', async () => { throw poisoned }))
+    await assert.rejects(idempotency.execute('poisoned', async () => 'never'), /failure could not be serialized/)
+  })
+
+  test('a corrupt stored failure replays as a plain error with the raw text', async () => {
+    const storage = new MemoryStorage()
+    await storage.acquire({ key: 'corrupt', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('corrupt', 't', { status: 'failed', error: 'not json {' }, 60_000)
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    await assert.rejects(idempotency.execute('corrupt', async () => 'never'), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.equal(error.message, 'not json {')
+      return true
+    })
+  })
+
+  test('a failed record without a stored error still replays an Error', async () => {
+    const failedRecord = {
+      key: 'k',
+      token: 't',
+      status: 'failed' as const,
+      storedAt: Date.now(),
+      expiresAt: Date.now() + 60_000
+    }
+    const stub: IdempotencyStorage = {
+      acquire: async () => failedRecord,
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => failedRecord,
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage: stub })
+    await assert.rejects(idempotency.execute('k', async () => 'never'), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      return true
+    })
+
+    // The same shape observed by a waiter instead of at acquisition time.
+    const inProgress = { ...failedRecord, status: 'in-progress' as const }
+    const waiterStub: IdempotencyStorage = { ...stub, acquire: async () => inProgress }
+    const waiting = new Idempotency({ storage: waiterStub, onConflict: 'wait' })
+    await assert.rejects(waiting.execute('k', async () => 'never'), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      return true
+    })
+  })
+
+  test('fail-open executions expose a no-op extend', async () => {
+    const down: IdempotencyStorage = {
+      acquire: async () => { throw new Error('down') },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => { throw new Error('must not be called') },
+      get: async () => null,
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage: down, onStorageError: 'open' })
+    const value = await idempotency.execute('k', async (ctx) => {
+      await ctx.extend('1m')
+      return 'v'
+    })
+    assert.equal(value, 'v')
+  })
+
+  test('rejects non-string keys', async () => {
+    const idempotency = instance()
+    await assert.rejects(idempotency.execute(123 as never, async () => 1), TypeError)
+    await assert.rejects(idempotency.execute({ key: 123 as never }, async () => 1), TypeError)
+  })
+
   test('a non-serializable result surfaces SerializationError and releases the key', async () => {
     const idempotency = instance()
     let calls = 0
@@ -283,6 +431,17 @@ describe('Idempotency API surface', () => {
     assert.equal(await createOnce({ invoiceId: 123 }), 'payment-for-123')
     assert.equal(await createOnce({ invoiceId: 456 }), 'payment-for-456')
     assert.equal(calls, 2)
+  })
+
+  test('get exposes a persisted failure as a decoded error', async () => {
+    const idempotency = instance({ persistFailures: true })
+    await assert.rejects(idempotency.execute('k', async () => { throw new Error('stored failure') }))
+    const record = await idempotency.get('k')
+    assert.ok(record)
+    assert.equal(record.status, 'failed')
+    assert.ok(record.error instanceof Error)
+    assert.equal(record.error.message, 'stored failure')
+    assert.equal(record.value, undefined)
   })
 
   test('get exposes the decoded record and invalidate allows re-execution', async () => {

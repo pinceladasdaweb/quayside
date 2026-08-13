@@ -72,4 +72,17 @@ describe('prometheus collector', () => {
     assert.equal(await metricValue(registry, 'q2_conflicts_total', { namespace: '' }), 1)
     assert.equal(await metricValue(registry, 'q2_storage_bypass_total', { namespace: '' }), 1)
   })
+
+  test('defaults and duration-less events are handled', async () => {
+    const registry = new Registry()
+    const collector = prometheusMetrics({ register: registry, prefix: 'q3_', durationBuckets: [0.1, 1] })
+    const event = { type: 'completed', key: 'k', correlationId: 'c', timestamp: Date.now() } as const
+    collector.onCompleted?.(event) // no durationMs: counted, not observed
+    assert.equal(await metricValue(registry, 'q3_executions_total', { outcome: 'completed', namespace: '' }), 1)
+    assert.equal(await metricValue(registry, 'q3_execution_duration_seconds_count', { outcome: 'completed', namespace: '' }), 0)
+
+    // The global-registry default only needs to not throw.
+    const globalCollector = prometheusMetrics()
+    globalCollector.onConflict?.({ ...event, type: 'conflict' })
+  })
 })

@@ -29,7 +29,6 @@ export interface FastifyInstanceLike {
 interface PendingExecution {
   resolveCapture (captured: CapturedHttpResponse | null): void
   outcome: Promise<KernelOutcome>
-  settled: boolean
 }
 
 function headerValue (value: unknown): string | undefined {
@@ -74,11 +73,12 @@ export function FastifyPlugin (
     // conflict, passthrough) or acquires the lock and asks for the
     // downstream response, which onSend later provides.
     instance.addHook('preHandler', async (request, reply) => {
-      let proceed: () => void = () => {}
+      // Promise executors run synchronously, so both are assigned before use.
+      let proceed!: () => void
       const proceeded = new Promise<'execute'>((resolve) => {
         proceed = () => resolve('execute')
       })
-      let resolveCapture: (captured: CapturedHttpResponse | null) => void = () => {}
+      let resolveCapture!: (captured: CapturedHttpResponse | null) => void
       const capture = new Promise<CapturedHttpResponse | null>((resolve) => {
         resolveCapture = resolve
       })
@@ -99,7 +99,7 @@ export function FastifyPlugin (
 
       const first = await Promise.race([proceeded, outcome])
       if (first === 'execute') {
-        pending.set(request as object, { resolveCapture, outcome, settled: false })
+        pending.set(request as object, { resolveCapture, outcome })
         return
       }
       if (first.kind === 'respond') {
@@ -112,8 +112,7 @@ export function FastifyPlugin (
 
     instance.addHook('onSend', async (request, reply, payload) => {
       const entry = pending.get(request as object)
-      if (entry === undefined || entry.settled) return payload
-      entry.settled = true
+      if (entry === undefined) return payload
       pending.delete(request as object)
       entry.resolveCapture(capturedFrom(kernel, reply, payload))
       try {

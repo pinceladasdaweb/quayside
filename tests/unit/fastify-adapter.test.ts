@@ -7,6 +7,9 @@ import { FastifyPlugin } from '../../src/fastify/index'
 import { Idempotency } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 
+// note: Fastify and the storage types are exercised structurally; the
+// poisoned-record test below feeds the plugin a replayable failure.
+
 let app: FastifyInstance
 let calls: Record<string, number>
 
@@ -27,6 +30,10 @@ before(async () => {
   app.post('/boom', async () => {
     calls.boom = (calls.boom ?? 0) + 1
     throw new Error('handler exploded')
+  })
+  app.post('/empty', async (_request, reply) => {
+    calls.empty = (calls.empty ?? 0) + 1
+    return reply.status(204).send()
   })
   await app.ready()
 })
@@ -83,5 +90,95 @@ describe('fastify adapter', () => {
     const second = await post('/boom', 'fas-boom', {})
     assert.equal(second.statusCode, 500)
     assert.equal(calls.boom, 2)
+  })
+
+  test('bodyless responses replay as empty bodies', async () => {
+    const first = await post('/empty', 'fas-204', {})
+    assert.equal(first.statusCode, 204)
+    const second = await post('/empty', 'fas-204', {})
+    assert.equal(second.statusCode, 204)
+    assert.equal(second.headers['idempotency-replayed'], 'true')
+    assert.equal(calls.empty, 1)
+  })
+
+  test('the query string stays out of the fingerprint path', async () => {
+    const first = await app.inject({
+      method: 'POST',
+      url: '/payments?attempt=1',
+      headers: { 'content-type': 'application/json', 'idempotency-key': 'fas-query' },
+      payload: JSON.stringify({ amount: 5 })
+    })
+    assert.equal(first.statusCode, 201)
+    const second = await app.inject({
+      method: 'POST',
+      url: '/payments?attempt=2',
+      headers: { 'content-type': 'application/json', 'idempotency-key': 'fas-query' },
+      payload: JSON.stringify({ amount: 5 })
+    })
+    assert.equal(second.headers['idempotency-replayed'], 'true')
+  })
+
+  test('a replayed persisted failure surfaces through the error handler', async () => {
+    const storage = new MemoryStorage()
+    await storage.acquire({ key: 'poisoned', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('poisoned', 't', {
+      status: 'failed',
+      error: JSON.stringify({ name: 'PaymentDeclinedError', message: 'card declined' })
+    }, 60_000)
+    const poisonedApp = Fastify()
+    await poisonedApp.register(FastifyPlugin(new Idempotency({ storage, persistFailures: true })) as never)
+    poisonedApp.post('/pay', async () => ({ never: true }))
+    await poisonedApp.ready()
+
+    const response = await poisonedApp.inject({
+      method: 'POST',
+      url: '/pay',
+      headers: { 'idempotency-key': 'poisoned' }
+    })
+    assert.equal(response.statusCode, 500)
+    await poisonedApp.close()
+  })
+
+  test('takes the first value of an array header', async () => {
+    // Real HTTP joins duplicate headers into one string before the plugin
+    // sees them, so the array branch is exercised by driving the hooks
+    // directly with a raw multi-value header.
+    const hooks: Record<string, (...args: never[]) => Promise<unknown>> = {}
+    const fakeInstance = {
+      addHook (name: string, hook: (...args: never[]) => Promise<unknown>) {
+        hooks[name] = hook
+      }
+    }
+    await FastifyPlugin(new Idempotency({ storage: new MemoryStorage() }))(fakeInstance as never)
+
+    const roundTrip = async (payload: string) => {
+      const request = {
+        method: 'POST',
+        url: '/fake?x=1',
+        headers: { 'idempotency-key': ['array-key', 'ignored'] },
+        body: { n: 1 }
+      }
+      const headersSet: Record<string, string> = {}
+      const reply = {
+        statusCode: 201,
+        sent: undefined as unknown,
+        getHeader: (name: string) => headersSet[name],
+        header (name: string, value: string) { headersSet[name] = value },
+        code (status: number) { reply.statusCode = status; return reply },
+        send (body: unknown) { reply.sent = body; return reply }
+      }
+      await hooks.preHandler?.(request as never, reply as never)
+      if (reply.sent === undefined) {
+        await hooks.onSend?.(request as never, reply as never, payload as never)
+        return { reply, body: payload }
+      }
+      return { reply, body: reply.sent }
+    }
+
+    const first = await roundTrip('first-response')
+    assert.equal(first.body, 'first-response')
+    const second = await roundTrip('second-response')
+    assert.equal(second.body, 'first-response')
+    assert.equal(second.reply.getHeader('idempotency-replayed'), 'true')
   })
 })

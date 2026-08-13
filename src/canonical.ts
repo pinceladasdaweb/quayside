@@ -23,8 +23,9 @@ class PathFilter {
     this.picks = options.pickFields?.map((path) => path.split('.'))
   }
 
+  // Only called for object entries and array items, whose paths are never
+  // empty; the root value is always included.
   includes (path: string[]): boolean {
-    if (path.length === 0) return true
     if (this.ignore.has(path.join('.'))) return false
     if (this.picks === undefined) return true
     return this.picks.some((pick) => isPrefix(pick, path) || isPrefix(path, pick))
