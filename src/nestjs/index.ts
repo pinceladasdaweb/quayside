@@ -6,7 +6,7 @@ import {
   SetMetadata
 } from '@nestjs/common'
 import type { Observable } from 'rxjs'
-import { from, lastValueFrom } from 'rxjs'
+import { defaultIfEmpty, from, lastValueFrom } from 'rxjs'
 import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } from '@nestjs/common'
 
 // Runtime values come from the core entry point, never from deep module
@@ -27,7 +27,9 @@ export const QUAYSIDE_IDEMPOTENCY = 'QUAYSIDE_IDEMPOTENCY'
 /** Injection token for the module options (storage, TTLs, header). */
 export const QUAYSIDE_MODULE_OPTIONS = 'QUAYSIDE_MODULE_OPTIONS'
 
-const IDEMPOTENT_METADATA = 'quayside:idempotent'
+// A symbol cannot collide with foreign metadata and needs no name: the
+// decorator and the interceptor share this reference.
+const IDEMPOTENT_METADATA = Symbol('quayside idempotent')
 
 export interface NestRequestLike {
   headers: Record<string, unknown>
@@ -61,10 +63,11 @@ export function Idempotent (options: IdempotentOptions = {}): MethodDecorator {
   return SetMetadata(IDEMPOTENT_METADATA, options)
 }
 
+// An empty-string header falls out at the caller's key check, together with
+// the absent-key case.
 function headerValue (value: unknown): string | undefined {
-  if (typeof value === 'string' && value !== '') return value
-  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
-  return undefined
+  if (Array.isArray(value)) return headerValue(value[0])
+  return typeof value === 'string' ? value : undefined
 }
 
 // Platform-neutral: express exposes setHeader, fastify exposes header.
@@ -80,10 +83,6 @@ function setResponseHeader (response: unknown, name: string, value: string): voi
 @Injectable()
 export class IdempotencyInterceptor implements NestInterceptor {
   private readonly headerName: string
-  // Per-route ttl overrides become derived instances sharing the same
-  // storage; the map is bounded by the number of distinct ttl values used
-  // in decorators.
-  private readonly derived = new Map<Duration, Idempotency>()
 
   constructor (
     @Inject(QUAYSIDE_IDEMPOTENCY) private readonly idempotency: Idempotency,
@@ -113,7 +112,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
           400
         )
       }
-      return lastValueFrom(next.handle(), { defaultValue: undefined })
+      return lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
     }
 
     const payload = options.fingerprint === false
@@ -124,8 +123,8 @@ export class IdempotencyInterceptor implements NestInterceptor {
 
     try {
       const outcome = await this.instanceFor(options.ttl).executeWithMetadata(
-        payload === undefined ? { key } : { key, payload },
-        async () => lastValueFrom(next.handle(), { defaultValue: undefined })
+        { key, payload },
+        async () => lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
       )
       if (outcome.replayed) setResponseHeader(response, 'idempotency-replayed', 'true')
       return outcome.value
@@ -134,14 +133,12 @@ export class IdempotencyInterceptor implements NestInterceptor {
     }
   }
 
+  // Routes with a ttl override are the exception, so the derived instance
+  // is built on demand; it shares the base storage.
   private instanceFor (ttl: Duration | undefined): Idempotency {
-    if (ttl === undefined) return this.idempotency
-    let instance = this.derived.get(ttl)
-    if (instance === undefined) {
-      instance = new Idempotency({ ...this.options, resultTtl: ttl })
-      this.derived.set(ttl, instance)
-    }
-    return instance
+    return ttl === undefined
+      ? this.idempotency
+      : new Idempotency({ ...this.options, resultTtl: ttl })
   }
 
   private mapError (error: unknown, response: unknown): unknown {

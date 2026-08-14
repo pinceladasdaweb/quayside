@@ -115,6 +115,19 @@ export function runStorageContract (name: string, createStorage: StorageFactory)
       await assert.rejects(storage.extend('k1', 'stale', 5_000), FencingError)
     })
 
+    test('release and extend after a terminal state fail and keep the stored outcome', async () => {
+      // A late cleanup from the holder itself must never delete or prolong
+      // a result that already committed.
+      const storage = await createStorage()
+      await storage.acquire(pending('k1'), 1_000)
+      await storage.complete('k1', 'token-1', { status: 'completed', result: '"kept"' }, 60_000)
+      await assert.rejects(storage.release('k1', 'token-1'), FencingError)
+      await assert.rejects(storage.extend('k1', 'token-1', 5_000), FencingError)
+      const record = await storage.get('k1')
+      assert.equal(record?.status, RECORD_STATUS.completed)
+      assert.equal(record?.result, '"kept"')
+    })
+
     test('an expired lock reads as absent and the key can be re-acquired', async () => {
       const storage = await createStorage()
       await storage.acquire(pending('k1', 'crashed'), 30)
@@ -157,6 +170,16 @@ export function runStorageContract (name: string, createStorage: StorageFactory)
       const completed = await storage.get('k1')
       assert.ok(completed)
       assert.equal(completed.fingerprint, fingerprint)
+    })
+
+    test('fenced operations on a missing key fail with FencingError', async () => {
+      const storage = await createStorage()
+      await assert.rejects(
+        storage.complete('ghost', 'token-1', { status: 'completed', result: '"x"' }, 1_000),
+        FencingError
+      )
+      await assert.rejects(storage.release('ghost', 'token-1'), FencingError)
+      await assert.rejects(storage.extend('ghost', 'token-1', 1_000), FencingError)
     })
 
     test('delete removes the record unconditionally', async () => {

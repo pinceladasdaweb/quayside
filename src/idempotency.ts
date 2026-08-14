@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { setTimeout as sleep } from 'node:timers/promises'
+import { setTimeout as sleepFor } from 'node:timers/promises'
 
 import { fingerprintsEqual, hashCanonical } from './canonical'
 import { jsonCodec, type Codec } from './codec'
@@ -58,6 +58,21 @@ export interface WrapOptions<TArgs extends unknown[]> {
   key (...args: TArgs): string
 }
 
+/**
+ * Time seam: every timestamp and every wait in the engine goes through it,
+ * so tests can drive time instead of sleeping. Production uses the wall
+ * clock.
+ */
+export interface IdempotencyClock {
+  now (): number
+  sleep (ms: number): Promise<void>
+}
+
+const WALL_CLOCK: IdempotencyClock = {
+  now: () => Date.now(),
+  sleep: async (ms) => { await sleepFor(ms) }
+}
+
 export interface IdempotencyOptions {
   storage: IdempotencyStorage
   /** How long a completed result stays replayable. Default: '24h'. */
@@ -83,6 +98,8 @@ export interface IdempotencyOptions {
   onStorageError?: 'closed' | 'open'
   onEvent? (event: IdempotencyEvent): void
   metrics?: MetricsCollector
+  /** Time source and wait primitive; tests inject a manual clock. */
+  clock?: IdempotencyClock
 }
 
 interface SerializedError {
@@ -93,8 +110,11 @@ interface SerializedError {
   cause?: SerializedError
 }
 
-const ERROR_CORE_FIELDS = new Set(['name', 'message', 'stack', 'cause'])
 const MAX_CAUSE_DEPTH = 5
+
+// Last-resort record for failures whose own serialization throws (a hostile
+// getter, for instance); precomputed so this path cannot fail in turn.
+const UNSERIALIZABLE_FAILURE = JSON.stringify({ name: 'Error', message: 'failure could not be serialized' })
 
 function serializeError (error: unknown, depth = 0): SerializedError {
   if (!(error instanceof Error)) {
@@ -106,11 +126,12 @@ function serializeError (error: unknown, depth = 0): SerializedError {
     }
     return { name: 'Error', message }
   }
-  const serialized: SerializedError = { name: error.name, message: error.message }
-  if (typeof error.stack === 'string') serialized.stack = error.stack
+  const serialized: SerializedError = { name: error.name, message: error.message, stack: error.stack }
   const properties: Record<string, unknown> = {}
   for (const field of Object.keys(error)) {
-    if (ERROR_CORE_FIELDS.has(field)) continue
+    // Fields already captured above are excluded structurally; cause is
+    // serialized recursively below instead of being JSON-flattened here.
+    if (field === 'cause' || Object.hasOwn(serialized, field)) continue
     // Best-effort: a property that does not survive JSON is dropped; the
     // failure path must never raise a serialization error that masks the
     // original failure.
@@ -118,7 +139,7 @@ function serializeError (error: unknown, depth = 0): SerializedError {
       properties[field] = JSON.parse(JSON.stringify((error as unknown as Record<string, unknown>)[field]))
     } catch {}
   }
-  if (Object.keys(properties).length > 0) serialized.properties = properties
+  serialized.properties = properties
   if (error.cause !== undefined && depth < MAX_CAUSE_DEPTH) {
     serialized.cause = serializeError(error.cause, depth + 1)
   }
@@ -129,7 +150,7 @@ function encodeErrorValue (error: unknown): string {
   try {
     return JSON.stringify(serializeError(error))
   } catch {
-    return JSON.stringify({ name: 'Error', message: 'failure could not be serialized' })
+    return UNSERIALIZABLE_FAILURE
   }
 }
 
@@ -139,7 +160,9 @@ function reviveError (serialized: SerializedError): Error {
   const error = new Error(serialized.message, options)
   error.name = serialized.name
   if (serialized.stack !== undefined) error.stack = serialized.stack
-  if (serialized.properties !== undefined) Object.assign(error, serialized.properties)
+  // Object.assign ignores an undefined source, so hand-crafted or corrupt
+  // records without properties revive cleanly.
+  Object.assign(error, serialized.properties)
   return error
 }
 
@@ -163,9 +186,10 @@ export class Idempotency {
   private readonly maxKeyLength: number
   private readonly codec: Codec
   private readonly persistFailures: boolean
-  private readonly onStorageError: 'closed' | 'open'
+  private readonly failOpen: boolean
   private readonly onEvent: ((event: IdempotencyEvent) => void) | undefined
   private readonly metrics: MetricsCollector | undefined
+  private readonly clock: IdempotencyClock
 
   constructor (options: IdempotencyOptions) {
     this.storage = options.storage
@@ -177,9 +201,10 @@ export class Idempotency {
     this.maxKeyLength = options.maxKeyLength ?? 512
     this.codec = options.codec ?? jsonCodec
     this.persistFailures = options.persistFailures ?? false
-    this.onStorageError = options.onStorageError ?? 'closed'
+    this.failOpen = options.onStorageError === 'open'
     this.onEvent = options.onEvent
     this.metrics = options.metrics
+    this.clock = options.clock ?? WALL_CLOCK
   }
 
   async execute<T> (input: ExecuteInput, fn: ExecuteFunction<T>): Promise<T> {
@@ -222,18 +247,18 @@ export class Idempotency {
     input: ExecuteInput,
     fn: ExecuteFunction<T>,
     correlationId: string,
-    startedAt: number = Date.now()
+    startedAt: number = this.clock.now()
   ): Promise<ExecutionResult<T>> {
     const { key, fingerprint } = this.resolveTarget(input)
     const storageKey = this.composeKey(key)
     const token = randomUUID()
-    const pending = { key: storageKey, token, fingerprint, storedAt: Date.now() }
+    const pending = { key: storageKey, token, fingerprint, storedAt: this.clock.now() }
 
     let existing: StoredRecord | null
     try {
       existing = await this.storageCall(() => this.storage.acquire(pending, this.lockTtlMs))
     } catch (error) {
-      if (error instanceof StorageUnavailableError && this.onStorageError === 'open') {
+      if (error instanceof StorageUnavailableError && this.failOpen) {
         return this.runUnguarded(key, fn, correlationId)
       }
       throw error
@@ -248,11 +273,11 @@ export class Idempotency {
     }
 
     if (existing.status === RECORD_STATUS.completed) {
-      this.emit('replayed', key, correlationId, Date.now() - startedAt)
+      this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
       return { value: this.decodeResult(existing) as T, replayed: true, storedAt: existing.storedAt }
     }
     if (existing.status === RECORD_STATUS.failed) {
-      this.emit('replayed', key, correlationId, Date.now() - startedAt)
+      this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
       throw decodeErrorValue(existing.error ?? '')
     }
 
@@ -288,7 +313,7 @@ export class Idempotency {
       value = await fn(ctx)
     } catch (error) {
       await this.settleFailure(storageKey, token, error)
-      this.emit('failed', key, correlationId, Date.now() - startedAt)
+      this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
 
@@ -300,23 +325,23 @@ export class Idempotency {
       // is released so callers may retry, and the error surfaces instead of
       // silently storing something else.
       await this.settleFailure(storageKey, token, error, { forceRelease: true })
-      this.emit('failed', key, correlationId, Date.now() - startedAt)
+      this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
 
     try {
       await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, this.resultTtlMs))
     } catch (error) {
-      if (error instanceof StorageUnavailableError && this.onStorageError === 'open') {
+      if (error instanceof StorageUnavailableError && this.failOpen) {
         // The function already ran; in fail-open mode the caller gets its
         // result even though it could not be stored for replay.
         this.emit('storage-bypass', key, correlationId)
         return { value, replayed: false, storedAt }
       }
-      this.emit('failed', key, correlationId, Date.now() - startedAt)
+      this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
-    this.emit('completed', key, correlationId, Date.now() - startedAt)
+    this.emit('completed', key, correlationId, this.clock.now() - startedAt)
     return { value, replayed: false, storedAt }
   }
 
@@ -336,7 +361,7 @@ export class Idempotency {
       signal: controller.signal,
       extend: async () => {}
     })
-    return { value, replayed: false, storedAt: Date.now() }
+    return { value, replayed: false, storedAt: this.clock.now() }
   }
 
   private async waitForOutcome<T> (
@@ -347,7 +372,8 @@ export class Idempotency {
     correlationId: string,
     startedAt: number
   ): Promise<ExecutionResult<T>> {
-    const deadline = Date.now() + this.waitTimeoutMs
+    const deadline = this.clock.now() + this.waitTimeoutMs
+    const notify = this.storage.waitForChange?.bind(this.storage) ?? null
     let delay = 25
     while (true) {
       const record = await this.storageCall(() => this.storage.get(storageKey))
@@ -356,29 +382,25 @@ export class Idempotency {
         return this.run(input, fn, correlationId, startedAt)
       }
       if (record.status === RECORD_STATUS.completed) {
-        this.emit('replayed', key, correlationId, Date.now() - startedAt)
+        this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
         return { value: this.decodeResult(record) as T, replayed: true, storedAt: record.storedAt }
       }
       if (record.status === RECORD_STATUS.failed) {
-        this.emit('replayed', key, correlationId, Date.now() - startedAt)
+        this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
         throw decodeErrorValue(record.error ?? '')
       }
-      const remaining = deadline - Date.now()
+      const remaining = deadline - this.clock.now()
       if (remaining <= 0) {
         throw new WaitTimeoutError(key, this.waitTimeoutMs)
       }
       const pause = Math.min(delay, remaining)
-      if (typeof this.storage.waitForChange === 'function') {
-        // Storage-assisted wake-up with the polling pause as its upper
-        // bound; a broken notification channel degrades to plain polling.
-        try {
-          await this.storage.waitForChange(storageKey, pause)
-        } catch {
-          await sleep(pause)
-        }
-      } else {
-        await sleep(pause)
+      // Storage-assisted wake-up with the polling pause as its upper bound;
+      // a broken notification channel degrades to plain polling.
+      let woke = false
+      if (notify !== null) {
+        await notify(storageKey, pause).then(() => { woke = true }, () => {})
       }
+      if (!woke) await this.clock.sleep(pause)
       delay = Math.min(delay * 2, 1_000)
     }
   }
@@ -460,16 +482,25 @@ export class Idempotency {
   }
 
   private emit (type: IdempotencyEventType, key: string, correlationId: string, durationMs?: number): void {
-    const event: IdempotencyEvent = { type, key, correlationId, timestamp: Date.now() }
+    const event: IdempotencyEvent = { type, key, correlationId, timestamp: this.clock.now() }
     if (this.namespace !== undefined) event.namespace = this.namespace
     if (durationMs !== undefined) event.durationMs = durationMs
-    // Observability must never alter execution semantics: listener failures
-    // are swallowed.
-    try {
-      this.onEvent?.(event)
-    } catch {}
-    try {
-      this.metrics?.[METRIC_HANDLERS[type]]?.(event)
-    } catch {}
+
+    const listeners: Array<(event: IdempotencyEvent) => void> = []
+    if (this.onEvent !== undefined) listeners.push(this.onEvent)
+    const metrics = this.metrics
+    if (metrics !== undefined) {
+      const handler = metrics[METRIC_HANDLERS[type]]
+      if (handler !== undefined) listeners.push((payload) => handler.call(metrics, payload))
+    }
+    for (const listener of listeners) {
+      // Observability must never alter execution semantics, but a broken
+      // listener is not silent either: it surfaces as a process warning.
+      try {
+        listener(event)
+      } catch (error) {
+        process.emitWarning(`quayside ${type} listener failed: ${String(error)}`)
+      }
+    }
   }
 }

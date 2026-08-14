@@ -118,6 +118,143 @@ describe('fastify adapter', () => {
     assert.equal(second.headers['idempotency-replayed'], 'true')
   })
 
+  test('body-and-path fingerprinting strips the query string', async () => {
+    const queryApp = Fastify()
+    await queryApp.register(FastifyPlugin(new Idempotency({ storage: new MemoryStorage() }), { fingerprint: 'body-and-path' }) as never)
+    queryApp.post('/', async () => ({ ok: true }))
+    await queryApp.ready()
+
+    const inject = async (query: string) => queryApp.inject({
+      method: 'POST',
+      url: `/${query}`,
+      headers: { 'content-type': 'application/json', 'idempotency-key': 'fas-bp' },
+      payload: JSON.stringify({ a: 1 })
+    })
+    const first = await inject('?attempt=1')
+    assert.equal(first.statusCode, 200)
+    const second = await inject('?attempt=2')
+    assert.equal(second.statusCode, 200, 'a query-dependent fingerprint would answer 422 here')
+    assert.equal(second.headers['idempotency-replayed'], 'true')
+    await queryApp.close()
+  })
+
+  test('body-and-path fingerprinting distinguishes paths and ignores only the query', async () => {
+    const pathApp = Fastify()
+    await pathApp.register(FastifyPlugin(new Idempotency({ storage: new MemoryStorage() }), { fingerprint: 'body-and-path' }) as never)
+    pathApp.post('/left', async () => ({ ok: true }))
+    pathApp.post('/right', async () => ({ ok: true }))
+    await pathApp.ready()
+
+    const inject = async (url: string, key: string) => pathApp.inject({
+      method: 'POST',
+      url,
+      headers: { 'content-type': 'application/json', 'idempotency-key': key },
+      payload: JSON.stringify({ a: 1 })
+    })
+
+    // the same key and body on another path is a key reuse
+    await inject('/left', 'fas-paths')
+    const otherPath = await inject('/right', 'fas-paths')
+    assert.equal(otherPath.statusCode, 422)
+
+    // with and without a query string is the same path
+    await inject('/left?attempt=1', 'fas-noq')
+    const noQuery = await inject('/left', 'fas-noq')
+    assert.equal(noQuery.statusCode, 200, 'stripping the query must not disturb the path itself')
+    assert.equal(noQuery.headers['idempotency-replayed'], 'true')
+    await pathApp.close()
+  })
+
+  test('the fake-hook harness covers bodyless, binary and object payloads plus commit ordering', async () => {
+    const memory = new MemoryStorage()
+    let completedBeforeSendReturned = false
+    const slow: typeof memory = memory
+    const storage = {
+      acquire: (record: Parameters<MemoryStorage['acquire']>[0], ttl: number) => slow.acquire(record, ttl),
+      complete: async (key: string, token: string, outcome: Parameters<MemoryStorage['complete']>[2], ttl: number) => {
+        await new Promise((resolve) => setTimeout(resolve, 20))
+        await slow.complete(key, token, outcome, ttl)
+        completedBeforeSendReturned = true
+      },
+      release: (key: string, token: string) => slow.release(key, token),
+      extend: (key: string, token: string, ttl: number) => slow.extend(key, token, ttl),
+      get: (key: string) => slow.get(key),
+      delete: (key: string) => slow.delete(key)
+    }
+    const hooks: Record<string, (...args: never[]) => Promise<unknown>> = {}
+    const fakeInstance = {
+      addHook (name: string, hook: (...args: never[]) => Promise<unknown>) { hooks[name] = hook }
+    }
+    await FastifyPlugin(new Idempotency({ storage }))(fakeInstance as never)
+
+    const roundTrip = async (key: string, payload: unknown) => {
+      const request = { method: 'POST', url: '/fake', headers: { 'idempotency-key': key }, body: undefined }
+      const headersSet: Record<string, string> = {}
+      const reply = {
+        statusCode: 200,
+        sent: undefined as unknown,
+        getHeader: (name: string) => headersSet[name],
+        header (name: string, value: string) { headersSet[name] = value },
+        code (status: number) { reply.statusCode = status; return reply },
+        send (body: unknown) { reply.sent = body; return reply }
+      }
+      await hooks.preHandler?.(request as never, reply as never)
+      if (reply.sent === undefined) await hooks.onSend?.(request as never, reply as never, payload as never)
+      return { reply, headersSet }
+    }
+
+    // undefined payload captures as an empty body and replays as one
+    await roundTrip('fk-empty', undefined)
+    assert.equal(completedBeforeSendReturned, true, 'the record commits before onSend returns')
+    const emptyReplay = await roundTrip('fk-empty', 'would-be-fresh')
+    assert.equal(emptyReplay.reply.sent, '')
+    assert.equal(emptyReplay.headersSet['idempotency-replayed'], 'true')
+
+    // binary payloads go through the UTF-8 gate
+    await roundTrip('fk-buf', Buffer.from('binary-ok'))
+    const bufReplay = await roundTrip('fk-buf', 'other')
+    assert.equal(bufReplay.reply.sent, 'binary-ok')
+
+    // exotic payload shapes (streams, objects) are served but never cached
+    await roundTrip('fk-obj', { not: 'a payload string' })
+    const objAgain = await roundTrip('fk-obj', { not: 'a payload string' })
+    assert.equal(objAgain.headersSet['idempotency-replayed'], undefined, 'uncacheable payloads never replay')
+
+    // a null payload captures as an empty body, exactly like undefined
+    await roundTrip('fk-null', null)
+    const nullReplay = await roundTrip('fk-null', 'would-be-fresh')
+    assert.equal(nullReplay.reply.sent, '')
+    assert.equal(nullReplay.headersSet['idempotency-replayed'], 'true')
+  })
+
+  test('a non-string, non-array header value runs unprotected', async () => {
+    const hooks: Record<string, (...args: never[]) => Promise<unknown>> = {}
+    const fakeInstance = {
+      addHook (name: string, hook: (...args: never[]) => Promise<unknown>) { hooks[name] = hook }
+    }
+    await FastifyPlugin(new Idempotency({ storage: new MemoryStorage() }))(fakeInstance as never)
+
+    const roundTrip = async () => {
+      const request = { method: 'POST', url: '/fake', headers: { 'idempotency-key': 42 }, body: undefined }
+      const headersSet: Record<string, string> = {}
+      const reply = {
+        statusCode: 200,
+        sent: undefined as unknown,
+        getHeader: (name: string) => headersSet[name],
+        header (name: string, value: string) { headersSet[name] = value },
+        code (status: number) { reply.statusCode = status; return reply },
+        send (body: unknown) { reply.sent = body; return reply }
+      }
+      await hooks.preHandler?.(request as never, reply as never)
+      if (reply.sent === undefined) await hooks.onSend?.(request as never, reply as never, 'fresh' as never)
+      return reply
+    }
+    const first = await roundTrip()
+    const second = await roundTrip()
+    assert.equal(first.sent, undefined, 'a malformed header value must not become a key')
+    assert.equal(second.sent, undefined)
+  })
+
   test('a replayed persisted failure surfaces through the error handler', async () => {
     const storage = new MemoryStorage()
     await storage.acquire({ key: 'poisoned', token: 't', storedAt: Date.now() }, 60_000)

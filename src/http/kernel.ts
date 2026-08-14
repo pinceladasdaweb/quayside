@@ -87,7 +87,7 @@ export class HttpIdempotencyKernel {
   private readonly header: string
   private readonly methods: Set<string>
   private readonly enforce: boolean
-  private readonly fingerprint: FingerprintStrategy
+  private readonly fingerprintPayload: (request: HttpRequestFacts) => unknown
   private readonly replayHeaders: string[]
   private readonly retryAfterSeconds: number
 
@@ -96,7 +96,13 @@ export class HttpIdempotencyKernel {
     this.header = (options.header ?? 'Idempotency-Key').toLowerCase()
     this.methods = new Set((options.methods ?? DEFAULT_METHODS).map((method) => method.toUpperCase()))
     this.enforce = options.enforce ?? false
-    this.fingerprint = options.fingerprint ?? 'body'
+    // The strategy normalizes to a function once; the default is the body.
+    const fingerprint = options.fingerprint
+    this.fingerprintPayload = typeof fingerprint === 'function'
+      ? fingerprint
+      : fingerprint === 'body-and-path'
+        ? (request) => ({ path: request.path, body: request.body ?? null })
+        : (request) => request.body
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
     this.replayHeaders = (options.replayHeaders ?? DEFAULT_REPLAY_HEADERS).map((name) => name.toLowerCase())
     this.retryAfterSeconds = options.retryAfterSeconds ?? 1
@@ -123,7 +129,7 @@ export class HttpIdempotencyKernel {
     const payload = this.fingerprintPayload(request)
     try {
       const outcome = await this.idempotency.executeWithMetadata<CapturedHttpResponse>(
-        payload === undefined ? { key } : { key, payload },
+        { key, payload },
         async () => {
           const captured = await runDownstream()
           // Server errors are transient by definition: the 5xx is served,
@@ -188,10 +194,20 @@ export class HttpIdempotencyKernel {
    * without being cached (oversized or not valid UTF-8).
    */
   cacheableBody (data: string | Uint8Array): string | null {
-    if (typeof data === 'string') {
-      return Buffer.byteLength(data) > this.maxBodyBytes ? null : data
-    }
-    if (data.byteLength > this.maxBodyBytes) return null
+    // Buffer.byteLength measures strings in UTF-8 bytes and views by their
+    // byteLength, so one call covers both input types.
+    const size = Buffer.byteLength(data)
+    if (size > this.maxBodyBytes) return null
+    return this.decodeUtf8(data)
+  }
+
+  /**
+   * The UTF-8 gate alone, for adapters whose capture already enforced the
+   * size cap while buffering. Returns null when the bytes are not valid
+   * UTF-8 (string replay would corrupt them).
+   */
+  decodeUtf8 (data: string | Uint8Array): string | null {
+    if (typeof data === 'string') return data
     try {
       return new TextDecoder('utf-8', { fatal: true }).decode(data)
     } catch {
@@ -209,14 +225,6 @@ export class HttpIdempotencyKernel {
       else if (Array.isArray(value) && value.length > 0) headers[name] = value.map(String).join(', ')
     }
     return headers
-  }
-
-  private fingerprintPayload (request: HttpRequestFacts): unknown {
-    if (typeof this.fingerprint === 'function') return this.fingerprint(request)
-    if (this.fingerprint === 'body-and-path') {
-      return { path: request.path, body: request.body ?? null }
-    }
-    return request.body
   }
 
   private problem (

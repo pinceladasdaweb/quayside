@@ -222,6 +222,32 @@ describe('nestjs interceptor glue', () => {
     assert.equal(headersSet['idempotency-replayed'], 'true')
   })
 
+  test('sets the replay marker through express-style setHeader responses', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated()
+    const headersSet: Record<string, string> = {}
+    const expressStyleResponse = { setHeader: (name: string, value: string) => { headersSet[name] = value } }
+
+    const context = fakeContext({ 'idempotency-key': 'exp-1' }, expressStyleResponse, handler)
+    assert.equal(await intercept(interceptor, context, 'first'), 'first')
+    assert.equal(await intercept(interceptor, context, 'second'), 'first')
+    assert.equal(headersSet['idempotency-replayed'], 'true')
+  })
+
+  test('a non-string, non-array header value runs unprotected', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': 7 }, {}, handler)
+    assert.equal(await intercept(interceptor, context, 'r1'), 'r1')
+    assert.equal(await intercept(interceptor, context, 'r2'), 'r2', 'a malformed header value must not become a key')
+  })
+
   test('maps fencing and storage failures onto 500 and 503', async () => {
     const { HttpException } = await import('@nestjs/common')
     const { FencingError } = await import('../../src/index')
@@ -244,6 +270,10 @@ describe('nestjs interceptor glue', () => {
       (error: unknown) => {
         assert.ok(error instanceof HttpException)
         assert.equal(error.getStatus(), 500)
+        const body = error.getResponse() as { statusCode: number, error: string, message: string }
+        assert.equal(body.statusCode, 500)
+        assert.equal(body.error, 'IDEMPOTENCY_FENCING')
+        assert.notEqual(body.message, '')
         return true
       }
     )
@@ -265,6 +295,10 @@ describe('nestjs interceptor glue', () => {
       (error: unknown) => {
         assert.ok(error instanceof HttpException)
         assert.equal(error.getStatus(), 503)
+        const body = error.getResponse() as { statusCode: number, error: string, message: string }
+        assert.equal(body.statusCode, 503)
+        assert.equal(body.error, 'IDEMPOTENCY_STORAGE_UNAVAILABLE')
+        assert.notEqual(body.message, '')
         return true
       }
     )
@@ -276,13 +310,12 @@ describe('nestjs interceptor glue', () => {
     const globalByDefault = QuaysideModule.forRoot({ storage: new MemoryStorage() })
     assert.equal(globalByDefault.global, true)
 
-    const asyncModule = QuaysideModule.forRootAsync({
-      imports: [],
-      inject: [],
-      useFactory: () => ({ storage: new MemoryStorage() })
-    })
-    assert.deepEqual(asyncModule.imports, [])
-    assert.equal(asyncModule.global, true)
+    // Omitted imports/inject must materialize as empty arrays, not undefined.
+    const bare = QuaysideModule.forRootAsync({ useFactory: () => ({ storage: new MemoryStorage() }) })
+    assert.deepEqual(bare.imports, [])
+    assert.equal(bare.global, true)
+    const bareOptionsProvider = (bare.providers ?? [])[0] as { inject?: unknown[] }
+    assert.deepEqual(bareOptionsProvider.inject, [])
   })
 
   test('a custom key extractor returning nothing runs unprotected', async () => {
@@ -294,6 +327,129 @@ describe('nestjs interceptor glue', () => {
     const context = fakeContext({}, {}, handler)
     assert.equal(await intercept(interceptor, context, 'ran-1'), 'ran-1')
     assert.equal(await intercept(interceptor, context, 'ran-2'), 'ran-2')
+  })
+
+  test('routes without a ttl override use the module resultTtl', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage(), resultTtl: '60ms' }),
+      { storage: new MemoryStorage(), resultTtl: '60ms' }
+    )
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': 'ttl-base' }, {}, handler)
+    assert.equal(await intercept(interceptor, context, 'first'), 'first')
+    await new Promise((resolve) => setTimeout(resolve, 90))
+    assert.equal(await intercept(interceptor, context, 'second'), 'second', 'the 60ms window has expired')
+  })
+
+  test('fingerprint false and custom fingerprint functions bypass the body', async () => {
+    const storage = new MemoryStorage()
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage }),
+      { storage }
+    )
+    const disabled = decorated({ fingerprint: false })
+    const bodies = [{ n: 1 }, { n: 2 }]
+    let call = 0
+    const shifting = {
+      getType: () => 'http',
+      getHandler: () => disabled,
+      switchToHttp: () => ({
+        getRequest: () => ({ headers: { 'idempotency-key': 'fp-off' }, body: bodies[call++] }),
+        getResponse: () => ({})
+      })
+    }
+    assert.equal(await intercept(interceptor, shifting as never, 'a'), 'a')
+    assert.equal(await intercept(interceptor, shifting as never, 'b'), 'a', 'different bodies replay when fingerprinting is off')
+
+    const custom = decorated({ fingerprint: () => 'constant' })
+    let customCall = 0
+    const customContext = {
+      getType: () => 'http',
+      getHandler: () => custom,
+      switchToHttp: () => ({
+        getRequest: () => ({ headers: { 'idempotency-key': 'fp-fn' }, body: bodies[customCall++] }),
+        getResponse: () => ({})
+      })
+    }
+    assert.equal(await intercept(interceptor, customContext as never, 'x'), 'x')
+    assert.equal(await intercept(interceptor, customContext as never, 'y'), 'x')
+  })
+
+  test('foreign HttpExceptions pass through unwrapped', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated()
+    const { HttpException } = await import('@nestjs/common')
+    const { lastValueFrom, throwError } = await import('rxjs')
+    const teapot = new HttpException('short and stout', 418)
+    await assert.rejects(
+      lastValueFrom(interceptor.intercept(
+        fakeContext({ 'idempotency-key': 'teapot' }, {}, handler) as never,
+        { handle: () => throwError(() => teapot) }
+      )),
+      (error: unknown) => {
+        assert.equal(error, teapot, 'application exceptions are rethrown as-is, never rewrapped')
+        return true
+      }
+    )
+  })
+
+  test('error responses carry the code and a non-empty message', async () => {
+    const conflict = await (async () => {
+      const running = post('/slow', 'nest-body-409', {})
+      await sleep(100)
+      const response = await post('/slow', 'nest-body-409', {})
+      release()
+      await running
+      return response
+    })()
+    const body409 = await conflict.json() as { error: string, message: string }
+    assert.equal(body409.error, 'IDEMPOTENCY_IN_PROGRESS')
+    assert.notEqual(body409.message, '')
+
+    await post('/payments', 'nest-body-422', { amount: 1 })
+    const reuse = await post('/payments', 'nest-body-422', { amount: 2 })
+    const body422 = await reuse.json() as { error: string, message: string }
+    assert.equal(body422.error, 'IDEMPOTENCY_KEY_REUSE')
+    assert.notEqual(body422.message, '')
+
+    const missing = await post('/strict', undefined, {})
+    const body400 = await missing.json() as { error: string, message: string }
+    assert.equal(body400.error, 'IDEMPOTENCY_KEY_REQUIRED')
+    assert.match(body400.message, /idempotency-key/)
+  })
+
+  test('empty handler observables resolve to undefined', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const { lastValueFrom, EMPTY } = await import('rxjs')
+    const decoratedHandler = decorated()
+    const value = await lastValueFrom(interceptor.intercept(
+      fakeContext({ 'idempotency-key': 'empty-obs' }, {}, decoratedHandler) as never,
+      { handle: () => EMPTY }
+    ))
+    assert.equal(value, undefined)
+
+    const noKey = await lastValueFrom(interceptor.intercept(
+      fakeContext({}, {}, decoratedHandler) as never,
+      { handle: () => EMPTY }
+    ))
+    assert.equal(noKey, undefined)
+  })
+
+  test('an empty-string header runs unprotected', async () => {
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': '' }, {}, handler)
+    assert.equal(await intercept(interceptor, context, 'r1'), 'r1')
+    assert.equal(await intercept(interceptor, context, 'r2'), 'r2')
   })
 
   test('non-http contexts pass through untouched', async () => {

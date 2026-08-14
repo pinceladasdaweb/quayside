@@ -9,8 +9,9 @@ export interface CanonicalizeOptions {
   pickFields?: string[]
 }
 
+// A prefix longer than the path fails every() naturally: the surplus
+// segments compare against undefined.
 function isPrefix (prefix: string[], path: string[]): boolean {
-  if (prefix.length > path.length) return false
   return prefix.every((segment, index) => segment === path[index])
 }
 
@@ -43,7 +44,8 @@ function canonicalizeValue (value: unknown, path: string[], filter: PathFilter, 
   if (value === undefined) return 'undefined'
   const type = typeof value
   if (type === 'boolean') return `bool:${String(value)}`
-  if (type === 'number') return `num:${Object.is(value, -0) ? '0' : String(value)}`
+  // String(-0) is already '0': negative zero normalizes for free.
+  if (type === 'number') return `num:${String(value)}`
   if (type === 'bigint') return `bigint:${String(value)}`
   if (type === 'string') return `str:${JSON.stringify(value)}`
   if (type === 'function' || type === 'symbol') {
@@ -100,9 +102,11 @@ export function hashCanonical (value: unknown, options: CanonicalizeOptions = {}
 // Fingerprints are compared in constant time so the comparison never leaks
 // how much of a fingerprint matched.
 export function fingerprintsEqual (a: string | undefined, b: string | undefined): boolean {
-  if (a === undefined || b === undefined) return a === b
-  const bufferA = Buffer.from(a)
-  const bufferB = Buffer.from(b)
+  // A record without a fingerprint only matches a call without one; an
+  // empty-string fingerprint is a real value and must not match absence.
+  if ((a === undefined) !== (b === undefined)) return false
+  const bufferA = Buffer.from(a ?? '')
+  const bufferB = Buffer.from(b ?? '')
   if (bufferA.length !== bufferB.length) return false
   return timingSafeEqual(bufferA, bufferB)
 }

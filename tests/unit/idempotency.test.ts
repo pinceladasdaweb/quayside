@@ -8,7 +8,7 @@ import {
   StorageUnavailableError,
   WaitTimeoutError
 } from '../../src/index'
-import type { IdempotencyEvent, IdempotencyStorage } from '../../src/index'
+import type { IdempotencyEvent, IdempotencyStorage, StoredRecord } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 
 function gate () {
@@ -290,6 +290,8 @@ describe('Idempotency failures', () => {
     await assert.rejects(idempotency.execute('plain', async () => 'never'), (error: unknown) => {
       assert.ok(error instanceof Error)
       assert.equal(error.message, 'just a string')
+      assert.equal(error.name, 'Error')
+      assert.equal(typeof error.stack, 'string')
       return true
     })
 
@@ -311,6 +313,60 @@ describe('Idempotency failures', () => {
     await assert.rejects(idempotency.execute('corrupt', async () => 'never'), (error: unknown) => {
       assert.ok(error instanceof Error)
       assert.equal(error.message, 'not json {')
+      assert.equal(error.name, 'Error')
+      assert.equal(typeof error.stack, 'string')
+      return true
+    })
+  })
+
+  test('a hand-written stack replays verbatim', async () => {
+    const idempotency = instance({ persistFailures: true })
+    const fn = async () => {
+      const error = new Error('with custom stack')
+      error.stack = 'CUSTOM-STACK-MARKER'
+      throw error
+    }
+    await assert.rejects(idempotency.execute('k', fn))
+    await assert.rejects(idempotency.execute('k', async () => 'never'), (error: unknown) => {
+      assert.equal((error as Error).stack, 'CUSTOM-STACK-MARKER')
+      return true
+    })
+  })
+
+  test('the cause chain replays capped at its depth budget', async () => {
+    const idempotency = instance({ persistFailures: true })
+    const fn = async () => {
+      let chained = new Error('depth-7')
+      for (let depth = 6; depth >= 0; depth -= 1) {
+        chained = new Error(`depth-${depth}`, { cause: chained })
+      }
+      throw chained
+    }
+    await assert.rejects(idempotency.execute('deep', fn))
+    await assert.rejects(idempotency.execute('deep', async () => 'never'), (error: unknown) => {
+      let length = 0
+      let cursor: unknown = error
+      while (cursor instanceof Error) {
+        length += 1
+        cursor = cursor.cause
+      }
+      // depth 0 plus MAX_CAUSE_DEPTH serialized causes
+      assert.equal(length, 6)
+      return true
+    })
+  })
+
+  test('a circular cause terminates at the depth budget', async () => {
+    const idempotency = instance({ persistFailures: true })
+    const fn = async () => {
+      const error = new Error('ouroboros')
+      error.cause = error
+      throw error
+    }
+    await assert.rejects(idempotency.execute('circular', fn))
+    await assert.rejects(idempotency.execute('circular', async () => 'never'), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.match(error.message, /ouroboros/)
       return true
     })
   })
@@ -334,6 +390,7 @@ describe('Idempotency failures', () => {
     const idempotency = new Idempotency({ storage: stub })
     await assert.rejects(idempotency.execute('k', async () => 'never'), (error: unknown) => {
       assert.ok(error instanceof Error)
+      assert.equal(error.message, '')
       return true
     })
 
@@ -343,8 +400,31 @@ describe('Idempotency failures', () => {
     const waiting = new Idempotency({ storage: waiterStub, onConflict: 'wait' })
     await assert.rejects(waiting.execute('k', async () => 'never'), (error: unknown) => {
       assert.ok(error instanceof Error)
+      assert.equal(error.message, '')
       return true
     })
+  })
+
+  test('a completed record without a stored result replays undefined', async () => {
+    const completedRecord = {
+      key: 'k',
+      token: 't',
+      status: 'completed' as const,
+      storedAt: Date.now(),
+      expiresAt: Date.now() + 60_000
+    }
+    const stub: IdempotencyStorage = {
+      acquire: async () => completedRecord,
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => completedRecord,
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage: stub })
+    const outcome = await idempotency.executeWithMetadata('k', async () => 'never')
+    assert.equal(outcome.replayed, true)
+    assert.equal(outcome.value, undefined)
   })
 
   test('fail-open executions expose a no-op extend', async () => {
@@ -441,7 +521,7 @@ describe('Idempotency API surface', () => {
     assert.equal(record.status, 'failed')
     assert.ok(record.error instanceof Error)
     assert.equal(record.error.message, 'stored failure')
-    assert.equal(record.value, undefined)
+    assert.ok(!('value' in record), 'a failed record exposes no value, not even undefined')
   })
 
   test('get exposes the decoded record and invalidate allows re-execution', async () => {
@@ -455,6 +535,7 @@ describe('Idempotency API surface', () => {
     assert.equal(record.key, 'k')
     assert.equal(record.status, 'completed')
     assert.deepEqual(record.value, { total: 10 })
+    assert.ok(!('error' in record), 'a completed record exposes no error, not even undefined')
 
     await idempotency.invalidate('k')
     assert.equal(await idempotency.get('k'), null)
@@ -509,5 +590,141 @@ describe('Idempotency observability', () => {
     const idempotency = instance({ namespace: 'payments', onEvent: (event) => events.push(event) })
     await idempotency.execute('k', async () => 1)
     assert.ok(events.every((event) => event.namespace === 'payments'))
+  })
+})
+
+describe('failure cleanup and revival edges', () => {
+  test('a failed execution leaves no record behind: the retry runs fresh', async () => {
+    let runs = 0
+    const idempotency = instance()
+    await assert.rejects(
+      idempotency.execute('k', async () => { runs += 1; throw new Error('first attempt') }),
+      /first attempt/
+    )
+    const value = await idempotency.execute('k', async () => { runs += 1; return 'second attempt' })
+    assert.equal(value, 'second attempt')
+    assert.equal(runs, 2)
+  })
+
+  test('an unstorable result releases the record even with persistFailures on', async () => {
+    let runs = 0
+    const idempotency = instance({ persistFailures: true })
+    const unstorable = async (): Promise<unknown> => { runs += 1; return { big: 10n } }
+    await assert.rejects(idempotency.execute('k', unstorable))
+    assert.equal(await idempotency.get('k'), null, 'a result that cannot be stored must not persist as a failure')
+    await assert.rejects(idempotency.execute('k', unstorable))
+    assert.equal(runs, 2)
+  })
+
+  test('a replayed failure without a cause revives without one', async () => {
+    const idempotency = instance({ persistFailures: true })
+    await assert.rejects(idempotency.execute('k', async () => { throw new Error('plain') }), /plain/)
+    const error = await idempotency.execute('k', async () => 'never').then(
+      () => assert.fail('the persisted failure must replay'),
+      (thrown: Error) => thrown
+    )
+    assert.equal(error.message, 'plain')
+    assert.equal(error.cause, undefined)
+  })
+
+  test('a failure whose serialization itself fails replays the fallback message', async () => {
+    class Nameless extends Error {
+      override get name (): string { throw new Error('no name available') }
+    }
+    const idempotency = instance({ persistFailures: true })
+    await assert.rejects(idempotency.execute('k', async () => { throw new Nameless('original') }))
+    const error = await idempotency.execute('k', async () => 'never').then(
+      () => assert.fail('the persisted failure must replay'),
+      (thrown: Error) => thrown
+    )
+    assert.equal(error.message, 'failure could not be serialized')
+    assert.equal(error.name, 'Error')
+  })
+
+  test('get exposes an error only on failed records, whatever the storage holds', async () => {
+    const records: Record<string, StoredRecord> = {
+      'failed-sans-error': {
+        key: 'failed-sans-error', token: 't', status: 'failed', storedAt: 1, expiresAt: Date.now() + 60_000
+      },
+      'completed-with-stray-error': {
+        key: 'completed-with-stray-error',
+        token: 't',
+        status: 'completed',
+        result: '"v"',
+        error: '{"name":"X","message":"stray"}',
+        storedAt: 1,
+        expiresAt: Date.now() + 60_000
+      }
+    }
+    const storage: IdempotencyStorage = {
+      acquire: async () => null,
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async (key) => records[key] ?? null,
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage })
+
+    const failed = await idempotency.get('failed-sans-error')
+    assert.ok(failed)
+    assert.ok(!('error' in failed), 'a failed record without a stored error exposes none')
+
+    const completed = await idempotency.get('completed-with-stray-error')
+    assert.ok(completed)
+    assert.equal(completed.value, 'v')
+    assert.ok(!('error' in completed), 'the status is the authority, not a stray field')
+  })
+
+  test('extend forwards the parsed ttl and defaults to the lock ttl', async () => {
+    const memory = new MemoryStorage()
+    const ttls: number[] = []
+    const storage: IdempotencyStorage = {
+      acquire: (record, ttl) => memory.acquire(record, ttl),
+      complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+      release: (key, token) => memory.release(key, token),
+      extend: async (key, token, ttl) => { ttls.push(ttl); await memory.extend(key, token, ttl) },
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const idempotency = new Idempotency({ storage, lockTtl: '7s' })
+    await idempotency.execute('k', async (ctx) => {
+      await ctx.extend('5s')
+      await ctx.extend()
+      return 1
+    })
+    assert.deepEqual(ttls, [5_000, 7_000])
+  })
+
+  test('fail-open bypasses report replayed=false on the context and the metadata', async () => {
+    const down: IdempotencyStorage = {
+      acquire: async () => { throw new Error('down') },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    let contextReplayed: boolean | undefined
+    const open = new Idempotency({ storage: down, onStorageError: 'open' })
+    const unguarded = await open.executeWithMetadata('k', async (ctx) => {
+      contextReplayed = ctx.replayed
+      return 'v'
+    })
+    assert.equal(contextReplayed, false)
+    assert.equal(unguarded.replayed, false)
+
+    const memory = new MemoryStorage()
+    const brokenWrite: IdempotencyStorage = {
+      acquire: (record, ttl) => memory.acquire(record, ttl),
+      complete: async () => { throw new Error('write lost') },
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, ttl) => memory.extend(key, token, ttl),
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const bypassed = await new Idempotency({ storage: brokenWrite, onStorageError: 'open' })
+      .executeWithMetadata('k', async () => 'v')
+    assert.equal(bypassed.replayed, false)
   })
 })

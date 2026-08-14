@@ -85,4 +85,24 @@ describe('prometheus collector', () => {
     const globalCollector = prometheusMetrics()
     globalCollector.onConflict?.({ ...event, type: 'conflict' })
   })
+
+  test('the default histogram ships real buckets and observes seconds', async () => {
+    const registry = new Registry()
+    const collector = prometheusMetrics({ register: registry, prefix: 'q4_' })
+    collector.onCompleted?.({
+      type: 'completed',
+      key: 'k',
+      correlationId: 'c',
+      timestamp: Date.now(),
+      durationMs: 42
+    })
+    const metrics = await registry.getMetricsAsJSON()
+    const histogram = metrics.find((entry) => entry.name === 'q4_execution_duration_seconds')
+    assert.ok(histogram)
+    const values = histogram.values as Array<{ metricName?: string, value: number, labels: Record<string, string | number> }>
+    const buckets = values.filter((value) => value.metricName === 'q4_execution_duration_seconds_bucket')
+    assert.ok(buckets.length >= 5, 'the default bucket layout must exist')
+    const sum = values.find((value) => value.metricName === 'q4_execution_duration_seconds_sum')
+    assert.equal(sum?.value, 0.042)
+  })
 })

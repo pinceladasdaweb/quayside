@@ -24,9 +24,8 @@ export interface ExpressResponseLike {
 export type ExpressNext = (error?: unknown) => void
 
 function headerValue (value: unknown): string | undefined {
-  if (typeof value === 'string') return value
-  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
-  return undefined
+  if (Array.isArray(value)) return headerValue(value[0])
+  return typeof value === 'string' ? value : undefined
 }
 
 // Response capture is the framework-specific part: Express writes through
@@ -46,13 +45,14 @@ function captureResponse (
 
     const record = (chunk: unknown, encoding: unknown): void => {
       if (overflow || chunk === undefined || chunk === null || typeof chunk === 'function') return
-      const buffer = typeof chunk === 'string'
-        ? Buffer.from(chunk, typeof encoding === 'string' ? encoding as BufferEncoding : 'utf8')
-        : Buffer.from(chunk as Uint8Array)
+      // Buffer.from ignores the encoding argument for Buffer and typed-array
+      // chunks and falls back to utf8 when a string chunk arrives with a
+      // non-string encoding slot (a callback), so one call covers every
+      // write/end signature.
+      const buffer = Buffer.from(chunk as string, encoding as BufferEncoding)
       size += buffer.byteLength
       if (size > kernel.maxBodyBytes) {
         overflow = true
-        chunks.length = 0
         return
       }
       chunks.push(buffer)
@@ -71,7 +71,8 @@ function captureResponse (
         resolve(null)
         return result
       }
-      const body = kernel.cacheableBody(Buffer.concat(chunks))
+      // record() is the size authority here; only the UTF-8 gate remains.
+      const body = kernel.decodeUtf8(Buffer.concat(chunks))
       resolve(body === null
         ? null
         : {

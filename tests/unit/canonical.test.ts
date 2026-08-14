@@ -5,6 +5,48 @@ import { canonicalize, fingerprintsEqual, hashCanonical } from '../../src/canoni
 import { SerializationError } from '../../src/errors'
 
 describe('canonicalize', () => {
+  test('the canonical form is the fingerprint wire format and never drifts', () => {
+    assert.equal(canonicalize(null), 'null')
+    assert.equal(canonicalize(undefined), 'undefined')
+    assert.equal(canonicalize(true), 'bool:true')
+    assert.equal(canonicalize(false), 'bool:false')
+    assert.equal(canonicalize(1), 'num:1')
+    assert.equal(canonicalize(-0), 'num:0')
+    assert.equal(canonicalize(10n), 'bigint:10')
+    assert.equal(canonicalize('a'), 'str:"a"')
+    assert.equal(canonicalize(new Date(0)), 'date:1970-01-01T00:00:00.000Z')
+    assert.equal(canonicalize(new Date('nope')), 'date:invalid')
+    assert.equal(canonicalize(new Uint8Array([1, 255])), 'bytes:01ff')
+    assert.equal(canonicalize([1, 'a']), 'arr:[num:1,str:"a"]')
+    assert.equal(canonicalize({ b: 2, a: 1 }), 'obj:{"a":num:1,"b":num:2}')
+    assert.equal(canonicalize({ nested: [true, null] }), 'obj:{"nested":arr:[bool:true,null]}')
+  })
+
+  test('filters apply to array indices as path segments', () => {
+    assert.equal(canonicalize([1, 2], { ignoreFields: ['1'] }), 'arr:[num:1]')
+    assert.equal(canonicalize([1, 2], { pickFields: ['0'] }), 'arr:[num:1]')
+  })
+
+  test('a two-segment pick requires every segment to match', () => {
+    const first = { meta: { retries: 1, trace: 'a' } }
+    const second = { meta: { retries: 1, trace: 'b' } }
+    assert.equal(
+      hashCanonical(first, { pickFields: ['meta.retries'] }),
+      hashCanonical(second, { pickFields: ['meta.retries'] })
+    )
+    assert.notEqual(
+      hashCanonical({ meta: { retries: 1 } }, { pickFields: ['meta.retries'] }),
+      hashCanonical({ meta: { retries: 2 } }, { pickFields: ['meta.retries'] })
+    )
+  })
+
+  test('the default configuration ignores nothing', () => {
+    assert.notEqual(
+      hashCanonical({ 'Stryker was here': 1 }),
+      hashCanonical({ 'Stryker was here': 2 })
+    )
+  })
+
   test('is independent of key insertion order at every depth', () => {
     const a = { user: { name: 'ana', roles: ['x', 'y'] }, total: 10 }
     const b = { total: 10, user: { roles: ['x', 'y'], name: 'ana' } }
@@ -34,6 +76,15 @@ describe('canonicalize', () => {
       hashCanonical(new Uint8Array([1, 2, 3])),
       hashCanonical(Buffer.from([1, 2, 3]))
     )
+  })
+
+  test('different values of every type hash differently', () => {
+    assert.notEqual(hashCanonical(true), hashCanonical(false))
+    assert.notEqual(hashCanonical(1), hashCanonical(2))
+    assert.notEqual(hashCanonical(10n), hashCanonical(11n))
+    assert.notEqual(hashCanonical(new Date(0)), hashCanonical(new Date(1_000)))
+    assert.notEqual(hashCanonical(new Uint8Array([1, 2, 3])), hashCanonical(new Uint8Array([1, 2, 4])))
+    assert.notEqual(hashCanonical(null), hashCanonical(undefined))
   })
 
   test('treats an own __proto__ key as plain data without polluting', () => {
@@ -114,5 +165,10 @@ describe('fingerprintsEqual', () => {
     assert.equal(fingerprintsEqual(undefined, undefined), true)
     assert.equal(fingerprintsEqual('abc', undefined), false)
     assert.equal(fingerprintsEqual(undefined, 'abc'), false)
+    // presence is part of the value: an absent fingerprint never equals a
+    // present one, not even an empty-string one
+    assert.equal(fingerprintsEqual(undefined, ''), false)
+    assert.equal(fingerprintsEqual('', undefined), false)
+    assert.equal(fingerprintsEqual('', ''), true)
   })
 })

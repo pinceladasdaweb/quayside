@@ -111,6 +111,16 @@ export class Idempotency {
     wrap<TArgs extends unknown[], TResult>(fn: (...args: TArgs) => TResult | Promise<TResult>, options: WrapOptions<TArgs>): (...args: TArgs) => Promise<TResult>;
 }
 
+// Warning: (ae-missing-release-tag) "IdempotencyClock" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface IdempotencyClock {
+    // (undocumented)
+    now(): number;
+    // (undocumented)
+    sleep(ms: number): Promise<void>;
+}
+
 // Warning: (ae-missing-release-tag) "IdempotencyEvent" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -148,6 +158,7 @@ export class IdempotencyKeyReuseError extends QuaysideError {
 //
 // @public (undocumented)
 export interface IdempotencyOptions {
+    clock?: IdempotencyClock;
     // (undocumented)
     codec?: Codec;
     lockTtl?: Duration;

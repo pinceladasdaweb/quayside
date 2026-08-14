@@ -42,6 +42,26 @@ before(async () => {
     res.write(Buffer.from('streamed '))
     res.end('world')
   })
+  app.post('/base64', (_req, res) => {
+    calls.base64 = (calls.base64 ?? 0) + 1
+    res.status(200).type('text/plain')
+    res.write('aGk=', 'base64')
+    res.end()
+  })
+  app.post('/no-body', (_req, res) => {
+    calls.noBody = (calls.noBody ?? 0) + 1
+    res.status(204).end()
+  })
+  app.post('/exact', (_req, res) => {
+    calls.exact = (calls.exact ?? 0) + 1
+    res.status(200).send('x'.repeat(1_024))
+  })
+  app.post('/tail', (_req, res) => {
+    calls.tail = (calls.tail ?? 0) + 1
+    res.status(200)
+    res.write('y'.repeat(1_100))
+    res.end('tail')
+  })
 
   // Expected handler errors answer 500 without reaching Express's default
   // error handler, which would dump the stack to stderr and drown out any
@@ -129,6 +149,39 @@ describe('express adapter', () => {
     assert.equal(second.headers.get('idempotency-replayed'), 'true')
     assert.equal(calls.stream, 1)
   })
+
+  test('write encodings are honored in the captured body', async () => {
+    await post('/base64', 'exp-b64', {})
+    const replay = await post('/base64', 'exp-b64', {})
+    assert.equal(await replay.text(), 'hi')
+    assert.equal(replay.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.base64, 1)
+  })
+
+  test('bodyless responses replay as empty bodies', async () => {
+    const first = await post('/no-body', 'exp-204', {})
+    assert.equal(first.status, 204)
+    const second = await post('/no-body', 'exp-204', {})
+    assert.equal(second.status, 204)
+    assert.equal(second.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.noBody, 1)
+  })
+
+  test('a body of exactly maxBodyBytes is cached', async () => {
+    await post('/exact', 'exp-exact', {})
+    const replay = await post('/exact', 'exp-exact', {})
+    assert.equal((await replay.text()).length, 1_024)
+    assert.equal(replay.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.exact, 1)
+  })
+
+  test('chunks after an overflow are served but never partially cached', async () => {
+    const first = await post('/tail', 'exp-tail', {})
+    assert.equal((await first.text()).length, 1_104)
+    const second = await post('/tail', 'exp-tail', {})
+    assert.equal((await second.text()).length, 1_104, 'a replay of only the post-overflow tail would betray the capture')
+    assert.equal(calls.tail, 2)
+  })
 })
 
 describe('express adapter glue', () => {
@@ -143,8 +196,8 @@ describe('express adapter glue', () => {
         res.body += String(chunk)
         return true
       },
-      end (chunk?: unknown) {
-        if (chunk !== undefined && typeof chunk !== 'function') res.body += String(chunk)
+      end (chunk?: unknown, ..._args: unknown[]) {
+        if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') res.body += String(chunk)
         return res
       },
       headers
@@ -181,6 +234,93 @@ describe('express adapter glue', () => {
     assert.equal(handled, 1)
     assert.equal(replayed.headers['idempotency-replayed'], 'true')
     assert.equal(replayed.body, 'created')
+  })
+
+  test('distinct string keys never collapse onto their first character', async () => {
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency)
+    let handled = 0
+    const roundTrip = async (key: string) => await new Promise<void>((resolve) => {
+      const res = fakeResponse()
+      middleware(
+        { method: 'POST', path: '/fake', body: undefined, headers: { 'idempotency-key': key } },
+        res,
+        () => {
+          handled += 1
+          res.end('ok')
+          setImmediate(resolve)
+        }
+      )
+      setImmediate(() => setImmediate(resolve))
+    })
+    await roundTrip('aa')
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await roundTrip('ab')
+    assert.equal(handled, 2, 'keys sharing a first character are different keys')
+  })
+
+  test('a non-string, non-array header value runs unprotected', async () => {
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency)
+    let handled = 0
+    const nextErrors: unknown[] = []
+    const roundTrip = async () => await new Promise<void>((resolve) => {
+      const res = fakeResponse()
+      middleware(
+        { method: 'POST', path: '/fake', body: undefined, headers: { 'idempotency-key': 42 } },
+        res,
+        (error?: unknown) => {
+          nextErrors.push(error)
+          handled += 1
+          res.end('ok')
+          setImmediate(resolve)
+        }
+      )
+      setImmediate(() => setImmediate(resolve))
+    })
+    await roundTrip()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    await roundTrip()
+    assert.equal(handled, 2, 'a malformed header value must not become a key')
+    assert.deepEqual(nextErrors, [undefined, undefined], 'the pass-through is clean, not an error hand-off')
+  })
+
+  test('the capture survives every res.end signature node accepts', async () => {
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency)
+    const settle = async (key: string, finish: (res: ReturnType<typeof fakeResponse>) => void) => {
+      const res = fakeResponse()
+      await new Promise<void>((resolve) => {
+        middleware(
+          { method: 'POST', path: '/fake', body: undefined, headers: { 'idempotency-key': key } },
+          res,
+          () => {
+            finish(res)
+            setImmediate(resolve)
+          }
+        )
+        setImmediate(() => setImmediate(resolve))
+      })
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return res
+    }
+
+    // end(null): no body chunk, cached as an empty body
+    await settle('sig-null', (res) => res.end(null))
+    const nullReplay = await settle('sig-null', (res) => res.end('would-be-fresh'))
+    assert.equal(nullReplay.headers['idempotency-replayed'], 'true')
+
+    // end(chunk, callback): the callback lands in the encoding slot
+    await settle('sig-cb', (res) => res.end('done', () => {}))
+    const callbackReplay = await settle('sig-cb', (res) => res.end('other', () => {}))
+    assert.equal(callbackReplay.headers['idempotency-replayed'], 'true')
+    assert.equal(callbackReplay.body, 'done')
+
+    // end(callback): a function chunk is not a body
+    await settle('sig-fn', (res) => res.end(() => {}))
+    const functionReplay = await settle('sig-fn', (res) => res.end(() => {}))
+    assert.equal(functionReplay.headers['idempotency-replayed'], 'true')
+    assert.equal(functionReplay.body, '')
   })
 
   test('forwards a replayed persisted failure to the error chain', async () => {
