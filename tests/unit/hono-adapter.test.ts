@@ -9,10 +9,11 @@ import { MemoryStorage } from '../../src/memory/index'
 
 let app: Hono
 let calls: Record<string, number>
+let idempotency: Idempotency
 
 before(() => {
   calls = {}
-  const idempotency = new Idempotency({ storage: new MemoryStorage() })
+  idempotency = new Idempotency({ storage: new MemoryStorage() })
   app = new Hono()
   app.use(HonoMiddleware(idempotency, { maxBodyBytes: 1_024 }) as never)
 
@@ -35,6 +36,25 @@ before(() => {
   app.post('/empty', (c) => {
     calls.empty = (calls.empty ?? 0) + 1
     return c.body(null, 204)
+  })
+  app.post('/declared-small', (c) => {
+    calls.declaredSmall = (calls.declaredSmall ?? 0) + 1
+    return c.body('cached', 200, { 'content-length': '6' })
+  })
+  app.post('/declared-exact', (c) => {
+    calls.declaredExact = (calls.declaredExact ?? 0) + 1
+    return c.body('small body, honest header', 200, { 'content-length': '1024' })
+  })
+  app.post('/stream-exact', (c) => {
+    calls.streamExact = (calls.streamExact ?? 0) + 1
+    const chunk = new TextEncoder().encode('x'.repeat(1_024))
+    const stream = new ReadableStream<Uint8Array>({
+      start (controller) {
+        controller.enqueue(chunk)
+        controller.close()
+      }
+    })
+    return c.body(stream, 200)
   })
   app.post('/stream-huge', (c) => {
     calls.streamHuge = (calls.streamHuge ?? 0) + 1
@@ -120,6 +140,36 @@ describe('hono adapter', () => {
     assert.equal(calls.empty, 1)
   })
 
+  test('declared content lengths within the cap still cache, including exactly at it', async () => {
+    await post('/declared-small', 'hon-small', {})
+    const smallReplay = await post('/declared-small', 'hon-small', {})
+    assert.equal(await smallReplay.text(), 'cached')
+    assert.equal(smallReplay.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.declaredSmall, 1)
+
+    await post('/declared-exact', 'hon-dexact', {})
+    const exactReplay = await post('/declared-exact', 'hon-dexact', {})
+    assert.equal(exactReplay.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.declaredExact, 1)
+  })
+
+  test('a streamed body of exactly the cap is cached', async () => {
+    await post('/stream-exact', 'hon-sexact', {})
+    const replay = await post('/stream-exact', 'hon-sexact', {})
+    assert.equal((await replay.text()).length, 1_024)
+    assert.equal(replay.headers.get('idempotency-replayed'), 'true')
+    assert.equal(calls.streamExact, 1)
+  })
+
+  test('an empty hono body and a keyless core call share the fingerprint semantics', async () => {
+    // The adapter must fingerprint a bodyless request as absent, staying
+    // interchangeable with non-HTTP callers of the same key.
+    const first = await app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-cross' } })
+    assert.equal(first.status, 204)
+    const direct = await idempotency.executeWithMetadata({ key: 'hon-cross' }, async () => 'never')
+    assert.equal(direct.replayed, true)
+  })
+
   test('a streamed body over the cap is served and never cached', async () => {
     const first = await post('/stream-huge', 'hon-stream', {})
     const second = await post('/stream-huge', 'hon-stream', {})
@@ -142,10 +192,11 @@ describe('hono adapter', () => {
   })
 
   test('a request without a body runs unfingerprinted and replays', async () => {
+    const startingCalls = calls.empty ?? 0
     const request = async () => app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-nobody' } })
     await request()
     const second = await request()
     assert.equal(second.headers.get('idempotency-replayed'), 'true')
-    assert.equal(calls.empty, 2)
+    assert.equal(calls.empty, startingCalls + 1)
   })
 })

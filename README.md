@@ -221,7 +221,7 @@ const idempotency = new Idempotency({
 })
 ```
 
-Listener failures never affect execution semantics. Ready-made integrations follow the same shape as [breakwater](https://github.com/pinceladasdaweb/breakwater)'s:
+Listener failures never affect execution semantics — a throwing listener surfaces as a process warning instead of failing the operation or being silently swallowed. Ready-made integrations follow the same shape as [breakwater](https://github.com/pinceladasdaweb/breakwater)'s:
 
 ```ts
 import { prometheusMetrics } from 'quayside/prometheus' // counters + duration histogram
@@ -264,6 +264,7 @@ new Idempotency(options)
 | `persistFailures` | `false` | Store and replay failures instead of allowing retries |
 | `onStorageError` | `'closed'` | `'open'` runs without the guarantee and emits `storage-bypass` |
 | `onEvent` / `metrics` | — | Typed event listener / metrics collector |
+| `clock` | wall clock | `{ now(), sleep(ms) }` time source — inject a manual clock for deterministic TTL and backoff tests |
 
 Durations accept `ms` numbers or strings: `'500ms'`, `'30s'`, `'10m'`, `'24h'`, `'7d'`.
 
@@ -294,6 +295,7 @@ npm install
 npm run hooks             # once per clone: lint + commit-message hooks
 npm test                  # unit tests, no external services needed
 npm run test:integration  # real Redis/Postgres/MySQL via Testcontainers (needs Docker)
+npm run test:mutation     # Stryker mutation testing over the unit suite
 npm run examples          # runnable, self-asserting examples
 ```
 

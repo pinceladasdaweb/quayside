@@ -20,6 +20,9 @@ export type HonoNext = () => Promise<void>
 
 async function requestBody (request: Request): Promise<string | undefined> {
   const text = await request.clone().text()
+  // A bodyless request must fingerprint as absent, not as the empty
+  // string, so it stays interchangeable with non-HTTP callers of the same
+  // key that pass no payload.
   return text === '' ? undefined : text
 }
 
@@ -34,8 +37,10 @@ async function captureWebResponse (
   if (response.body === null) {
     return { status: response.status, headers, body: '' }
   }
-  const declaredLength = response.headers.get('content-length')
-  if (declaredLength !== null && Number(declaredLength) > kernel.maxBodyBytes) return null
+  // Number(null) is 0 and a garbage header is NaN: both fall through to the
+  // stream read below, the real size authority.
+  const declaredLength = Number(response.headers.get('content-length'))
+  if (declaredLength > kernel.maxBodyBytes) return null
 
   // The clone of a response whose body was checked non-null above is never
   // null; the cast removes a branch no test could ever reach.
@@ -53,7 +58,8 @@ async function captureWebResponse (
     }
     chunks.push(value)
   }
-  const body = kernel.cacheableBody(Buffer.concat(chunks))
+  // The read loop is the size authority here; only the UTF-8 gate remains.
+  const body = kernel.decodeUtf8(Buffer.concat(chunks))
   return body === null ? null : { status: response.status, headers, body }
 }
 
@@ -63,10 +69,6 @@ export function HonoMiddleware (
 ): (c: HonoContextLike, next: HonoNext) => Promise<Response | undefined> {
   const kernel = new HttpIdempotencyKernel(idempotency, options)
   return async function quaysideIdempotency (c, next) {
-    if (!kernel.shouldHandle(c.req.method)) {
-      await next()
-      return
-    }
     const body = await requestBody(c.req.raw)
     const outcome = await kernel.handle(
       {

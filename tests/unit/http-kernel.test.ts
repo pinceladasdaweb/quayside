@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 
 import { HttpIdempotencyKernel } from '../../src/http/kernel'
 import type { CapturedHttpResponse, HttpKernelOptions, HttpRequestFacts } from '../../src/http/kernel'
-import { Idempotency } from '../../src/index'
+import { FencingError, Idempotency } from '../../src/index'
+import type { IdempotencyStorage } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 
 function kernelWith (options: HttpKernelOptions = {}, idempotencyOverrides = {}) {
@@ -41,6 +42,10 @@ describe('http kernel routing', () => {
     const outcome = await strict.handle(request, async () => ok())
     assert.equal(outcome.kind, 'respond')
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 400)
+    const problem = JSON.parse(outcome.kind === 'respond' ? outcome.response.body : '{}') as { error: string, detail: string }
+    assert.equal(problem.error, 'IDEMPOTENCY_KEY_REQUIRED')
+    assert.match(problem.detail, /idempotency-key/, 'the problem names the missing header')
+    assert.match(problem.detail, /POST/, 'the problem names the method it applies to')
   })
 })
 
@@ -75,6 +80,13 @@ describe('http kernel replay', () => {
     const kernel = kernelWith({ fingerprint: 'body-and-path' })
     await kernel.handle(post({ path: '/a' }), async () => ok())
     const outcome = await kernel.handle(post({ path: '/b' }), async () => ok())
+    assert.equal(outcome.kind === 'respond' && outcome.response.status, 422)
+  })
+
+  test('body-and-path fingerprinting distinguishes another body on the same path', async () => {
+    const kernel = kernelWith({ fingerprint: 'body-and-path' })
+    await kernel.handle(post({ body: { amount: 10 } }), async () => ok())
+    const outcome = await kernel.handle(post({ body: { amount: 99 } }), async () => ok())
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 422)
   })
 
@@ -164,6 +176,17 @@ describe('http kernel cacheability', () => {
     const binary = Buffer.from([0xff, 0xfe, 0x00, 0x81])
     assert.equal(kernel.cacheableBody(binary), null)
     assert.equal(kernel.cacheableBody(Buffer.from('texto', 'utf8')), 'texto')
+    assert.equal(kernel.decodeUtf8('text'), 'text')
+    assert.equal(kernel.decodeUtf8(Buffer.from('text')), 'text')
+    assert.equal(kernel.decodeUtf8(binary), null)
+  })
+
+  test('the size cap is inclusive: exactly maxBodyBytes still caches', () => {
+    const kernel = kernelWith({ maxBodyBytes: 8 })
+    assert.equal(kernel.cacheableBody('x'.repeat(8)), 'x'.repeat(8))
+    assert.equal(kernel.cacheableBody('x'.repeat(9)), null)
+    assert.equal(kernel.cacheableBody(Buffer.alloc(8, 120)), 'x'.repeat(8))
+    assert.equal(kernel.cacheableBody(Buffer.alloc(9, 120)), null)
   })
 
   test('uncacheable responses release the record even with persistFailures enabled', async () => {
@@ -203,6 +226,111 @@ describe('http kernel cacheability', () => {
 })
 
 describe('http kernel configuration', () => {
+  test('PATCH is protected by default', async () => {
+    const kernel = kernelWith()
+    let calls = 0
+    const run = async () => { calls += 1; return ok() }
+    assert.deepEqual(await kernel.handle(post({ method: 'PATCH' }), run), { kind: 'handled' })
+    const replay = await kernel.handle(post({ method: 'PATCH' }), run)
+    assert.equal(calls, 1)
+    assert.equal(replay.kind, 'respond')
+  })
+
+  test('an empty-string key behaves like a missing key', async () => {
+    const relaxed = kernelWith()
+    const request = { ...post(), header: () => '' }
+    assert.deepEqual(await relaxed.handle(request, async () => ok()), { kind: 'passthrough' })
+    const strict = kernelWith({ enforce: true })
+    const outcome = await strict.handle(request, async () => ok())
+    assert.equal(outcome.kind === 'respond' && outcome.response.status, 400)
+  })
+
+  test('fencing and serialization failures map to 500, storage to 503', async () => {
+    const memory = new MemoryStorage()
+    const fencing: IdempotencyStorage = {
+      acquire: (record, ttl) => memory.acquire(record, ttl),
+      complete: async () => { throw new FencingError('k-1') },
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, ttl) => memory.extend(key, token, ttl),
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const kernel = new HttpIdempotencyKernel(new Idempotency({ storage: fencing }))
+    const outcome = await kernel.handle(post(), async () => ok())
+    assert.equal(outcome.kind, 'respond')
+    if (outcome.kind === 'respond') {
+      assert.equal(outcome.response.status, 500)
+      assert.match(outcome.response.body, /IDEMPOTENCY_FENCING/)
+    }
+  })
+
+  test('problem responses declare a JSON content type and a non-empty detail', async () => {
+    const kernel = kernelWith({ retryAfterSeconds: 2 })
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const running = kernel.handle(post(), async () => { await gate; return ok() })
+    await new Promise((resolve) => setImmediate(resolve))
+    const conflict = await kernel.handle(post(), async () => ok())
+    release()
+    await running
+
+    assert.equal(conflict.kind, 'respond')
+    if (conflict.kind === 'respond') {
+      assert.match(conflict.response.headers['content-type'] ?? '', /application\/json/)
+      const body = JSON.parse(conflict.response.body) as { error: string, detail: string }
+      assert.equal(body.error, 'IDEMPOTENCY_IN_PROGRESS')
+      assert.notEqual(body.detail, '')
+    }
+
+    const strict = kernelWith({ enforce: true })
+    const missing = await strict.handle({ ...post(), header: () => undefined }, async () => ok())
+    if (missing.kind === 'respond') {
+      const body = JSON.parse(missing.response.body) as { detail: string }
+      assert.match(body.detail, /idempotency-key/)
+      assert.match(body.detail, /POST/)
+    }
+
+    const reuse = kernelWith()
+    await reuse.handle(post({ body: { amount: 1 } }), async () => ok())
+    const rejected = await reuse.handle(post({ body: { amount: 2 } }), async () => ok())
+    if (rejected.kind === 'respond') {
+      const body = JSON.parse(rejected.response.body) as { detail: string }
+      assert.notEqual(body.detail, '')
+    }
+  })
+
+  test('body-and-path folds an absent body into null', async () => {
+    const kernel = kernelWith({ fingerprint: 'body-and-path' })
+    let calls = 0
+    const run = async () => { calls += 1; return ok() }
+    await kernel.handle(post({ body: undefined }), run)
+    const second = await kernel.handle(post({ body: null }), run)
+    assert.equal(calls, 1)
+    assert.equal(second.kind, 'respond')
+  })
+
+  test('the stored uncacheable sentinel keeps its diagnostic message', async () => {
+    const memory = new MemoryStorage()
+    const stored: string[] = []
+    const spy: IdempotencyStorage = {
+      acquire: (record, ttl) => memory.acquire(record, ttl),
+      complete: async (key, token, outcome, ttl) => {
+        if (outcome.status === 'failed') stored.push(outcome.error)
+        return memory.complete(key, token, outcome, ttl)
+      },
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, ttl) => memory.extend(key, token, ttl),
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const kernel = new HttpIdempotencyKernel(new Idempotency({ storage: spy, persistFailures: true }))
+    await kernel.handle(post({ body: undefined }), async () => null)
+    assert.equal(stored.length, 1)
+    const parsed = JSON.parse(stored[0] ?? '{}') as { name: string, message: string }
+    assert.equal(parsed.name, 'QuaysideUncacheableResponse')
+    assert.match(parsed.message, /not cacheable/)
+  })
+
   test('custom header and method set are honored', async () => {
     const kernel = kernelWith({ header: 'X-Request-Once', methods: ['PUT'] })
     let calls = 0

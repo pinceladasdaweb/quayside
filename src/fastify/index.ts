@@ -32,9 +32,8 @@ interface PendingExecution {
 }
 
 function headerValue (value: unknown): string | undefined {
-  if (typeof value === 'string') return value
-  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
-  return undefined
+  if (Array.isArray(value)) return headerValue(value[0])
+  return typeof value === 'string' ? value : undefined
 }
 
 function pathOf (url: string): string {

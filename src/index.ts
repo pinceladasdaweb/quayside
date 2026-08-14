@@ -13,6 +13,7 @@ export type {
   ExecuteInput,
   ExecutionContext,
   ExecutionResult,
+  IdempotencyClock,
   IdempotencyOptions,
   IdempotencyRecord,
   WrapOptions

@@ -1,5 +1,5 @@
 import { SpanStatusCode, trace } from '@opentelemetry/api'
-import type { Tracer } from '@opentelemetry/api'
+import type { Attributes, Tracer } from '@opentelemetry/api'
 
 import type { IdempotencyEvent, MetricsCollector } from '../index'
 
@@ -8,13 +8,14 @@ export interface OtelSpansOptions {
   tracer?: Tracer
 }
 
-function attributesFor (event: IdempotencyEvent): Record<string, string | boolean> {
-  const attributes: Record<string, string | boolean> = {
+function attributesFor (event: IdempotencyEvent): Attributes {
+  return {
     'quayside.key': event.key,
-    'quayside.correlation_id': event.correlationId
+    'quayside.correlation_id': event.correlationId,
+    // The Attributes contract allows undefined values and drops them, which
+    // is exactly the omit-when-absent semantics wanted for the namespace.
+    'quayside.namespace': event.namespace
   }
-  if (event.namespace !== undefined) attributes['quayside.namespace'] = event.namespace
-  return attributes
 }
 
 /**

@@ -133,8 +133,8 @@ The `correlationId` is stable across all events of one `execute` call.
 | `storage-bypass` | `onStorageError: 'open'` ran an execution without the guarantee |
 
 `metrics` receives the same events through named methods (`onAcquired`,
-`onReplayed`, ...). Listener exceptions are swallowed by design:
-observability never alters execution semantics.
+`onReplayed`, ...). Listener exceptions never alter execution semantics:
+they surface as process warnings instead of failing the operation.
 
 ## Storage errors
 

@@ -69,5 +69,6 @@ pipelines can join the two streams directly, and the OTel span attribute
 
 `onEvent` receives every event; `metrics` receives them through named
 methods (`onAcquired`, `onReplayed`, ...). Both are fire-and-forget:
-listener exceptions are swallowed, observability never alters execution
-semantics.
+a throwing listener never alters execution semantics — the exception is
+reported as a process warning (`process.emitWarning`) naming the event
+type, so a broken collector is visible without ever failing an operation.
