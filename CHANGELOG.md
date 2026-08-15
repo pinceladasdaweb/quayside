@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## 1.1.0 (2026-08-15)
+
+* fix: put persisted failures through the configured codec (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/8e0c819eb9282c4331dd690cb945bba090aab710)
+* perf: stop resending lua bodies and resubscribing between polls (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/0570bf81642cd207eb088b008a9e1dff3dc33c9a)
+* perf: fingerprint paths as strings, and take resultTtl per call (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/3803682961bc55fc0d12445cf32d543c03fc9d64)
+
+
 ## 1.0.0 (2026-08-15)
 
 * chore: keep stryker runner leftovers out of the repo by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/972e4b224e9a8ecc87f2823c91cbcc37f5bf2185)
