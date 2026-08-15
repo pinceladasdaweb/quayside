@@ -106,7 +106,6 @@ describe('durations through the clock seam', () => {
 describe('the wait loop under a manual clock', () => {
   function inProgressRecord (clock: ManualClock): StoredRecord {
     return {
-      key: 'k',
       token: 'holder',
       status: 'in-progress',
       storedAt: clock.now(),
@@ -146,7 +145,6 @@ describe('the wait loop under a manual clock', () => {
         reads += 1
         if (reads < 3) return { ...inProgressRecord(clock), token: 'winner' }
         return {
-          key: 'k',
           token: 'winner',
           status: 'completed',
           result: '"done"',
@@ -181,7 +179,6 @@ describe('the wait loop under a manual clock', () => {
       get: async () => {
         clock.advance(40)
         return {
-          key: 'k',
           token: 'winner',
           status: 'failed',
           error: JSON.stringify({ name: 'Error', message: 'stored boom' }),

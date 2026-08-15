@@ -98,7 +98,6 @@ function parseWireRecord (key: string, raw: string): StoredRecord {
     throw new Error(`corrupt idempotency record under key "${key}"`)
   }
   const record: StoredRecord = {
-    key,
     token: wire.token,
     status: wire.status as RecordStatus,
     storedAt: Number(wire.storedAt),

@@ -390,7 +390,6 @@ describe('http kernel configuration', () => {
     // empty shell would be worse than letting the request run.
     const poisoned: IdempotencyStorage = {
       acquire: async () => ({
-        key: 'k-null',
         token: 't',
         status: 'completed',
         result: 'null',

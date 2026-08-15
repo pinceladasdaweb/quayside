@@ -381,7 +381,6 @@ describe('Idempotency failures', () => {
 
   test('a failed record without a stored error still replays an Error', async () => {
     const failedRecord = {
-      key: 'k',
       token: 't',
       status: 'failed' as const,
       storedAt: Date.now(),
@@ -415,7 +414,6 @@ describe('Idempotency failures', () => {
 
   test('a completed record without a stored result replays undefined', async () => {
     const completedRecord = {
-      key: 'k',
       token: 't',
       status: 'completed' as const,
       storedAt: Date.now(),
@@ -695,7 +693,6 @@ describe('waiters and key identity', () => {
     // over: its result belongs to that payload, not to the waiter's.
     let reads = 0
     const takeover = {
-      key: 'k',
       token: 'other-holder',
       status: 'completed' as const,
       result: '"someone else\'s result"',
@@ -727,7 +724,6 @@ describe('waiters and key identity', () => {
     let reads = 0
     const storage: IdempotencyStorage = {
       acquire: async (record) => ({
-        key: 'k',
         token: 'holder',
         status: 'in-progress',
         fingerprint: record.fingerprint,
@@ -740,7 +736,6 @@ describe('waiters and key identity', () => {
       get: async () => {
         reads += 1
         return {
-          key: 'k',
           token: 'holder',
           status: 'completed' as const,
           result: '"winner"',
@@ -821,10 +816,9 @@ describe('failure cleanup and revival edges', () => {
   test('get exposes an error only on failed records, whatever the storage holds', async () => {
     const records: Record<string, StoredRecord> = {
       'failed-sans-error': {
-        key: 'failed-sans-error', token: 't', status: 'failed', storedAt: 1, expiresAt: Date.now() + 60_000
+        token: 't', status: 'failed', storedAt: 1, expiresAt: Date.now() + 60_000
       },
       'completed-with-stray-error': {
-        key: 'completed-with-stray-error',
         token: 't',
         status: 'completed',
         result: '"v"',

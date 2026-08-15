@@ -100,10 +100,17 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    remaining `waitTimeout`). Storages that implement the optional
    `waitForChange(key, timeoutMs)` cut the sleep short on change
    notifications — the Redis adapter uses keyspace events; correctness
-   never depends on the notification arriving.
+   never depends on the notification arriving. A channel that throws,
+   rejects or hands back something that is not a promise falls back to the
+   plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the
    waiter **takes over**: it attempts a fresh acquisition and executes.
 4. `WaitTimeoutError` when `waitTimeout` elapses first.
+
+The fingerprint is re-checked on every poll, not just at acquisition: a
+holder's lock can expire mid-wait and another payload take the key over,
+and that outcome is not the waiter's to replay. It gets
+`IdempotencyKeyReuseError`, exactly as if it had arrived second.
 
 ## Failure replay fidelity
 

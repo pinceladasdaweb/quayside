@@ -191,6 +191,8 @@ Options and cacheability rules: [docs/http.md](docs/http.md). Adding another fra
 ## NestJS
 
 ```ts
+import { QuaysideModule, Idempotent } from 'quayside/nestjs'
+
 QuaysideModule.forRoot({ storage: new RedisStorage(redis) })
 
 @Post('/payments')
