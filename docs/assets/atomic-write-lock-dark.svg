@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg viewBox="0 0 1000 460" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="atomic-write-lock-dark-title atomic-write-lock-dark-desc">
+      <title id="atomic-write-lock-dark-title">The atomic write is the lock</title>
+      <desc id="atomic-write-lock-dark-desc">State machine showing execute(key) creating an IN_PROGRESS record with a single atomic create-if-absent write, which then either completes and is replayed for the result TTL, or frees the key again when the function rejects or the lock expires.</desc>
+      <defs>
+        <style>@import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;display=swap');</style>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#2d3142"/>
+
+      <!-- Transitions (drawn before boxes so nodes paint over the strokes) -->
+      <!-- start -> IN_PROGRESS -->
+      <line x1="64" y1="204" x2="176" y2="204" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- IN_PROGRESS -> COMPLETED (accent: the path the guarantee exists for) -->
+      <line x1="384" y1="204" x2="680" y2="204" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <!-- IN_PROGRESS -> Key free, via the rightmost bottom attach point -->
+      <path d="M 316 248 L 316 340 Q 316 348 324 348 L 680 348" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <!-- IN_PROGRESS -> Key free, via the leftmost bottom attach point -->
+      <path d="M 244 248 L 244 372 Q 244 380 252 380 L 680 380" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- Transition labels: masked, held 8px clear of their stroke -->
+      <rect x="84" y="184" width="72" height="12" rx="2" fill="#2d3142"/>
+      <text x="120" y="193" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">EXECUTE(KEY)</text>
+
+      <rect x="496" y="184" width="72" height="12" rx="2" fill="#2d3142"/>
+      <text x="532" y="193" fill="#f08a59" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">FN RESOLVES</text>
+
+      <rect x="464" y="328" width="72" height="12" rx="2" fill="#2d3142"/>
+      <text x="500" y="337" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">FN REJECTS</text>
+
+      <rect x="344" y="360" width="72" height="12" rx="2" fill="#2d3142"/>
+      <text x="380" y="369" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">LOCK EXPIRES</text>
+
+      <!-- Editorial callout: the thesis of the section -->
+      <text x="176" y="104" fill="#f08a59" font-size="14" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="start">that write is the lock — there is no second step</text>
+      <path d="M 200 112 Q 188 152 168 196" fill="none" stroke="rgba(240,138,89,0.50)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="166" cy="200" r="2" fill="#f08a59"/>
+
+      <!-- Start: filled ink dot -->
+      <circle cx="56" cy="204" r="6" fill="#f5f5f5"/>
+
+      <!-- State: IN_PROGRESS (focal) -->
+      <rect x="176" y="160" width="208" height="88" rx="8" fill="#2d3142"/>
+      <rect x="176" y="160" width="208" height="88" rx="8" fill="rgba(240,138,89,0.10)" stroke="#f08a59" stroke-width="1"/>
+      <rect x="184" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(240,138,89,0.50)" stroke-width="0.8"/>
+      <text x="204" y="176" fill="#f08a59" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+      <text x="280" y="212" fill="#f5f5f5" font-size="14" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">IN_PROGRESS</text>
+      <text x="280" y="228" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">create-if-absent · lockTtl</text>
+
+      <!-- State: COMPLETED -->
+      <rect x="680" y="160" width="208" height="88" rx="8" fill="#2d3142"/>
+      <rect x="680" y="160" width="208" height="88" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <rect x="688" y="168" width="40" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
+      <text x="708" y="176" fill="#bfc0c0" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+      <text x="784" y="212" fill="#f5f5f5" font-size="14" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">COMPLETED</text>
+      <text x="784" y="228" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">replayed for resultTtl</text>
+
+      <!-- State: key free again -->
+      <rect x="680" y="320" width="208" height="88" rx="8" fill="#2d3142"/>
+      <rect x="680" y="320" width="208" height="88" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+      <rect x="688" y="328" width="40" height="12" rx="2" fill="transparent" stroke="rgba(191,192,192,0.50)" stroke-width="0.8"/>
+      <text x="708" y="336" fill="#bfc0c0" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">STATE</text>
+      <text x="784" y="372" fill="#f5f5f5" font-size="14" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Key free</text>
+      <text x="784" y="388" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">the retry runs fresh</text>
+
+      <!-- Footnote strip -->
+      <line x1="56" y1="424" x2="944" y2="424" stroke="rgba(245,245,245,0.10)" stroke-width="0.8"/>
+      <text x="56" y="444" fill="#bfc0c0" font-size="14" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="start">Every exit is fenced: a holder that lost its lock gets FencingError from the store itself, and can never overwrite the new holder's result.</text>
+    </svg>

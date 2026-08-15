@@ -121,12 +121,10 @@ The same `execute` call works verbatim inside an Express route, a Fastify handle
 
 ### The atomic write is the lock
 
-```
-                    ┌──────────────┐
-   execute(key) ──▶ │  IN_PROGRESS │──── fn resolves ────▶ COMPLETED (result stored for resultTtl)
-                    │  (lockTtl)   │──── fn rejects ─────▶ record deleted → retry allowed
-                    └──────────────┘──── process crash ──▶ lock expires → retry allowed
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/pinceladasdaweb/quayside/main/docs/assets/atomic-write-lock-dark.svg">
+  <img src="https://raw.githubusercontent.com/pinceladasdaweb/quayside/main/docs/assets/atomic-write-lock.svg" alt="State machine: execute(key) creates an IN_PROGRESS record with a single atomic create-if-absent write, bounded by lockTtl — that write is the lock. The record then either completes and is replayed for resultTtl, or the key is freed again when the function rejects or the lock expires. Every exit is fenced: a holder that lost its lock gets FencingError and can never overwrite the new holder's result.">
+</picture>
 
 `IN_PROGRESS` is written atomically (create-if-absent) before your function runs — that write *is* the lock; there is no separate locking step. On success the record transitions to `COMPLETED` guarded by a **fencing token**: a holder that lost its lock (GC pause, slow I/O, expired TTL) gets `FencingError` from the store itself and can never overwrite the new holder's result.
 
