@@ -88,3 +88,12 @@ stands, the failure is reported as a process warning and through the
 Note that with the Express adapter the record is committed right after the
 response is flushed; with Fastify and Hono it is committed before the
 response leaves the server.
+
+The Fastify adapter also settles on the raw `close` event, so a hijacked
+reply (`reply.hijack()`, SSE, proxying) releases the key instead of holding
+it until the lock expires. A connection that dies *before* the response
+finished is deliberately not settled that way: Node does not cancel the
+handler, so the work is still running, and releasing the key would let the
+client's next retry execute it a second time. Those keep the lock until
+`lockTtl` — the same treatment as an execution whose process died — and the
+handler's late completion still stores its outcome for the retry to replay.

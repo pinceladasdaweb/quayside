@@ -228,54 +228,92 @@ describe('fastify adapter', () => {
     assert.equal(nullReplay.headersSet['idempotency-replayed'], 'true')
   })
 
-  test('a reply that never reaches onSend releases the key on close', async () => {
-    // reply.hijack(), an aborted connection or a handler that never answers
-    // all skip onSend; without the raw close backstop the record would stay
-    // locked until its TTL expired and every retry would answer 409.
-    const storage = new MemoryStorage()
-    const idempotency = new Idempotency({ storage })
+  function hookHarness (idempotency: Idempotency) {
     const hooks: Record<string, (...args: never[]) => Promise<unknown>> = {}
-    const fakeInstance = {
+    const instance = {
       addHook (name: string, hook: (...args: never[]) => Promise<unknown>) { hooks[name] = hook }
     }
-    await FastifyPlugin(idempotency)(fakeInstance as never)
-
-    const closeListeners: Array<() => void> = []
-    const hijacked = {
-      statusCode: 200,
-      // Only the close event is a lifecycle backstop; anything else the
-      // adapter listened for would leave the record locked.
-      raw: { on (event: string, listener: () => void) { if (event === 'close') closeListeners.push(listener) } },
-      getHeader: () => undefined,
-      header () {},
-      code () { return hijacked },
-      send () { return hijacked }
+    const replyFor = (writableEnded: boolean) => {
+      const closeListeners: Array<() => void> = []
+      const reply = {
+        statusCode: 200,
+        sent: undefined as unknown,
+        closeListeners,
+        // Only the close event is a lifecycle backstop; anything else the
+        // adapter listened for would leave the record locked.
+        raw: {
+          writableEnded,
+          on (event: string, listener: () => void) { if (event === 'close') closeListeners.push(listener) }
+        },
+        getHeader: () => undefined,
+        header () {},
+        code (status: number) { reply.statusCode = status; return reply },
+        send (body: unknown) { reply.sent = body; return reply }
+      }
+      return reply
     }
+    return { hooks, instance, replyFor }
+  }
+
+  test('a finished response that never reached onSend releases the key on close', async () => {
+    // reply.hijack() answers the client directly and skips onSend; without
+    // the raw close backstop the record would stay locked until its TTL
+    // expired and every retry would answer 409.
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const { hooks, instance, replyFor } = hookHarness(idempotency)
+    await FastifyPlugin(idempotency)(instance as never)
+
+    const hijacked = replyFor(true)
     const request = { method: 'POST', url: '/fake', headers: { 'idempotency-key': 'hijack-1' }, body: undefined }
     await hooks.preHandler?.(request as never, hijacked as never)
-    assert.equal(closeListeners.length, 1, 'the adapter listens for the raw close event')
+    assert.equal(hijacked.closeListeners.length, 1, 'the adapter listens for the raw close event')
 
-    // The connection ends without onSend ever running.
-    for (const listener of closeListeners) listener()
+    // The hijacked response ended; the connection closes without onSend.
+    for (const listener of hijacked.closeListeners) listener()
     await new Promise((resolve) => setImmediate(resolve))
     assert.equal(await idempotency.get('hijack-1'), null, 'the lock is released, not held until it expires')
 
     // The next attempt on the same key acquires it instead of getting a 409.
-    let ran = 0
-    const reply = {
-      statusCode: 200,
-      sent: undefined as unknown,
-      raw: { on () {} },
-      getHeader: () => undefined,
-      header () {},
-      code () { return reply },
-      send (body: unknown) { reply.sent = body; return reply }
-    }
+    const reply = replyFor(false)
     await hooks.preHandler?.(request as never, reply as never)
-    ran += 1
     await hooks.onSend?.(request as never, reply as never, 'fresh' as never)
-    assert.equal(ran, 1)
     assert.equal(reply.sent, undefined, 'no conflict response was sent')
+  })
+
+  test('a connection that dies mid-handler keeps the lock, so no retry runs twice', async () => {
+    // Node does not cancel a handler when the client goes away: the work is
+    // still running, so releasing the record here would let the very next
+    // retry execute it a second time under one idempotency key.
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const { hooks, instance, replyFor } = hookHarness(idempotency)
+    await FastifyPlugin(idempotency)(instance as never)
+
+    const aborted = replyFor(false)
+    const request = { method: 'POST', url: '/fake', headers: { 'idempotency-key': 'abort-1' }, body: undefined }
+    await hooks.preHandler?.(request as never, aborted as never)
+
+    // The client hangs up before the response was finished.
+    for (const listener of aborted.closeListeners) listener()
+    await new Promise((resolve) => setImmediate(resolve))
+    const held = await idempotency.get('abort-1')
+    assert.equal(held?.status, 'in-progress', 'the key stays locked while the handler runs on')
+
+    // A retry arriving now is refused instead of executing the work again.
+    const retry = replyFor(false)
+    await hooks.preHandler?.(request as never, retry as never)
+    assert.equal(retry.statusCode, 409, 'the retry is told the first attempt is still in flight')
+
+    // The original handler finishes late: its outcome is what gets stored.
+    aborted.statusCode = 201
+    await hooks.onSend?.(request as never, aborted as never, 'charged once' as never)
+    const stored = await idempotency.get('abort-1')
+    assert.equal(stored?.status, 'completed')
+
+    // From here the key replays, exactly as if the client had never dropped.
+    const replayed = replyFor(false)
+    await hooks.preHandler?.(request as never, replayed as never)
+    assert.equal(replayed.sent, 'charged once')
+    assert.equal(replayed.statusCode, 201)
   })
 
   test('a non-string, non-array header value runs unprotected', async () => {
