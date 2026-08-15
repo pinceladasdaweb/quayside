@@ -294,6 +294,25 @@ describe('http kernel configuration', () => {
     assert.match(warnings[0] ?? '', /k-1|after the response was sent/)
   })
 
+  test('a key the client cannot use answers 400, not 500', async () => {
+    // The header is client input: a 5xx here would blame the server and page
+    // someone for a malformed request.
+    const kernel = kernelWith({}, { maxKeyLength: 16 })
+    let calls = 0
+    const outcome = await kernel.handle(
+      post({ key: 'x'.repeat(20) }),
+      async () => { calls += 1; return ok() }
+    )
+    assert.equal(outcome.kind, 'respond')
+    if (outcome.kind === 'respond') {
+      assert.equal(outcome.response.status, 400)
+      const body = JSON.parse(outcome.response.body) as { error: string, detail: string }
+      assert.equal(body.error, 'IDEMPOTENCY_KEY_INVALID')
+      assert.match(body.detail, /16/, 'the client is told the limit it broke')
+    }
+    assert.equal(calls, 0, 'the handler never ran')
+  })
+
   test('failures before the handler runs still map to a status', async () => {
     // Nothing was sent yet, so these can and must become responses.
     const unserializable = kernelWith()

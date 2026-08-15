@@ -23,6 +23,7 @@ export {
   ConcurrentExecutionError,
   ERROR_CODES,
   FencingError,
+  IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   QuaysideError,
   SerializationError,

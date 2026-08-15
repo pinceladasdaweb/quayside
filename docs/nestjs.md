@@ -79,6 +79,7 @@ to Nest `HttpException`s:
 | Same key, execution still running | `409` + `Retry-After` |
 | Same key, different payload | `422` |
 | Missing key with `enforce: true` | `400` |
+| Key longer than `maxKeyLength` | `400` |
 | Storage unreachable (fail-closed) | `503` |
 
 Decorator options: `key` (extractor over the request; default is the

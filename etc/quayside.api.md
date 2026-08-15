@@ -35,6 +35,7 @@ export type Duration = number | string;
 // @public (undocumented)
 export const ERROR_CODES: {
     readonly inProgress: "IDEMPOTENCY_IN_PROGRESS";
+    readonly keyInvalid: "IDEMPOTENCY_KEY_INVALID";
     readonly keyReuse: "IDEMPOTENCY_KEY_REUSE";
     readonly waitTimeout: "IDEMPOTENCY_WAIT_TIMEOUT";
     readonly fencing: "IDEMPOTENCY_FENCING";
@@ -143,6 +144,17 @@ export interface IdempotencyEvent {
 //
 // @public (undocumented)
 export type IdempotencyEventType = 'acquired' | 'replayed' | 'conflict' | 'completed' | 'failed' | 'expired-recovery' | 'storage-bypass';
+
+// Warning: (ae-missing-release-tag) "IdempotencyKeyInvalidError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export class IdempotencyKeyInvalidError extends QuaysideError {
+    constructor(key: string, message: string);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.keyInvalid;
+    // (undocumented)
+    readonly key: string;
+}
 
 // Warning: (ae-missing-release-tag) "IdempotencyKeyReuseError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //

@@ -4,6 +4,7 @@
 // core bundle instead of inlining a private copy.
 import {
   ConcurrentExecutionError,
+  IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   QuaysideError,
   WaitTimeoutError
@@ -176,6 +177,11 @@ export class HttpIdempotencyKernel {
           kind: 'respond',
           response: this.problem(422, error.code, 'this idempotency key was already used with a different payload')
         }
+      }
+      if (error instanceof IdempotencyKeyInvalidError) {
+        // The offending value came from the request, so this is a client
+        // error: answering 5xx would blame the server and page someone.
+        return { kind: 'respond', response: this.problem(400, error.code, error.message) }
       }
       if (error instanceof QuaysideError) {
         const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500

@@ -157,7 +157,7 @@ If the storage is unreachable, `execute` throws `StorageUnavailableError` instea
 
 ### Keys are never truncated
 
-Namespace and key segments are percent-encoded before composition (a client-supplied key cannot impersonate another namespace) and composed keys longer than `maxKeyLength` (default 512) are rejected — truncation would silently alias two keys into one record.
+Namespace and key segments are percent-encoded before composition (a client-supplied key cannot impersonate another namespace) and composed keys longer than `maxKeyLength` (default 512) are rejected with `IdempotencyKeyInvalidError` — truncation would silently alias two keys into one record. The value came from the caller, so the HTTP adapters answer `400`, never a 5xx.
 
 Deep dive on all of the above: [docs/core.md](docs/core.md).
 
@@ -239,6 +239,7 @@ All errors extend `QuaysideError` and carry a stable `code` — codes are contra
 | Error | `code` | HTTP mapping |
 |---|---|---|
 | `ConcurrentExecutionError` | `IDEMPOTENCY_IN_PROGRESS` | 409 |
+| `IdempotencyKeyInvalidError` | `IDEMPOTENCY_KEY_INVALID` | 400 |
 | `IdempotencyKeyReuseError` | `IDEMPOTENCY_KEY_REUSE` | 422 |
 | `WaitTimeoutError` | `IDEMPOTENCY_WAIT_TIMEOUT` | 409 |
 | `FencingError` | `IDEMPOTENCY_FENCING` | 500 |

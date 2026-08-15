@@ -125,6 +125,14 @@ at `maxKeyLength` (default 512) and rejected on overflow — never truncated,
 because truncation aliases two keys into one record. Payload-derived keys
 are hex hashes and always fit.
 
+The overflow raises `IdempotencyKeyInvalidError` (`IDEMPOTENCY_KEY_INVALID`),
+not a `TypeError`: the offending value is data, usually straight from a
+client header, so it carries a code and the HTTP adapters answer `400`.
+Percent-encoding counts toward the cap, so a key of multibyte characters can
+overflow well before 512 of them. `TypeError` is kept for genuine misuse of
+the API — a non-string key, an empty key, `ignoreFields` together with
+`pickFields`.
+
 ## Events reference
 
 Every event carries `{ type, key, namespace?, correlationId, timestamp }`.

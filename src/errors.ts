@@ -1,5 +1,6 @@
 export const ERROR_CODES = {
   inProgress: 'IDEMPOTENCY_IN_PROGRESS',
+  keyInvalid: 'IDEMPOTENCY_KEY_INVALID',
   keyReuse: 'IDEMPOTENCY_KEY_REUSE',
   waitTimeout: 'IDEMPOTENCY_WAIT_TIMEOUT',
   fencing: 'IDEMPOTENCY_FENCING',
@@ -25,6 +26,21 @@ export class ConcurrentExecutionError extends QuaysideError {
 
   constructor (key: string) {
     super(ERROR_CODES.inProgress, `an execution for key "${key}" is already in progress`)
+    this.key = key
+  }
+}
+
+/**
+ * The key itself violates a policy limit. It carries a code (and maps to a
+ * 4xx in the HTTP adapters) because the offending value is data, usually
+ * supplied by a client, rather than a mistake in the calling code.
+ */
+export class IdempotencyKeyInvalidError extends QuaysideError {
+  declare readonly code: typeof ERROR_CODES.keyInvalid
+  readonly key: string
+
+  constructor (key: string, message: string) {
+    super(ERROR_CODES.keyInvalid, message)
     this.key = key
   }
 }

@@ -11,6 +11,7 @@ import {
   ConcurrentExecutionError,
   FencingError,
   Idempotency,
+  IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   SerializationError,
   StorageUnavailableError,
@@ -125,6 +126,17 @@ describe('error diagnostics carry their context', () => {
     const overflow = await rejectionOf(long.execute('x'.repeat(17), async () => 1))
     assert.match(overflow.message, /16/)
     assert.match(overflow.message, /17/)
+    // The offending value is data, not a mistake in the calling code: it
+    // carries a code so adapters can answer 4xx instead of blaming the server.
+    assert.ok(overflow instanceof IdempotencyKeyInvalidError)
+    assert.equal(overflow.code, 'IDEMPOTENCY_KEY_INVALID')
+    assert.equal(overflow.key, 'x'.repeat(17))
+    assert.equal(overflow.name, 'IdempotencyKeyInvalidError')
+    // Percent-encoding counts: a short but escaped key can still overflow.
+    const escaped = await rejectionOf(long.execute('ü'.repeat(6), async () => 1))
+    assert.ok(escaped instanceof IdempotencyKeyInvalidError)
+    // Misuse of the API stays a TypeError; only policy limits get a code.
+    assert.ok((await rejectionOf(long.execute('', async () => 1))) instanceof TypeError)
     // the limit is inclusive: a key of exactly maxKeyLength is accepted
     assert.equal(await long.execute('x'.repeat(16), async () => 1), 1)
   })

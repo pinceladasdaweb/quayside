@@ -282,6 +282,22 @@ describe('nestjs interceptor glue', () => {
     )
   })
 
+  test('an oversized key answers 400, not 500', async () => {
+    const { HttpException } = await import('@nestjs/common')
+    const options = { storage: new MemoryStorage(), maxKeyLength: 16 }
+    const interceptor = new IdempotencyInterceptor(new Idempotency(options), options)
+    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, {}, decorated())
+
+    await assert.rejects(intercept(interceptor, context), (error: unknown) => {
+      assert.ok(error instanceof HttpException)
+      assert.equal(error.getStatus(), 400)
+      const body = error.getResponse() as { error: string, message: string }
+      assert.equal(body.error, 'IDEMPOTENCY_KEY_INVALID')
+      assert.match(body.message, /16/)
+      return true
+    })
+  })
+
   test('only a complete http shape is rebuilt as an HttpException', async () => {
     // Both halves are required: a status with no body has nothing to answer
     // with, and a body with no numeric status has no status to answer under.

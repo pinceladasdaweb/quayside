@@ -6,6 +6,7 @@ import { jsonCodec, type Codec } from './codec'
 import { parseDuration, type Duration } from './duration'
 import {
   ConcurrentExecutionError,
+  IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   QuaysideError,
   StorageUnavailableError,
@@ -512,7 +513,10 @@ export class Idempotency {
       ? encodedKey
       : `${encodeURIComponent(this.namespace)}:${encodedKey}`
     if (composed.length > this.maxKeyLength) {
-      throw new TypeError(`composed idempotency key is ${composed.length} characters long and exceeds maxKeyLength (${this.maxKeyLength})`)
+      throw new IdempotencyKeyInvalidError(
+        key,
+        `composed idempotency key is ${composed.length} characters long and exceeds maxKeyLength (${this.maxKeyLength})`
+      )
     }
     return composed
   }

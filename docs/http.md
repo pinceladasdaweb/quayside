@@ -10,7 +10,8 @@ only, implementing the IETF `Idempotency-Key` draft:
 - **Error mapping**: `409` + `Retry-After` while the first request is still
   running (or when a wait times out), `422` when the same key arrives with a
   different payload, `503` when the storage is unreachable, `400` for a
-  missing key under `enforce`.
+  missing key under `enforce` or a key that breaks `maxKeyLength` (both are
+  client input, so neither is ever answered with a 5xx).
 - **Route policies**: which methods to protect, enforce-vs-passthrough,
   fingerprint strategy.
 

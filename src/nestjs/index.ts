@@ -16,6 +16,7 @@ import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } fr
 import {
   ConcurrentExecutionError,
   Idempotency,
+  IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   QuaysideError,
   WaitTimeoutError
@@ -168,6 +169,10 @@ export class IdempotencyInterceptor implements NestInterceptor {
         { statusCode: 422, error: error.code, message: 'this idempotency key was already used with a different payload' },
         422
       )
+    }
+    if (error instanceof IdempotencyKeyInvalidError) {
+      // Client-supplied value, client error: never a 5xx.
+      return new HttpException({ statusCode: 400, error: error.code, message: error.message }, 400)
     }
     if (error instanceof QuaysideError) {
       const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500
