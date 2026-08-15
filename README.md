@@ -6,8 +6,6 @@
 [![npm version](https://img.shields.io/npm/v/quayside.svg)](https://www.npmjs.com/package/quayside)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> ⚠️ **Work in progress** — the public API is being built towards `1.0.0` and may change without notice until then.
-
 The quay is where cargo lands **once**: unloaded, registered, never processed twice. quayside is that quay for your operations — REST handlers, queue consumers, cron jobs, workers and CLI commands all get the same guarantee: *run this function once per key; if it already ran, return the stored result; if it is running right now, don't run it again.*
 
 ```ts
