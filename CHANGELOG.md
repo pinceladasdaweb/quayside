@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 1.0.0 (2026-08-15)
+
+* chore: keep stryker runner leftovers out of the repo by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/972e4b224e9a8ecc87f2823c91cbcc37f5bf2185)
+* ci: publish from main through trusted publishing by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/dd26c1642f6268eef9c399eb073a43fabd1caa0d)
+* docs: drop the work-in-progress banner now that the package ships by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/e2177df2c85f0977e6377da216647390b9e06beb)
+* docs: draw the state machine instead of spelling it in ascii by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/1abd3f889484daa9185b5dbe7745566e53fe2300)
+* docs: reuse the state machine diagram in the core reference by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/7307586d2f6949937613a0c7fabdaf86ed12f955)
+* refactor: drop the key nobody reads from StoredRecord by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/3da7980f8af903386f913b2283822f224c011530)
+
+
 ## 0.1.0 (2026-08-14)
 
 * chore: scaffold project foundation by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/3a55f0e462d06b7a56c688d289eb18d270b10c4a)
@@ -26,5 +36,3 @@
 * fix: answer 4xx for a key the client cannot use by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/a58f51f167d852689fe2999abe8770377570868e)
 * fix: never release a fastify lock while its handler runs on by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/94160a657e9cfc07373334fb485a91a837de0357)
 * chore: set the initial published version to 0.1.0 by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/9117995c56352a7df3317906dfffe68c10274a36)
-
-
