@@ -29,6 +29,12 @@ export type ExecuteInput =
     ignoreFields?: string[]
     /** Dot-separated payload paths that alone form the fingerprint. */
     pickFields?: string[]
+    /**
+     * Replay window for this call, overriding the instance `resultTtl`.
+     * A per-route TTL is a property of the call, not a reason to build a
+     * second engine around the same storage.
+     */
+    resultTtl?: Duration
   }
 
 export interface ExecutionContext {
@@ -274,7 +280,7 @@ export class Idempotency {
     }
 
     if (existing === null) {
-      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId, startedAt)
+      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId, startedAt, this.resultTtlFor(input))
     }
 
     if (!fingerprintsEqual(existing.fingerprint, fingerprint)) {
@@ -304,7 +310,8 @@ export class Idempotency {
     storedAt: number,
     fn: ExecuteFunction<T>,
     correlationId: string,
-    startedAt: number
+    startedAt: number,
+    resultTtlMs: number
   ): Promise<ExecutionResult<T>> {
     this.emit('acquired', key, correlationId)
     const controller = new AbortController()
@@ -324,7 +331,7 @@ export class Idempotency {
       value = await fn(ctx)
     } catch (error) {
       const persisted = this.persistFailures && stores
-      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error) } : null)
+      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error) } : null, resultTtlMs)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
@@ -332,7 +339,7 @@ export class Idempotency {
     if (!stores) {
       // The execution opted out of storage: the caller gets its value, the
       // record is released, and nothing is left for anyone to replay.
-      await this.settle(storageKey, token, null)
+      await this.settle(storageKey, token, null, resultTtlMs)
       this.emit('completed', key, correlationId, this.clock.now() - startedAt)
       return { value, replayed: false, storedAt }
     }
@@ -344,13 +351,13 @@ export class Idempotency {
       // A result that cannot be stored cannot be replayed either: the record
       // is released so callers may retry, and the error surfaces instead of
       // silently storing something else.
-      await this.settle(storageKey, token, null)
+      await this.settle(storageKey, token, null, resultTtlMs)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
 
     try {
-      await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, this.resultTtlMs))
+      await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, resultTtlMs))
     } catch (error) {
       if (error instanceof StorageUnavailableError && this.failOpen) {
         // The function already ran; in fail-open mode the caller gets its
@@ -453,13 +460,20 @@ export class Idempotency {
   // the record, an outcome persists it. Best-effort by design: the caller's
   // own result or failure must surface even when this write loses the lock
   // or the storage is down.
-  private async settle (storageKey: string, token: string, outcome: Outcome | null): Promise<void> {
+  private async settle (storageKey: string, token: string, outcome: Outcome | null, resultTtlMs: number): Promise<void> {
     try {
       if (outcome === null) await this.storage.release(storageKey, token)
-      else await this.storage.complete(storageKey, token, outcome, this.resultTtlMs)
+      else await this.storage.complete(storageKey, token, outcome, resultTtlMs)
     } catch {
       // Swallowed by design: see above.
     }
+  }
+
+  private resultTtlFor (input: ExecuteInput): number {
+    // Reading the property off the string form yields undefined, so the two
+    // input shapes need no separate check.
+    const perCall = (input as { resultTtl?: Duration }).resultTtl
+    return perCall === undefined ? this.resultTtlMs : parseDuration(perCall)
   }
 
   private resolveTarget (input: ExecuteInput): { key: string, fingerprint?: string } {

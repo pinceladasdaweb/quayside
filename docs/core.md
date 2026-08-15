@@ -23,6 +23,20 @@ contract suite against real servers.
 
 ### The execution context
 
+The object form of the input also takes `resultTtl`, overriding the
+instance replay window for that call:
+
+```ts
+await idempotency.execute(
+  { key: req.headers['idempotency-key'], payload: req.body, resultTtl: '1h' },
+  () => createPayment(req.body)
+)
+```
+
+A per-route or per-operation window is a property of the call. Expressing
+it by building a second `Idempotency` around the same storage costs an
+engine per request and duplicates whatever state the engine holds.
+
 Your function receives `ctx`:
 
 | Field | Meaning |
