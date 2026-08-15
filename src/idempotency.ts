@@ -135,7 +135,10 @@ function serializeError (error: unknown, depth = 0): SerializedError {
     }
     return { name: 'Error', message }
   }
-  const serialized: SerializedError = { name: error.name, message: error.message, stack: error.stack }
+  // Only defined values go in: the serialized shape travels through the
+  // configured codec, and a codec is entitled to reject an undefined field.
+  const serialized: SerializedError = { name: error.name, message: error.message }
+  if (typeof error.stack === 'string') serialized.stack = error.stack
   const properties: Record<string, unknown> = {}
   for (const field of Object.keys(error)) {
     // Fields already captured above are excluded structurally; cause is
@@ -155,10 +158,12 @@ function serializeError (error: unknown, depth = 0): SerializedError {
   return serialized
 }
 
-function encodeErrorValue (error: unknown): string {
+function encodeErrorValue (error: unknown, codec: Codec): string {
   try {
-    return JSON.stringify(serializeError(error))
+    return codec.encode(serializeError(error))
   } catch {
+    // Last resort, and deliberately not codec-encoded: whatever just failed
+    // cannot be trusted to encode this either. It carries no caller data.
     return UNSERIALIZABLE_FAILURE
   }
 }
@@ -175,14 +180,19 @@ function reviveError (serialized: SerializedError): Error {
   return error
 }
 
-function decodeErrorValue (encoded: string): Error {
-  let parsed: SerializedError
+function decodeErrorValue (encoded: string, codec: Codec): Error {
+  let parsed: unknown
   try {
-    parsed = JSON.parse(encoded) as SerializedError
-  } catch {
-    parsed = { name: 'Error', message: encoded }
+    parsed = codec.decode(encoded)
+  } catch {}
+  // A hand-written record, or one written under a different codec, decodes
+  // to something that is not a serialized error. The raw text is then the
+  // most honest message available, and beats throwing over the failure the
+  // caller was actually asking about.
+  if (parsed === null || typeof parsed !== 'object') {
+    return reviveError({ name: 'Error', message: encoded })
   }
-  return reviveError(parsed)
+  return reviveError(parsed as SerializedError)
 }
 
 export class Idempotency {
@@ -243,7 +253,7 @@ export class Idempotency {
     }
     if (record.status === RECORD_STATUS.completed) result.value = this.decodeResult(record)
     if (record.status === RECORD_STATUS.failed && record.error !== undefined) {
-      result.error = decodeErrorValue(record.error)
+      result.error = decodeErrorValue(record.error, this.codec)
     }
     return result
   }
@@ -287,7 +297,7 @@ export class Idempotency {
     }
     if (existing.status === RECORD_STATUS.failed) {
       this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-      throw decodeErrorValue(existing.error ?? '')
+      throw decodeErrorValue(existing.error ?? '', this.codec)
     }
 
     this.emit('conflict', key, correlationId)
@@ -324,7 +334,7 @@ export class Idempotency {
       value = await fn(ctx)
     } catch (error) {
       const persisted = this.persistFailures && stores
-      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error) } : null)
+      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error, this.codec) } : null)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
@@ -417,7 +427,7 @@ export class Idempotency {
       }
       if (record.status === RECORD_STATUS.failed) {
         this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-        throw decodeErrorValue(record.error ?? '')
+        throw decodeErrorValue(record.error ?? '', this.codec)
       }
       const remaining = deadline - this.clock.now()
       if (remaining <= 0) {
