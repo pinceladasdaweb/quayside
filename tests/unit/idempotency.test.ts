@@ -800,6 +800,129 @@ describe('waiters and key identity', () => {
   })
 })
 
+describe('persisted failures go through the codec', () => {
+  // A codec exists so the caller decides what reaches the store. Results
+  // honoured it and failures did not, so an encrypting codec left error
+  // messages, stacks and properties in the clear beside ciphertext.
+  function recordingCodec () {
+    const encoded: unknown[] = []
+    const codec = {
+      encode (value: unknown) {
+        encoded.push(value)
+        return `enc:${JSON.stringify(value)}`
+      },
+      decode (raw: string) {
+        if (!raw.startsWith('enc:')) throw new SerializationError('foreign payload')
+        return JSON.parse(raw.slice(4))
+      }
+    }
+    return { codec, encoded }
+  }
+
+  test('the stored failure is written and read back through the codec', async () => {
+    const { codec, encoded } = recordingCodec()
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, codec, persistFailures: true })
+
+    const boom = Object.assign(new Error('card declined'), { code: 'CARD_DECLINED' })
+    await assert.rejects(idempotency.execute('k', async () => { throw boom }), /card declined/)
+
+    const stored = await storage.get('k')
+    assert.ok(stored?.error?.startsWith('enc:'), 'the codec owns the stored bytes, not JSON')
+    const serialized = encoded.at(-1) as { name: string, message: string, properties: { code: string } }
+    assert.equal(serialized.message, 'card declined', 'the codec receives the serialized shape, not a string')
+    assert.equal(serialized.properties.code, 'CARD_DECLINED')
+
+    const replayed = await idempotency.execute('k', async () => 'never').then(
+      () => assert.fail('the persisted failure must replay'),
+      (error: Error) => error
+    )
+    assert.equal(replayed.message, 'card declined')
+    assert.equal((replayed as { code?: string }).code, 'CARD_DECLINED')
+  })
+
+  test('the default codec keeps the exact bytes earlier versions wrote', async () => {
+    // Records written before failures went through the codec must still
+    // replay: with jsonCodec the encoding has to stay byte-identical.
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const boom = Object.assign(new Error('legacy'), { code: 'X' })
+    await assert.rejects(idempotency.execute('k', async () => { throw boom }), /legacy/)
+
+    const stored = await storage.get('k')
+    const parsed = JSON.parse(stored?.error ?? '{}') as { name: string, message: string, properties: unknown, stack: string }
+    assert.equal(parsed.name, 'Error')
+    assert.equal(parsed.message, 'legacy')
+    assert.deepEqual(parsed.properties, { code: 'X' })
+    assert.ok(parsed.stack.includes('legacy'))
+  })
+
+  test('an error with no stack survives the default codec, which rejects undefined', async () => {
+    // jsonCodec refuses nested undefined by design, so the serialized shape
+    // must omit an absent stack rather than carry the key with no value:
+    // otherwise every stackless failure would store the fallback marker.
+    const idempotency = new Idempotency({ storage: new MemoryStorage(), persistFailures: true })
+    const stackless = new Error('no stack here')
+    delete (stackless as { stack?: string }).stack
+
+    await assert.rejects(idempotency.execute('k', async () => { throw stackless }), /no stack here/)
+    const replayed = await idempotency.execute('k', async () => 'never').then(
+      () => assert.fail('the persisted failure must replay'),
+      (error: Error) => error
+    )
+    assert.equal(replayed.message, 'no stack here', 'the real failure survived, not the fallback marker')
+  })
+
+  test('a codec that cannot encode the failure falls back instead of masking it', async () => {
+    const hostile = {
+      encode () { throw new Error('encoder exploded') },
+      decode (raw: string) { return JSON.parse(raw) }
+    }
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, codec: hostile, persistFailures: true })
+
+    // The original failure reaches the caller; the store keeps a marker.
+    await assert.rejects(idempotency.execute('k', async () => { throw new Error('the real problem') }), /the real problem/)
+    const stored = await storage.get('k')
+    assert.match(stored?.error ?? '', /could not be serialized/)
+  })
+
+  test('a record the codec cannot read replays with the raw text', async () => {
+    const { codec } = recordingCodec()
+    const storage = new MemoryStorage()
+    await storage.acquire({ key: 'foreign', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('foreign', 't', { status: 'failed', error: 'written by another codec' }, 60_000)
+
+    const idempotency = new Idempotency({ storage, codec, persistFailures: true })
+    const replayed = await idempotency.execute('foreign', async () => 'never').then(
+      () => assert.fail('the stored failure must replay'),
+      (error: Error) => error
+    )
+    assert.equal(replayed.message, 'written by another codec')
+    assert.equal(replayed.name, 'Error')
+  })
+
+  test('a record decoding to a non-object replays with the raw text', async () => {
+    const idempotency = (storage: MemoryStorage) => new Idempotency({ storage, persistFailures: true })
+    // Both are valid JSON for the default codec, and neither is a
+    // serialized error. `null` is the sharp one: typeof null is 'object',
+    // so only an explicit check keeps it away from the reviver.
+    const cases: Array<[string, string]> = [['scalar', '"just a string"'], ['nulled', 'null']]
+    for (const [key, stored] of cases) {
+      const storage = new MemoryStorage()
+      await storage.acquire({ key, token: 't', storedAt: Date.now() }, 60_000)
+      await storage.complete(key, 't', { status: 'failed', error: stored }, 60_000)
+
+      const replayed = await idempotency(storage).execute(key, async () => 'never').then(
+        () => assert.fail('the stored failure must replay'),
+        (error: Error) => error
+      )
+      assert.equal(replayed.message, stored)
+      assert.equal(replayed.name, 'Error')
+    }
+  })
+})
+
 describe('failure cleanup and revival edges', () => {
   test('a failed execution leaves no record behind: the retry runs fresh', async () => {
     let runs = 0
