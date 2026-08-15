@@ -29,6 +29,12 @@ export type ExecuteInput =
     ignoreFields?: string[]
     /** Dot-separated payload paths that alone form the fingerprint. */
     pickFields?: string[]
+    /**
+     * Replay window for this call, overriding the instance `resultTtl`.
+     * A per-route TTL is a property of the call, not a reason to build a
+     * second engine around the same storage.
+     */
+    resultTtl?: Duration
   }
 
 export interface ExecutionContext {
@@ -135,7 +141,10 @@ function serializeError (error: unknown, depth = 0): SerializedError {
     }
     return { name: 'Error', message }
   }
-  const serialized: SerializedError = { name: error.name, message: error.message, stack: error.stack }
+  // Only defined values go in: the serialized shape travels through the
+  // configured codec, and a codec is entitled to reject an undefined field.
+  const serialized: SerializedError = { name: error.name, message: error.message }
+  if (typeof error.stack === 'string') serialized.stack = error.stack
   const properties: Record<string, unknown> = {}
   for (const field of Object.keys(error)) {
     // Fields already captured above are excluded structurally; cause is
@@ -155,10 +164,12 @@ function serializeError (error: unknown, depth = 0): SerializedError {
   return serialized
 }
 
-function encodeErrorValue (error: unknown): string {
+function encodeErrorValue (error: unknown, codec: Codec): string {
   try {
-    return JSON.stringify(serializeError(error))
+    return codec.encode(serializeError(error))
   } catch {
+    // Last resort, and deliberately not codec-encoded: whatever just failed
+    // cannot be trusted to encode this either. It carries no caller data.
     return UNSERIALIZABLE_FAILURE
   }
 }
@@ -175,14 +186,19 @@ function reviveError (serialized: SerializedError): Error {
   return error
 }
 
-function decodeErrorValue (encoded: string): Error {
-  let parsed: SerializedError
+function decodeErrorValue (encoded: string, codec: Codec): Error {
+  let parsed: unknown
   try {
-    parsed = JSON.parse(encoded) as SerializedError
-  } catch {
-    parsed = { name: 'Error', message: encoded }
+    parsed = codec.decode(encoded)
+  } catch {}
+  // A hand-written record, or one written under a different codec, decodes
+  // to something that is not a serialized error. The raw text is then the
+  // most honest message available, and beats throwing over the failure the
+  // caller was actually asking about.
+  if (parsed === null || typeof parsed !== 'object') {
+    return reviveError({ name: 'Error', message: encoded })
   }
-  return reviveError(parsed)
+  return reviveError(parsed as SerializedError)
 }
 
 export class Idempotency {
@@ -243,7 +259,7 @@ export class Idempotency {
     }
     if (record.status === RECORD_STATUS.completed) result.value = this.decodeResult(record)
     if (record.status === RECORD_STATUS.failed && record.error !== undefined) {
-      result.error = decodeErrorValue(record.error)
+      result.error = decodeErrorValue(record.error, this.codec)
     }
     return result
   }
@@ -274,7 +290,7 @@ export class Idempotency {
     }
 
     if (existing === null) {
-      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId, startedAt)
+      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId, startedAt, this.resultTtlFor(input))
     }
 
     if (!fingerprintsEqual(existing.fingerprint, fingerprint)) {
@@ -287,7 +303,7 @@ export class Idempotency {
     }
     if (existing.status === RECORD_STATUS.failed) {
       this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-      throw decodeErrorValue(existing.error ?? '')
+      throw decodeErrorValue(existing.error ?? '', this.codec)
     }
 
     this.emit('conflict', key, correlationId)
@@ -304,7 +320,8 @@ export class Idempotency {
     storedAt: number,
     fn: ExecuteFunction<T>,
     correlationId: string,
-    startedAt: number
+    startedAt: number,
+    resultTtlMs: number
   ): Promise<ExecutionResult<T>> {
     this.emit('acquired', key, correlationId)
     const controller = new AbortController()
@@ -324,7 +341,7 @@ export class Idempotency {
       value = await fn(ctx)
     } catch (error) {
       const persisted = this.persistFailures && stores
-      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error) } : null)
+      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error, this.codec) } : null, resultTtlMs)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
@@ -332,7 +349,7 @@ export class Idempotency {
     if (!stores) {
       // The execution opted out of storage: the caller gets its value, the
       // record is released, and nothing is left for anyone to replay.
-      await this.settle(storageKey, token, null)
+      await this.settle(storageKey, token, null, resultTtlMs)
       this.emit('completed', key, correlationId, this.clock.now() - startedAt)
       return { value, replayed: false, storedAt }
     }
@@ -344,13 +361,13 @@ export class Idempotency {
       // A result that cannot be stored cannot be replayed either: the record
       // is released so callers may retry, and the error surfaces instead of
       // silently storing something else.
-      await this.settle(storageKey, token, null)
+      await this.settle(storageKey, token, null, resultTtlMs)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
 
     try {
-      await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, this.resultTtlMs))
+      await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, resultTtlMs))
     } catch (error) {
       if (error instanceof StorageUnavailableError && this.failOpen) {
         // The function already ran; in fail-open mode the caller gets its
@@ -417,7 +434,7 @@ export class Idempotency {
       }
       if (record.status === RECORD_STATUS.failed) {
         this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-        throw decodeErrorValue(record.error ?? '')
+        throw decodeErrorValue(record.error ?? '', this.codec)
       }
       const remaining = deadline - this.clock.now()
       if (remaining <= 0) {
@@ -453,13 +470,20 @@ export class Idempotency {
   // the record, an outcome persists it. Best-effort by design: the caller's
   // own result or failure must surface even when this write loses the lock
   // or the storage is down.
-  private async settle (storageKey: string, token: string, outcome: Outcome | null): Promise<void> {
+  private async settle (storageKey: string, token: string, outcome: Outcome | null, resultTtlMs: number): Promise<void> {
     try {
       if (outcome === null) await this.storage.release(storageKey, token)
-      else await this.storage.complete(storageKey, token, outcome, this.resultTtlMs)
+      else await this.storage.complete(storageKey, token, outcome, resultTtlMs)
     } catch {
       // Swallowed by design: see above.
     }
+  }
+
+  private resultTtlFor (input: ExecuteInput): number {
+    // Reading the property off the string form yields undefined, so the two
+    // input shapes need no separate check.
+    const perCall = (input as { resultTtl?: Duration }).resultTtl
+    return perCall === undefined ? this.resultTtlMs : parseDuration(perCall)
   }
 
   private resolveTarget (input: ExecuteInput): { key: string, fingerprint?: string } {

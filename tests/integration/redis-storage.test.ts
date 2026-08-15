@@ -52,6 +52,84 @@ runStorageContract('RedisStorage (@pinceladasdaweb/redis)', async () => {
   return managedStorage
 })
 
+describe('fenced transitions over EVALSHA', () => {
+  test('the script body stops leaving the process once the cache is warm', async () => {
+    await client.flushdb()
+    // Command stats are cumulative since server start, so the claim can
+    // only be measured as a delta around the calls under test.
+    const calls = async (command: string): Promise<number> => {
+      const stats = await client.info('commandstats')
+      return Number(new RegExp(`cmdstat_${command}:calls=(\\d+)`).exec(stats)?.[1] ?? 0)
+    }
+
+    // Seed the cache with the one transition this test exercises.
+    await storage.acquire({ key: 'sha-warm', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('sha-warm', 't', { status: 'completed', result: '"v"' }, 60_000)
+
+    const evalBefore = await calls('eval')
+    const evalshaBefore = await calls('evalsha')
+    for (const suffix of ['a', 'b', 'c']) {
+      await storage.acquire({ key: `sha-${suffix}`, token: 't', storedAt: Date.now() }, 60_000)
+      await storage.complete(`sha-${suffix}`, 't', { status: 'completed', result: '"v"' }, 60_000)
+    }
+
+    assert.equal(await calls('eval') - evalBefore, 0, 'no script body was sent again')
+    assert.equal(await calls('evalsha') - evalshaBefore, 3, 'each transition went by digest')
+  })
+
+  test('a flushed script cache is reseeded instead of failing the transition', async () => {
+    await client.flushdb()
+    await storage.acquire({ key: 'noscript', token: 't', storedAt: Date.now() }, 60_000)
+    // Exactly what a Redis restart or a fresh replica looks like.
+    await client.script('FLUSH')
+
+    await storage.complete('noscript', 't', { status: 'completed', result: '"survived"' }, 60_000)
+    const record = await storage.get('noscript')
+    assert.equal(record?.result, '"survived"')
+
+    // And the recovery is not permanent damage: the next call is a digest again.
+    await storage.acquire({ key: 'noscript-2', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.release('noscript-2', 't')
+    assert.equal(await storage.get('noscript-2'), null)
+  })
+
+  test('a driver without evalsha still works through eval', async () => {
+    await client.flushdb()
+    // The interface declares evalsha optional; an older or minimal driver
+    // simply does not have it.
+    const withoutEvalsha = Object.create(client, {
+      evalsha: { value: undefined, enumerable: true }
+    }) as Redis
+    const fallback = new RedisStorage(withoutEvalsha, { subscribe: false })
+
+    await fallback.acquire({ key: 'no-evalsha', token: 't', storedAt: Date.now() }, 60_000)
+    await fallback.complete('no-evalsha', 't', { status: 'completed', result: '"ok"' }, 60_000)
+    const record = await fallback.get('no-evalsha')
+    assert.equal(record?.result, '"ok"')
+  })
+})
+
+describe('keyspace subscriptions across polls', () => {
+  test('consecutive waits on one key reuse the subscription', async () => {
+    await client.flushdb()
+    const before = await subscriptionCount()
+
+    await storage.acquire({ key: 'linger', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.waitForChange('linger', 30)
+    const afterFirst = await subscriptionCount()
+    await storage.waitForChange('linger', 30)
+    const afterSecond = await subscriptionCount()
+
+    assert.equal(afterFirst, before + 1, 'the first wait subscribed')
+    assert.equal(afterSecond, afterFirst, 'the second wait reused the warm subscription')
+  })
+})
+
+async function subscriptionCount (): Promise<number> {
+  const channels = await client.pubsub('CHANNELS')
+  return (channels as string[]).length
+}
+
 describe('RedisStorage under fire', () => {
   test('survives a server-side CLIENT KILL mid-execution', async () => {
     await client.flushdb()

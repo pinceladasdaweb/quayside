@@ -23,6 +23,20 @@ contract suite against real servers.
 
 ### The execution context
 
+The object form of the input also takes `resultTtl`, overriding the
+instance replay window for that call:
+
+```ts
+await idempotency.execute(
+  { key: req.headers['idempotency-key'], payload: req.body, resultTtl: '1h' },
+  () => createPayment(req.body)
+)
+```
+
+A per-route or per-operation window is a property of the call. Expressing
+it by building a second `Idempotency` around the same storage costs an
+engine per request and duplicates whatever state the engine holds.
+
 Your function receives `ctx`:
 
 | Field | Meaning |
@@ -63,6 +77,15 @@ released (retries allowed) and the `SerializationError` surfaces — the
 result is never half-stored. Need richer types? Pass any `{ encode, decode }`
 pair as `codec` (superjson, msgpack).
 
+**Persisted failures go through the same codec.** The engine serializes the
+error into a plain shape (`name`, `message`, `stack`, `properties`, `cause`)
+and hands *that* to `codec.encode`, so a codec that encrypts at rest covers
+error text, stacks and error properties too — not just results. With the
+default codec the bytes are plain JSON, unchanged from what earlier versions
+wrote. Two paths never throw over a failure the caller is already handling:
+a codec that cannot encode the error stores a marker instead, and a record
+the codec cannot read back replays as an `Error` carrying the raw text.
+
 ## Payload fingerprints and derived keys
 
 `hash = sha256(canonicalize(payload))`, where `canonicalize` is:
@@ -100,7 +123,10 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    remaining `waitTimeout`). Storages that implement the optional
    `waitForChange(key, timeoutMs)` cut the sleep short on change
    notifications — the Redis adapter uses keyspace events; correctness
-   never depends on the notification arriving. A channel that throws,
+   never depends on the notification arriving. That subscription outlives
+   its last waiter by a few seconds on purpose, so consecutive polls reuse
+   it instead of paying a subscribe/unsubscribe round-trip each time; it is
+   dropped after the grace period, and immediately on `close()`. A channel that throws,
    rejects or hands back something that is not a promise falls back to the
    plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the

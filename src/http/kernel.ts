@@ -53,6 +53,10 @@ export type KernelOutcome =
   | { kind: 'handled' }
   | { kind: 'respond', response: CapturedHttpResponse }
 
+// A non-streaming decode keeps no state between calls, so one decoder
+// serves every response instead of one per captured body.
+const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true })
+
 const DEFAULT_METHODS = ['POST', 'PATCH']
 const DEFAULT_REPLAY_HEADERS = ['content-type', 'location']
 const DEFAULT_MAX_BODY_BYTES = 1_048_576
@@ -212,7 +216,7 @@ export class HttpIdempotencyKernel {
   decodeUtf8 (data: string | Uint8Array): string | null {
     if (typeof data === 'string') return data
     try {
-      return new TextDecoder('utf-8', { fatal: true }).decode(data)
+      return UTF8_STRICT.decode(data)
     } catch {
       return null
     }

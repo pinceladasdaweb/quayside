@@ -1,6 +1,7 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { hashCanonical } from '../../src/canonical'
 import { Idempotency, IdempotencyKeyInvalidError, IdempotencyKeyReuseError } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 
@@ -101,6 +102,21 @@ describe('payload-derived keys', () => {
       fn
     )
     assert.equal(calls, 1)
+  })
+
+  test('a pick keeps its whole subtree, and the ancestors leading to it', async () => {
+    // Both directions of the prefix test: a node under the pick belongs to
+    // it, and the nodes above a deep pick have to survive for it to be
+    // reachable at all.
+    const under = (city: string, noise: number) =>
+      hashCanonical({ customer: { address: { city } }, noise }, { pickFields: ['customer'] })
+    assert.notEqual(under('SP', 1), under('RJ', 1), 'a change deep under the pick changes the key')
+    assert.equal(under('SP', 1), under('SP', 999), 'noise outside the pick is still ignored')
+
+    const deep = (city: string, zip: string) =>
+      hashCanonical({ customer: { address: { city, zip } } }, { pickFields: ['customer.address.city'] })
+    assert.notEqual(deep('SP', '01310'), deep('RJ', '01310'), 'the picked leaf drives the key')
+    assert.equal(deep('SP', '01310'), deep('SP', '99999'), 'its siblings do not')
   })
 
   test('pickFields derives the key from the selected paths only', async () => {

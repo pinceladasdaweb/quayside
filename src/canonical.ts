@@ -9,28 +9,36 @@ export interface CanonicalizeOptions {
   pickFields?: string[]
 }
 
-// A prefix longer than the path fails every() naturally: the surplus
-// segments compare against undefined.
-function isPrefix (prefix: string[], path: string[]): boolean {
-  return prefix.every((segment, index) => segment === path[index])
-}
-
+// Paths travel as the dotted string the options are written in, built one
+// concatenation deeper per node. Carrying segment arrays instead means an
+// allocation and a join at every node of every payload, which is most of
+// what fingerprinting a request body costs.
 class PathFilter {
   private readonly ignore: Set<string>
-  private readonly picks: string[][] | undefined
+  private readonly picks: string[] | undefined
 
   constructor (options: CanonicalizeOptions) {
     this.ignore = new Set(options.ignoreFields ?? [])
-    this.picks = options.pickFields?.map((path) => path.split('.'))
+    this.picks = options.pickFields
   }
 
   // Only called for object entries and array items, whose paths are never
-  // empty; the root value is always included.
-  includes (path: string[]): boolean {
-    if (this.ignore.has(path.join('.'))) return false
+  // empty; the root value is always included. A pick keeps a node when
+  // either path is a prefix of the other: the ancestors that lead to it,
+  // and the subtree under it.
+  includes (path: string): boolean {
+    if (this.ignore.has(path)) return false
     if (this.picks === undefined) return true
-    return this.picks.some((pick) => isPrefix(pick, path) || isPrefix(path, pick))
+    return this.picks.some((pick) =>
+      pick === path || path.startsWith(`${pick}.`) || pick.startsWith(`${path}.`)
+    )
   }
+}
+
+// The root path is empty, so the first level is the bare key: 'customer',
+// then 'customer.address'.
+function childPath (path: string, segment: string): string {
+  return path === '' ? segment : `${path}.${segment}`
 }
 
 // Canonical, type-tagged stringify: independent of key insertion order,
@@ -39,7 +47,7 @@ class PathFilter {
 // data). Type tags keep values JSON would conflate apart (1 vs '1', array
 // vs object). Values that cannot be canonicalized deterministically fail
 // loudly instead of hashing to a colliding representation.
-function canonicalizeValue (value: unknown, path: string[], filter: PathFilter, seen: WeakSet<object>): string {
+function canonicalizeValue (value: unknown, path: string, filter: PathFilter, seen: WeakSet<object>): string {
   if (value === null) return 'null'
   if (value === undefined) return 'undefined'
   const type = typeof value
@@ -76,7 +84,7 @@ function canonicalizeValue (value: unknown, path: string[], filter: PathFilter, 
     if (Array.isArray(object)) {
       const items: string[] = []
       for (let index = 0; index < object.length; index += 1) {
-        const itemPath = [...path, String(index)]
+        const itemPath = childPath(path, String(index))
         if (!filter.includes(itemPath)) continue
         items.push(canonicalizeValue(object[index], itemPath, filter, seen))
       }
@@ -85,7 +93,7 @@ function canonicalizeValue (value: unknown, path: string[], filter: PathFilter, 
     const keys = Object.keys(object).sort()
     const entries: string[] = []
     for (const key of keys) {
-      const entryPath = [...path, key]
+      const entryPath = childPath(path, key)
       if (!filter.includes(entryPath)) continue
       const entryValue = (object as Record<string, unknown>)[key]
       entries.push(`${JSON.stringify(key)}:${canonicalizeValue(entryValue, entryPath, filter, seen)}`)
@@ -97,7 +105,7 @@ function canonicalizeValue (value: unknown, path: string[], filter: PathFilter, 
 }
 
 export function canonicalize (value: unknown, options: CanonicalizeOptions = {}): string {
-  return canonicalizeValue(value, [], new PathFilter(options), new WeakSet())
+  return canonicalizeValue(value, '', new PathFilter(options), new WeakSet())
 }
 
 export function hashCanonical (value: unknown, options: CanonicalizeOptions = {}): string {

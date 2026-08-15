@@ -259,13 +259,15 @@ new Idempotency(options)
 | `waitTimeout` | `'10s'` | Upper bound for `onConflict: 'wait'` |
 | `namespace` | — | Key prefix isolating domains that share one storage |
 | `maxKeyLength` | `512` | Longest composed storage key; longer keys are rejected |
-| `codec` | JSON | Result serialization (`Codec` interface for superjson/msgpack users) |
+| `codec` | JSON | Serialization of stored results **and** persisted failures (`Codec` interface for superjson/msgpack/encrypt-at-rest users) |
 | `persistFailures` | `false` | Store and replay failures instead of allowing retries |
 | `onStorageError` | `'closed'` | `'open'` runs without the guarantee and emits `storage-bypass` |
 | `onEvent` / `metrics` | — | Typed event listener / metrics collector |
 | `clock` | wall clock | `{ now(), sleep(ms) }` time source — inject a manual clock for deterministic TTL and backoff tests |
 
 Durations accept `ms` numbers or strings: `'500ms'`, `'30s'`, `'10m'`, `'24h'`, `'7d'`.
+
+The object input form takes `{ key, payload, ignoreFields, pickFields, resultTtl }` — `resultTtl` overrides the replay window for that call alone, so a per-route TTL never means building a second engine.
 
 Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, { key })` · `get(key)` · `invalidate(key)`. The `fn` receives a context: `{ key, replayed, signal, extend(ttl), doNotStore() }` — `doNotStore()` keeps the lock's protection for concurrent callers while giving up the replay window, so an outcome that must not be served twice leaves no record behind.
 
