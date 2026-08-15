@@ -17,9 +17,13 @@ export interface FastifyReplyLike {
   statusCode: number
   /**
    * Node's raw ServerResponse. Its 'close' event is the only signal that
-   * arrives for every request, whatever the reply lifecycle does.
+   * arrives for every request, whatever the reply lifecycle does, and
+   * `writableEnded` tells a finished response from an abandoned one.
    */
-  raw: { on (event: 'close', listener: () => void): unknown }
+  raw: {
+    writableEnded: boolean
+    on (event: 'close', listener: () => void): unknown
+  }
   getHeader (name: string): unknown
   header (name: string, value: string): unknown
   code (status: number): unknown
@@ -86,11 +90,21 @@ export function FastifyPlugin (
       const capture = new Promise<CapturedHttpResponse | null>((resolve) => {
         resolveCapture = resolve
       })
-      // onSend never runs for a hijacked reply, an aborted connection or a
-      // handler that never answers. Without this backstop the capture would
-      // never settle and the key would stay locked until its TTL expired;
-      // resolving a promise twice is a no-op, so onSend still wins.
-      reply.raw.on('close', () => { resolveCapture(null) })
+      // A hijacked reply answers the client directly and never reaches
+      // onSend, which would leave the capture pending and the key locked
+      // until its TTL expired. Closing after the response was finished is
+      // therefore settled here as "served, nothing to cache"; resolving a
+      // promise twice is a no-op, so onSend still wins when it does run.
+      //
+      // A connection that dies BEFORE the response finished is the opposite
+      // case and must not settle: the handler keeps running (Node does not
+      // cancel it), so releasing the record here would let the client's very
+      // next retry execute the same work a second time. Those keep the lock
+      // and let lockTtl govern, exactly as an execution that lost its
+      // process does.
+      reply.raw.on('close', () => {
+        if (reply.raw.writableEnded) resolveCapture(null)
+      })
 
       const outcome = kernel.handle(
         {
