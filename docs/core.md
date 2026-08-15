@@ -100,7 +100,10 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    remaining `waitTimeout`). Storages that implement the optional
    `waitForChange(key, timeoutMs)` cut the sleep short on change
    notifications — the Redis adapter uses keyspace events; correctness
-   never depends on the notification arriving. A channel that throws,
+   never depends on the notification arriving. That subscription outlives
+   its last waiter by a few seconds on purpose, so consecutive polls reuse
+   it instead of paying a subscribe/unsubscribe round-trip each time; it is
+   dropped after the grace period, and immediately on `close()`. A channel that throws,
    rejects or hands back something that is not a promise falls back to the
    plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the
