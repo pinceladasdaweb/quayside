@@ -259,7 +259,7 @@ new Idempotency(options)
 | `waitTimeout` | `'10s'` | Upper bound for `onConflict: 'wait'` |
 | `namespace` | — | Key prefix isolating domains that share one storage |
 | `maxKeyLength` | `512` | Longest composed storage key; longer keys are rejected |
-| `codec` | JSON | Result serialization (`Codec` interface for superjson/msgpack users) |
+| `codec` | JSON | Serialization of stored results **and** persisted failures (`Codec` interface for superjson/msgpack/encrypt-at-rest users) |
 | `persistFailures` | `false` | Store and replay failures instead of allowing retries |
 | `onStorageError` | `'closed'` | `'open'` runs without the guarantee and emits `storage-bypass` |
 | `onEvent` / `metrics` | — | Typed event listener / metrics collector |

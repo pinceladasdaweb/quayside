@@ -63,6 +63,15 @@ released (retries allowed) and the `SerializationError` surfaces — the
 result is never half-stored. Need richer types? Pass any `{ encode, decode }`
 pair as `codec` (superjson, msgpack).
 
+**Persisted failures go through the same codec.** The engine serializes the
+error into a plain shape (`name`, `message`, `stack`, `properties`, `cause`)
+and hands *that* to `codec.encode`, so a codec that encrypts at rest covers
+error text, stacks and error properties too — not just results. With the
+default codec the bytes are plain JSON, unchanged from what earlier versions
+wrote. Two paths never throw over a failure the caller is already handling:
+a codec that cannot encode the error stores a marker instead, and a record
+the codec cannot read back replays as an `Error` carrying the raw text.
+
 ## Payload fingerprints and derived keys
 
 `hash = sha256(canonicalize(payload))`, where `canonicalize` is:
