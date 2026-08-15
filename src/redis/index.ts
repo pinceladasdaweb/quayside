@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 
 // Runtime values come from the core entry point, never from deep module
@@ -18,6 +19,13 @@ export interface RedisCommandClient {
   get (key: string): Promise<string | null>
   del (...keys: string[]): Promise<number>
   eval (script: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>
+  /**
+   * Optional. When present, fenced transitions send a 40-byte digest
+   * instead of the whole script body; a server that forgot the script
+   * answers NOSCRIPT and the adapter falls back to `eval`, which caches it
+   * again. Every ioredis-shaped driver has it.
+   */
+  evalsha? (sha: string, numKeys: number, ...args: Array<string | number>): Promise<unknown>
   duplicate? (): RedisSubscriberClient
 }
 
@@ -85,8 +93,27 @@ record.expiresAt = ARGV[2]
 redis.call('SET', KEYS[1], cjson.encode(record), 'PX', ARGV[3])
 return 1`
 
+// Redis addresses a cached script by the SHA1 of its body, so the digests
+// are computed here rather than round-tripped through SCRIPT LOAD.
+const COMPLETE_SHA = sha1(COMPLETE_SCRIPT)
+const RELEASE_SHA = sha1(RELEASE_SCRIPT)
+const EXTEND_SHA = sha1(EXTEND_SCRIPT)
+
 const VALID_STATUS = new Set<string>(Object.values(RECORD_STATUS))
 const MAX_ACQUIRE_ATTEMPTS = 5
+// How long a keyspace subscription outlives its last waiter. Longer than
+// the wait loop's polling backoff, so consecutive polls reuse it.
+const SUBSCRIPTION_LINGER_MS = 5_000
+
+function sha1 (script: string): string {
+  return createHash('sha1').update(script).digest('hex')
+}
+
+// A server that restarted, was SCRIPT FLUSHed, or a replica that never saw
+// the script answers NOSCRIPT. Anything else is a real failure.
+function isNoScript (error: unknown): boolean {
+  return error instanceof Error && error.message.includes('NOSCRIPT')
+}
 
 function isManagedClient (client: RedisStorageClient): client is ManagedRedisClient {
   return 'client' in client && typeof (client as { client: unknown }).client !== 'function'
@@ -123,6 +150,7 @@ export class RedisStorage implements IdempotencyStorage {
   private ownedSubscriber: RedisSubscriberClient | undefined
   private readonly subscribedChannels = new Map<string, Promise<unknown>>()
   private readonly waiters = new Map<string, Set<() => void>>()
+  private readonly lingering = new Map<string, ReturnType<typeof setTimeout>>()
 
   constructor (client: RedisStorageClient, options: RedisStorageOptions = {}) {
     if (isManagedClient(client)) {
@@ -154,21 +182,21 @@ export class RedisStorage implements IdempotencyStorage {
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
     const payload = outcome.status === 'completed' ? outcome.result : outcome.error
-    const applied = await this.raw().eval(
-      COMPLETE_SCRIPT, 1, key,
+    const applied = await this.runScript(
+      COMPLETE_SCRIPT, COMPLETE_SHA, key,
       token, outcome.status, payload, String(Date.now() + resultTtlMs), resultTtlMs
     )
     if (applied !== 1) throw new FencingError(key)
   }
 
   async release (key: string, token: string): Promise<void> {
-    const applied = await this.raw().eval(RELEASE_SCRIPT, 1, key, token)
+    const applied = await this.runScript(RELEASE_SCRIPT, RELEASE_SHA, key, token)
     if (applied !== 1) throw new FencingError(key)
   }
 
   async extend (key: string, token: string, lockTtlMs: number): Promise<void> {
-    const applied = await this.raw().eval(
-      EXTEND_SCRIPT, 1, key,
+    const applied = await this.runScript(
+      EXTEND_SCRIPT, EXTEND_SHA, key,
       token, String(Date.now() + lockTtlMs), lockTtlMs
     )
     if (applied !== 1) throw new FencingError(key)
@@ -212,7 +240,7 @@ export class RedisStorage implements IdempotencyStorage {
       }
       channelWaiters.add(waiter)
     })
-    this.releaseChannel(channel).catch(() => {})
+    this.releaseChannel(channel)
   }
 
   /** Unsubscribes and disposes any subscriber connection this adapter owns. */
@@ -221,6 +249,8 @@ export class RedisStorage implements IdempotencyStorage {
       for (const waiter of [...waiterSet]) waiter()
     }
     this.waiters.clear()
+    for (const timer of this.lingering.values()) clearTimeout(timer)
+    this.lingering.clear()
     const channels = [...this.subscribedChannels.keys()]
     this.subscribedChannels.clear()
     if (this.ownedSubscriber !== undefined) {
@@ -240,6 +270,29 @@ export class RedisStorage implements IdempotencyStorage {
         } catch {}
       }
     }
+  }
+
+  /**
+   * Sends the digest when the driver supports EVALSHA, and the body when it
+   * does not or when the server has forgotten the script. Every fenced
+   * transition goes through here, so the script text leaves the process at
+   * most once per server lifetime instead of once per call.
+   */
+  private async runScript (
+    script: string,
+    sha: string,
+    key: string,
+    ...args: Array<string | number>
+  ): Promise<unknown> {
+    const client = this.raw()
+    if (typeof client.evalsha === 'function') {
+      try {
+        return await client.evalsha(sha, 1, key, ...args)
+      } catch (error) {
+        if (!isNoScript(error)) throw error
+      }
+    }
+    return await client.eval(script, 1, key, ...args)
   }
 
   private raw (): RedisCommandClient {
@@ -262,6 +315,11 @@ export class RedisStorage implements IdempotencyStorage {
 
   private async ensureSubscribed (key: string): Promise<string> {
     const channel = this.channelFor(key)
+    const linger = this.lingering.get(channel)
+    if (linger !== undefined) {
+      clearTimeout(linger)
+      this.lingering.delete(channel)
+    }
     let subscription = this.subscribedChannels.get(channel)
     if (subscription === undefined) {
       subscription = this.subscribeTo(channel)
@@ -306,9 +364,27 @@ export class RedisStorage implements IdempotencyStorage {
     for (const waiter of [...channelWaiters]) waiter()
   }
 
-  private async releaseChannel (channel: string): Promise<void> {
+  /**
+   * The last waiter for a key leaves the subscription warm for a moment
+   * instead of tearing it down: a poll loop comes back within its own
+   * backoff, and unsubscribing between iterations would spend a round-trip
+   * each time to save an idle subscription that costs the server nothing.
+   */
+  private releaseChannel (channel: string): void {
     if ((this.waiters.get(channel)?.size ?? 0) > 0) return
     this.waiters.delete(channel)
+    if (this.lingering.has(channel)) return
+    const timer = setTimeout(() => {
+      this.lingering.delete(channel)
+      // unsubscribeFrom swallows its own failures; nothing awaits this.
+      this.unsubscribeFrom(channel).catch(() => {})
+    }, SUBSCRIPTION_LINGER_MS)
+    // Never a reason to hold the process open.
+    timer.unref?.()
+    this.lingering.set(channel, timer)
+  }
+
+  private async unsubscribeFrom (channel: string): Promise<void> {
     if (!this.subscribedChannels.delete(channel)) return
     try {
       if (this.managed !== undefined) {

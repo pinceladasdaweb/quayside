@@ -137,8 +137,8 @@ export class IdempotencyInterceptor implements NestInterceptor {
         : request.body
 
     try {
-      const outcome = await this.instanceFor(options.ttl).executeWithMetadata(
-        { key, payload },
+      const outcome = await this.idempotency.executeWithMetadata(
+        { key, payload, resultTtl: options.ttl },
         async () => lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
       )
       if (outcome.replayed) setResponseHeader(response, 'idempotency-replayed', 'true')
@@ -146,14 +146,6 @@ export class IdempotencyInterceptor implements NestInterceptor {
     } catch (error) {
       throw this.mapError(error, response)
     }
-  }
-
-  // Routes with a ttl override are the exception, so the derived instance
-  // is built on demand; it shares the base storage.
-  private instanceFor (ttl: Duration | undefined): Idempotency {
-    return ttl === undefined
-      ? this.idempotency
-      : new Idempotency({ ...this.options, resultTtl: ttl })
   }
 
   private mapError (error: unknown, response: unknown): unknown {

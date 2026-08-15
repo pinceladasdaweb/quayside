@@ -56,6 +56,7 @@ export type ExecuteInput = string | {
     payload?: unknown;
     ignoreFields?: string[];
     pickFields?: string[];
+    resultTtl?: Duration;
 };
 
 // Warning: (ae-missing-release-tag) "ExecutionContext" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)

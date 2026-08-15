@@ -492,6 +492,41 @@ describe('Idempotency failures', () => {
   })
 })
 
+describe('per-call resultTtl', () => {
+  // A per-route replay window is a property of the call. Building a second
+  // engine around the same storage to express it costs an allocation per
+  // request and duplicates state the moment the engine ever holds any.
+  test('the call overrides the instance window, and omitting it keeps the default', async () => {
+    const clock = new ManualClock(1_000)
+    const storage = new MemoryStorage({ now: () => clock.now() })
+    const idempotency = new Idempotency({ storage, resultTtl: '1h', clock })
+
+    await idempotency.execute({ key: 'short', resultTtl: '50ms' }, async () => 'v')
+    await idempotency.execute({ key: 'default' }, async () => 'v')
+    await idempotency.execute('bare-string', async () => 'v')
+
+    clock.advance(51)
+    assert.equal(await idempotency.get('short'), null, 'the per-call window closed')
+    assert.ok(await idempotency.get('default'), 'the object form without a ttl keeps the instance window')
+    assert.ok(await idempotency.get('bare-string'), 'the string form keeps it too')
+  })
+
+  test('it governs a persisted failure as well as a result', async () => {
+    const clock = new ManualClock(2_000)
+    const storage = new MemoryStorage({ now: () => clock.now() })
+    const idempotency = new Idempotency({ storage, resultTtl: '1h', persistFailures: true, clock })
+
+    await assert.rejects(
+      idempotency.execute({ key: 'failed', resultTtl: '40ms' }, async () => { throw new Error('boom') }),
+      /boom/
+    )
+    assert.equal((await idempotency.get('failed'))?.status, 'failed')
+
+    clock.advance(41)
+    assert.equal(await idempotency.get('failed'), null, 'the stored failure closed with the call window')
+  })
+})
+
 describe('Idempotency API surface', () => {
   test('executeWithMetadata reports replay status and storedAt', async () => {
     const idempotency = instance()

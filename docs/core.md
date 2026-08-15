@@ -23,6 +23,20 @@ contract suite against real servers.
 
 ### The execution context
 
+The object form of the input also takes `resultTtl`, overriding the
+instance replay window for that call:
+
+```ts
+await idempotency.execute(
+  { key: req.headers['idempotency-key'], payload: req.body, resultTtl: '1h' },
+  () => createPayment(req.body)
+)
+```
+
+A per-route or per-operation window is a property of the call. Expressing
+it by building a second `Idempotency` around the same storage costs an
+engine per request and duplicates whatever state the engine holds.
+
 Your function receives `ctx`:
 
 | Field | Meaning |
@@ -109,7 +123,10 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    remaining `waitTimeout`). Storages that implement the optional
    `waitForChange(key, timeoutMs)` cut the sleep short on change
    notifications — the Redis adapter uses keyspace events; correctness
-   never depends on the notification arriving. A channel that throws,
+   never depends on the notification arriving. That subscription outlives
+   its last waiter by a few seconds on purpose, so consecutive polls reuse
+   it instead of paying a subscribe/unsubscribe round-trip each time; it is
+   dropped after the grace period, and immediately on `close()`. A channel that throws,
    rejects or hands back something that is not a promise falls back to the
    plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the
