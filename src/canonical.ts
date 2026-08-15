@@ -59,6 +59,11 @@ function canonicalizeValue (value: unknown, path: string[], filter: PathFilter, 
   if (ArrayBuffer.isView(object)) {
     return `bytes:${Buffer.from(object.buffer, object.byteOffset, object.byteLength).toString('hex')}`
   }
+  // Raw buffers carry no own enumerable keys: without this branch they would
+  // canonicalize as an empty object and every binary payload would collide.
+  if (object instanceof ArrayBuffer || object instanceof SharedArrayBuffer) {
+    return `bytes:${Buffer.from(object).toString('hex')}`
+  }
   if (object instanceof Map || object instanceof Set || object instanceof RegExp) {
     throw new SerializationError(`${object.constructor.name} values cannot be fingerprinted; convert them to plain arrays or objects first`)
   }

@@ -193,6 +193,7 @@ describe('fastify adapter', () => {
       const reply = {
         statusCode: 200,
         sent: undefined as unknown,
+        raw: { on () {} },
         getHeader: (name: string) => headersSet[name],
         header (name: string, value: string) { headersSet[name] = value },
         code (status: number) { reply.statusCode = status; return reply },
@@ -227,6 +228,56 @@ describe('fastify adapter', () => {
     assert.equal(nullReplay.headersSet['idempotency-replayed'], 'true')
   })
 
+  test('a reply that never reaches onSend releases the key on close', async () => {
+    // reply.hijack(), an aborted connection or a handler that never answers
+    // all skip onSend; without the raw close backstop the record would stay
+    // locked until its TTL expired and every retry would answer 409.
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage })
+    const hooks: Record<string, (...args: never[]) => Promise<unknown>> = {}
+    const fakeInstance = {
+      addHook (name: string, hook: (...args: never[]) => Promise<unknown>) { hooks[name] = hook }
+    }
+    await FastifyPlugin(idempotency)(fakeInstance as never)
+
+    const closeListeners: Array<() => void> = []
+    const hijacked = {
+      statusCode: 200,
+      // Only the close event is a lifecycle backstop; anything else the
+      // adapter listened for would leave the record locked.
+      raw: { on (event: string, listener: () => void) { if (event === 'close') closeListeners.push(listener) } },
+      getHeader: () => undefined,
+      header () {},
+      code () { return hijacked },
+      send () { return hijacked }
+    }
+    const request = { method: 'POST', url: '/fake', headers: { 'idempotency-key': 'hijack-1' }, body: undefined }
+    await hooks.preHandler?.(request as never, hijacked as never)
+    assert.equal(closeListeners.length, 1, 'the adapter listens for the raw close event')
+
+    // The connection ends without onSend ever running.
+    for (const listener of closeListeners) listener()
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(await idempotency.get('hijack-1'), null, 'the lock is released, not held until it expires')
+
+    // The next attempt on the same key acquires it instead of getting a 409.
+    let ran = 0
+    const reply = {
+      statusCode: 200,
+      sent: undefined as unknown,
+      raw: { on () {} },
+      getHeader: () => undefined,
+      header () {},
+      code () { return reply },
+      send (body: unknown) { reply.sent = body; return reply }
+    }
+    await hooks.preHandler?.(request as never, reply as never)
+    ran += 1
+    await hooks.onSend?.(request as never, reply as never, 'fresh' as never)
+    assert.equal(ran, 1)
+    assert.equal(reply.sent, undefined, 'no conflict response was sent')
+  })
+
   test('a non-string, non-array header value runs unprotected', async () => {
     const hooks: Record<string, (...args: never[]) => Promise<unknown>> = {}
     const fakeInstance = {
@@ -240,6 +291,7 @@ describe('fastify adapter', () => {
       const reply = {
         statusCode: 200,
         sent: undefined as unknown,
+        raw: { on () {} },
         getHeader: (name: string) => headersSet[name],
         header (name: string, value: string) { headersSet[name] = value },
         code (status: number) { reply.statusCode = status; return reply },
@@ -299,6 +351,7 @@ describe('fastify adapter', () => {
       const reply = {
         statusCode: 201,
         sent: undefined as unknown,
+        raw: { on () {} },
         getHeader: (name: string) => headersSet[name],
         header (name: string, value: string) { headersSet[name] = value },
         code (status: number) { reply.statusCode = status; return reply },

@@ -61,6 +61,7 @@ export type ExecuteInput = string | {
 //
 // @public (undocumented)
 export interface ExecutionContext {
+    doNotStore(): void;
     // (undocumented)
     extend(ttl?: Duration): Promise<void>;
     // (undocumented)

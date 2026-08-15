@@ -268,7 +268,7 @@ new Idempotency(options)
 
 Durations accept `ms` numbers or strings: `'500ms'`, `'30s'`, `'10m'`, `'24h'`, `'7d'`.
 
-Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, { key })` · `get(key)` · `invalidate(key)`. The `fn` receives a context: `{ key, replayed, signal, extend(ttl) }`.
+Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, { key })` · `get(key)` · `invalidate(key)`. The `fn` receives a context: `{ key, replayed, signal, extend(ttl), doNotStore() }` — `doNotStore()` keeps the lock's protection for concurrent callers while giving up the replay window, so an outcome that must not be served twice leaves no record behind.
 
 ## Documentation
 

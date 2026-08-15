@@ -237,6 +237,100 @@ describe('nestjs interceptor glue', () => {
     assert.equal(headersSet['idempotency-replayed'], 'true')
   })
 
+  test('the metadata key is shared across module copies', () => {
+    // The package ships dual CJS and ESM builds. A registered symbol is what
+    // keeps the decorator and the interceptor talking when an app loads
+    // both: a second copy resolves the very same key by name, where a unique
+    // Symbol() would silently read nothing and leave the route unprotected.
+    const handler = decorated({ ttl: '5m' })
+    const fromOtherCopy = Reflect.getMetadata(Symbol.for('quayside:idempotent'), handler) as { ttl?: string } | undefined
+    assert.deepEqual(fromOtherCopy, { ttl: '5m' })
+  })
+
+  test('a replayed HttpException keeps the status of the first attempt', async () => {
+    const { HttpException, NotFoundException } = await import('@nestjs/common')
+    const { lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const interceptor = new IdempotencyInterceptor(idempotency, { storage, persistFailures: true })
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': 'nest-404' }, {}, handler)
+
+    const first = await assert.rejects(
+      lastValueFrom(interceptor.intercept(context as never, {
+        handle: () => { throw new NotFoundException('no such invoice') }
+      })),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        assert.equal(error.getStatus(), 404)
+        return true
+      }
+    ).then(() => true)
+    assert.equal(first, true)
+
+    // The retry replays a reconstruction: without rebuilding the exception
+    // Nest's filter would answer 500 for the request that first got a 404.
+    await assert.rejects(
+      intercept(interceptor, context),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException, 'the replayed failure is still an HttpException')
+        assert.equal(error.getStatus(), 404)
+        const body = error.getResponse() as { message: string }
+        assert.equal(body.message, 'no such invoice')
+        return true
+      }
+    )
+  })
+
+  test('only a complete http shape is rebuilt as an HttpException', async () => {
+    // Both halves are required: a status with no body has nothing to answer
+    // with, and a body with no numeric status has no status to answer under.
+    const { HttpException } = await import('@nestjs/common')
+    const { lastValueFrom } = await import('rxjs')
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated()
+
+    const halves = [
+      { label: 'status without a response', error: Object.assign(new Error('half a'), { status: 418 }) },
+      { label: 'response without a numeric status', error: Object.assign(new Error('half b'), { response: { message: 'x' }, status: 'teapot' }) }
+    ]
+    for (const [index, { label, error }] of halves.entries()) {
+      const context = fakeContext({ 'idempotency-key': `nest-half-${index}` }, {}, handler)
+      await assert.rejects(
+        lastValueFrom(interceptor.intercept(context as never, { handle: () => { throw error } })),
+        (thrown: unknown) => {
+          assert.equal(thrown, error, `${label} must pass through untouched`)
+          assert.ok(!(thrown instanceof HttpException))
+          return true
+        }
+      )
+    }
+  })
+
+  test('replayed errors without an http shape pass through untouched', async () => {
+    const { lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const interceptor = new IdempotencyInterceptor(idempotency, { storage, persistFailures: true })
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': 'nest-plain' }, {}, handler)
+    const domainError = Object.assign(new Error('card declined'), { code: 'CARD_DECLINED' })
+
+    await assert.rejects(lastValueFrom(interceptor.intercept(context as never, {
+      handle: () => { throw domainError }
+    })), /card declined/)
+
+    await assert.rejects(intercept(interceptor, context), (error: unknown) => {
+      assert.ok(error instanceof Error)
+      assert.equal((error as { code?: string }).code, 'CARD_DECLINED')
+      assert.equal(error.constructor.name, 'Error', 'a plain domain failure is not dressed up as an HttpException')
+      return true
+    })
+  })
+
   test('a non-string, non-array header value runs unprotected', async () => {
     const interceptor = new IdempotencyInterceptor(
       new Idempotency({ storage: new MemoryStorage() }),

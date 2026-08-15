@@ -36,4 +36,15 @@ describe('parseDuration', () => {
   test('rejects zero-valued strings', () => {
     assert.throws(() => parseDuration('0s'), RangeError)
   })
+
+  test('rejects positive values that round down to zero', () => {
+    // A zero TTL expires the record the instant it is written, so every
+    // completion would fail fencing: these must not slip past the guard.
+    assert.throws(() => parseDuration(0.4), RangeError)
+    assert.throws(() => parseDuration(0.49), RangeError)
+    assert.throws(() => parseDuration('0.4ms'), RangeError)
+    // The boundary itself still rounds up to a usable duration.
+    assert.equal(parseDuration(0.5), 1)
+    assert.equal(parseDuration('0.5ms'), 1)
+  })
 })

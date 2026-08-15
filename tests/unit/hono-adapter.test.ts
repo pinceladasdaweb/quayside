@@ -191,6 +191,77 @@ describe('hono adapter', () => {
     assert.equal(response.status, 404)
   })
 
+  test('the request body is read only when the kernel will fingerprint it', async () => {
+    // Reading clones and buffers the whole request: an unprotected method or
+    // a keyless request must not pay for a body nobody looks at.
+    const middleware = HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), { maxBodyBytes: 1_024 })
+    let clones = 0
+    const contextFor = (method: string, key?: string) => {
+      const headers: Record<string, string | undefined> = { 'idempotency-key': key }
+      return {
+        req: {
+          method,
+          path: '/fake',
+          header: (name: string) => headers[name],
+          raw: {
+            clone () {
+              clones += 1
+              return { text: async () => '{"amount":1}' }
+            }
+          } as unknown as Request
+        },
+        res: new Response('ok', { status: 200 })
+      }
+    }
+    const next = async () => {}
+
+    await middleware(contextFor('GET'), next)
+    assert.equal(clones, 0, 'an unprotected method never reads the body')
+    await middleware(contextFor('GET', 'hon-gate-get'), next)
+    assert.equal(clones, 0, 'a key on an unprotected method changes nothing')
+    await middleware(contextFor('POST'), next)
+    assert.equal(clones, 0, 'a request without a key never reads the body')
+    await middleware(contextFor('POST', ''), next)
+    assert.equal(clones, 0, 'an empty key is no key at all')
+    await middleware(contextFor('POST', 'hon-gate'), next)
+    assert.equal(clones, 1, 'a protected, keyed request is fingerprinted')
+  })
+
+  test('enforce answers 400 without ever reading the body', async () => {
+    const middleware = HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), { enforce: true })
+    let clones = 0
+    const context = {
+      req: {
+        method: 'POST',
+        path: '/fake',
+        header: () => undefined,
+        raw: {
+          clone () {
+            clones += 1
+            return { text: async () => '{"amount":1}' }
+          }
+        } as unknown as Request
+      },
+      res: new Response('ok', { status: 200 })
+    }
+    const response = await middleware(context, async () => {})
+    assert.equal(response?.status, 400)
+    assert.equal(clones, 0, 'the 400 needs no fingerprint, so the body is never buffered')
+  })
+
+  test('enforce reads nothing and still answers 400 without a key', async () => {
+    const strict = new Hono()
+    strict.use(HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), { enforce: true }) as never)
+    strict.post('/payments', (c) => c.json({ ok: true }, 201))
+    const response = await strict.request('/payments', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ amount: 1 })
+    })
+    assert.equal(response.status, 400)
+    assert.match(await response.text(), /IDEMPOTENCY_KEY_REQUIRED/)
+  })
+
   test('a request without a body runs unfingerprinted and replays', async () => {
     const startingCalls = calls.empty ?? 0
     const request = async () => app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-nobody' } })

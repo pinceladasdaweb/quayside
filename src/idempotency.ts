@@ -12,7 +12,7 @@ import {
   WaitTimeoutError
 } from './errors'
 import { METRIC_HANDLERS, type IdempotencyEvent, type IdempotencyEventType, type MetricsCollector } from './events'
-import { RECORD_STATUS, type IdempotencyStorage, type RecordStatus, type StoredRecord } from './storage'
+import { RECORD_STATUS, type IdempotencyStorage, type Outcome, type RecordStatus, type StoredRecord } from './storage'
 
 export type ExecuteInput =
   | string
@@ -35,6 +35,14 @@ export interface ExecutionContext {
   replayed: boolean
   signal: AbortSignal
   extend (ttl?: Duration): Promise<void>
+  /**
+   * Opts this execution out of storage entirely: the outcome reaches this
+   * caller, the record is released, and the next call with the same key runs
+   * fresh. Concurrent callers stay protected by the lock while it runs; only
+   * the replay window is given up. Applies to failures too, overriding
+   * `persistFailures` for this run.
+   */
+  doNotStore (): void
 }
 
 export type ExecuteFunction<T> = (ctx: ExecutionContext) => T | Promise<T>
@@ -285,7 +293,7 @@ export class Idempotency {
     if (this.onConflict === 'reject') {
       throw new ConcurrentExecutionError(key)
     }
-    return this.waitForOutcome(input, storageKey, key, fn, correlationId, startedAt)
+    return this.waitForOutcome(input, storageKey, key, fingerprint, fn, correlationId, startedAt)
   }
 
   private async runOwned<T> (
@@ -299,22 +307,33 @@ export class Idempotency {
   ): Promise<ExecutionResult<T>> {
     this.emit('acquired', key, correlationId)
     const controller = new AbortController()
+    let stores = true
     const ctx: ExecutionContext = {
       key,
       replayed: false,
       signal: controller.signal,
       extend: async (ttl) => {
         await this.storageCall(() => this.storage.extend(storageKey, token, ttl === undefined ? this.lockTtlMs : parseDuration(ttl)))
-      }
+      },
+      doNotStore: () => { stores = false }
     }
 
     let value: T
     try {
       value = await fn(ctx)
     } catch (error) {
-      await this.settleFailure(storageKey, token, error)
+      const persisted = this.persistFailures && stores
+      await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error) } : null)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
+    }
+
+    if (!stores) {
+      // The execution opted out of storage: the caller gets its value, the
+      // record is released, and nothing is left for anyone to replay.
+      await this.settle(storageKey, token, null)
+      this.emit('completed', key, correlationId, this.clock.now() - startedAt)
+      return { value, replayed: false, storedAt }
     }
 
     let encoded: string
@@ -324,7 +343,7 @@ export class Idempotency {
       // A result that cannot be stored cannot be replayed either: the record
       // is released so callers may retry, and the error surfaces instead of
       // silently storing something else.
-      await this.settleFailure(storageKey, token, error, { forceRelease: true })
+      await this.settle(storageKey, token, null)
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
@@ -359,7 +378,9 @@ export class Idempotency {
       key,
       replayed: false,
       signal: controller.signal,
-      extend: async () => {}
+      // Nothing is locked and nothing is stored: both are already no-ops.
+      extend: async () => {},
+      doNotStore: () => {}
     })
     return { value, replayed: false, storedAt: this.clock.now() }
   }
@@ -368,18 +389,26 @@ export class Idempotency {
     input: ExecuteInput,
     storageKey: string,
     key: string,
+    fingerprint: string | undefined,
     fn: ExecuteFunction<T>,
     correlationId: string,
     startedAt: number
   ): Promise<ExecutionResult<T>> {
     const deadline = this.clock.now() + this.waitTimeoutMs
-    const notify = this.storage.waitForChange?.bind(this.storage) ?? null
+    const notify = this.storage.waitForChange?.bind(this.storage)
+    let warned = false
     let delay = 25
     while (true) {
       const record = await this.storageCall(() => this.storage.get(storageKey))
       if (record === null) {
         // The holder failed (record deleted) or its lock expired: take over.
         return this.run(input, fn, correlationId, startedAt)
+      }
+      // The record under the key can change identity while we wait: the
+      // holder's lock may expire and another payload take the key over. Its
+      // outcome is not ours to replay, exactly as in the acquire path.
+      if (!fingerprintsEqual(record.fingerprint, fingerprint)) {
+        throw new IdempotencyKeyReuseError(key)
       }
       if (record.status === RECORD_STATUS.completed) {
         this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
@@ -394,32 +423,39 @@ export class Idempotency {
         throw new WaitTimeoutError(key, this.waitTimeoutMs)
       }
       const pause = Math.min(delay, remaining)
-      // Storage-assisted wake-up with the polling pause as its upper bound;
-      // a broken notification channel degrades to plain polling.
-      let woke = false
-      if (notify !== null) {
-        await notify(storageKey, pause).then(() => { woke = true }, () => {})
+      // Storage-assisted wake-up with the polling pause as its upper bound.
+      // A storage without a channel simply polls; one whose channel is
+      // broken polls too, but says so once instead of degrading in silence.
+      if (notify === undefined) {
+        await this.clock.sleep(pause)
+      } else {
+        let woke = false
+        try {
+          // Calling .then() doubles as the contract check: a channel that
+          // hands back something other than a promise throws right here
+          // rather than passing for an instant wake-up that would spin.
+          await notify(storageKey, pause).then(() => {})
+          woke = true
+        } catch (error) {
+          if (!warned) {
+            warned = true
+            process.emitWarning(`quayside notification channel failed for "${key}"; falling back to polling: ${String(error)}`)
+          }
+        }
+        if (!woke) await this.clock.sleep(pause)
       }
-      if (!woke) await this.clock.sleep(pause)
       delay = Math.min(delay * 2, 1_000)
     }
   }
 
-  // Cleanup after a failed or unstorable execution. Every path here is
-  // best-effort: the original failure must surface even when the cleanup
-  // itself loses the lock or the storage is down.
-  private async settleFailure (
-    storageKey: string,
-    token: string,
-    error: unknown,
-    options: { forceRelease?: boolean } = {}
-  ): Promise<void> {
+  // Terminal write for an execution that stores no result: `null` releases
+  // the record, an outcome persists it. Best-effort by design: the caller's
+  // own result or failure must surface even when this write loses the lock
+  // or the storage is down.
+  private async settle (storageKey: string, token: string, outcome: Outcome | null): Promise<void> {
     try {
-      if (this.persistFailures && options.forceRelease !== true) {
-        await this.storage.complete(storageKey, token, { status: 'failed', error: encodeErrorValue(error) }, this.resultTtlMs)
-      } else {
-        await this.storage.release(storageKey, token)
-      }
+      if (outcome === null) await this.storage.release(storageKey, token)
+      else await this.storage.complete(storageKey, token, outcome, this.resultTtlMs)
     } catch {
       // Swallowed by design: see above.
     }

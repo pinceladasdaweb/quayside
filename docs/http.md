@@ -72,8 +72,17 @@ A response is stored for replay only when it is **UTF-8 text**, **within
 - 5xx responses are served but never cached: server errors are transient by
   definition, and a client retry re-executes the handler.
 
-In all three cases the idempotency record is released, so the endpoint keeps
-its concurrency protection on every attempt while storing nothing.
+In all three cases the adapter calls `ctx.doNotStore()`, so the record is
+released without ever holding an outcome: the endpoint keeps its concurrency
+protection on every attempt (a second request racing the first still gets a
+409, or waits for it under `onConflict: 'wait'`) while nothing is ever
+written for anyone to replay — not even with `persistFailures` enabled.
+
+A failure that happens *after* the response was already sent — a lock that
+expired mid-execution, a storage that died on the completion write — cannot
+be answered with a different status without lying to the client. The response
+stands, the failure is reported as a process warning and through the
+`failed` event, and nothing was stored, so a client retry re-executes.
 
 Note that with the Express adapter the record is committed right after the
 response is flushed; with Fastify and Hono it is committed before the

@@ -52,23 +52,6 @@ export type KernelOutcome =
   | { kind: 'handled' }
   | { kind: 'respond', response: CapturedHttpResponse }
 
-// Thrown inside the executed function to release the record after a
-// response that must not be replayed (binary, oversized, 5xx). Matched by
-// name, not instanceof: with persistFailures enabled the error comes back
-// as a reconstruction, and the name is what survives serialization.
-const UNCACHEABLE_NAME = 'QuaysideUncacheableResponse'
-
-class UncacheableResponseError extends Error {
-  constructor () {
-    super('the response was served but is not cacheable; the idempotency record was released')
-    this.name = UNCACHEABLE_NAME
-  }
-}
-
-function isUncacheable (error: unknown): error is Error {
-  return error instanceof Error && error.name === UNCACHEABLE_NAME
-}
-
 const DEFAULT_METHODS = ['POST', 'PATCH']
 const DEFAULT_REPLAY_HEADERS = ['content-type', 'location']
 const DEFAULT_MAX_BODY_BYTES = 1_048_576
@@ -83,8 +66,9 @@ const DEFAULT_MAX_BODY_BYTES = 1_048_576
  */
 export class HttpIdempotencyKernel {
   readonly maxBodyBytes: number
+  /** Lower-cased header carrying the key; adapters read it to gate work. */
+  readonly header: string
   private readonly idempotency: Idempotency
-  private readonly header: string
   private readonly methods: Set<string>
   private readonly enforce: boolean
   private readonly fingerprintPayload: (request: HttpRequestFacts) => unknown
@@ -112,6 +96,16 @@ export class HttpIdempotencyKernel {
     return this.methods.has(method.toUpperCase())
   }
 
+  /**
+   * Whether this request has a body worth reading: only a protected method
+   * carrying a key is ever fingerprinted. Adapters that must buffer the
+   * request body call this first, so nothing else pays for the buffering:
+   * a missing key under `enforce` is answered without reading anything.
+   */
+  handles (method: string, key: string | undefined): boolean {
+    return this.shouldHandle(method) && key !== undefined && key !== ''
+  }
+
   async handle (
     request: HttpRequestFacts,
     runDownstream: () => Promise<CapturedHttpResponse | null>
@@ -127,44 +121,47 @@ export class HttpIdempotencyKernel {
     }
 
     const payload = this.fingerprintPayload(request)
+    // Once the downstream response is out there is nothing left to answer
+    // with: a late failure can only be reported, never mapped to a status.
+    let responded = false
     try {
-      const outcome = await this.idempotency.executeWithMetadata<CapturedHttpResponse>(
+      const outcome = await this.idempotency.executeWithMetadata<CapturedHttpResponse | null>(
         { key, payload },
-        async () => {
+        async (ctx) => {
           const captured = await runDownstream()
-          // Server errors are transient by definition: the 5xx is served,
-          // nothing is stored, and a client retry re-executes.
-          if (captured === null || captured.status >= 500) {
-            throw new UncacheableResponseError()
-          }
+          responded = true
+          // Server errors are transient by definition, and bodies that
+          // cannot be replayed faithfully must not be cached: the response
+          // is served and the record is released without ever holding an
+          // outcome, so a client retry re-executes under a fresh lock.
+          if (captured === null || captured.status >= 500) ctx.doNotStore()
           return captured
         }
       )
+      const stored = outcome.value
       if (!outcome.replayed) return { kind: 'handled' }
+      if (stored === null) {
+        // Unreachable through this kernel, which never stores a null: only a
+        // hand-written record gets here, and it has no response to serve.
+        return { kind: 'passthrough' }
+      }
       return {
         kind: 'respond',
         response: {
-          status: outcome.value.status,
-          headers: { ...outcome.value.headers, 'idempotency-replayed': 'true' },
-          body: outcome.value.body
+          status: stored.status,
+          headers: { ...stored.headers, 'idempotency-replayed': 'true' },
+          body: stored.body
         }
       }
     } catch (error) {
-      if (isUncacheable(error)) {
-        if (error instanceof UncacheableResponseError) {
-          // Thrown directly: the response already went out downstream. With
-          // persistFailures the sentinel was stored as a FAILED record, so
-          // it is removed to keep uncacheable endpoints fully protected on
-          // the next request (a redundant delete otherwise).
-          try {
-            await this.idempotency.invalidate(key)
-          } catch {}
-          return { kind: 'handled' }
-        }
-        // Replayed sentinel (a concurrent waiter read the FAILED record
-        // before the invalidation above): nothing usable is cached, run
-        // fresh and unprotected.
-        return { kind: 'passthrough' }
+      if (responded) {
+        // A settlement failure after the client was served (a lock that
+        // expired mid-execution, a storage that died on the completion
+        // write). Overwriting the delivered response with a 5xx would be a
+        // lie, so the failure is reported and the response stands; the
+        // record was not stored, so a retry re-executes.
+        process.emitWarning(`quayside could not settle the record for "${key}" after the response was sent: ${String(error)}`)
+        return { kind: 'handled' }
       }
       if (error instanceof ConcurrentExecutionError || error instanceof WaitTimeoutError) {
         return {
