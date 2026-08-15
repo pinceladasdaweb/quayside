@@ -60,6 +60,12 @@ export function otelSpans (options: OtelSpansOptions = {}): MetricsCollector {
     onReplayed: terminal('replayed'),
     onFailed: terminal('failed'),
     onConflict: instant('quayside.conflict'),
-    onStorageBypass: instant('quayside.storage-bypass')
+    onStorageBypass: (event) => {
+      // A bypass after a successful acquire is terminal: the completion write
+      // failed once the function had already run, so no completed/failed
+      // event follows and the recorded start would be kept forever.
+      starts.delete(event.correlationId)
+      instant('quayside.storage-bypass')(event)
+    }
   }
 }

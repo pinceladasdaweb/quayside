@@ -32,12 +32,20 @@ Your function receives `ctx`:
 | `replayed` | Always `false` inside `fn` — the function only runs on fresh executions |
 | `signal` | An `AbortSignal` (reserved for future cancellation semantics) |
 | `extend(ttl?)` | Heartbeat: pushes the lock expiry forward (`lockTtl` when omitted). Long-running functions call it periodically instead of sizing a worst-case `lockTtl` up front |
+| `doNotStore()` | Opts this execution out of storage: the outcome reaches this caller, the record is released, and the next call with the same key runs fresh. Concurrent callers stay protected by the lock while it runs; only the replay window is given up. It also overrides `persistFailures` for that run |
+
+`doNotStore()` is how a caller says "this outcome is not replayable" without
+losing the exactly-once guarantee for callers racing it — the HTTP adapters
+use it for responses that cannot be cached (binary, oversized, 5xx), and
+business code can use it for results that go stale immediately.
 
 ## Durations
 
 Numbers are milliseconds. Strings take a unit suffix: `ms`, `s`, `m`, `h`,
 `d` — `'500ms'`, `'30s'`, `'1.5s'`, `'10m'`, `'24h'`, `'7d'`. Zero and
-negative values are rejected.
+negative values are rejected, as is any positive value that rounds down to
+zero milliseconds (`0.4`, `'0.4ms'`): a zero TTL would expire the record the
+instant it was written.
 
 ## Result serialization
 
@@ -116,6 +124,14 @@ containing the separator cannot address another namespace (`pay` +
 at `maxKeyLength` (default 512) and rejected on overflow — never truncated,
 because truncation aliases two keys into one record. Payload-derived keys
 are hex hashes and always fit.
+
+The overflow raises `IdempotencyKeyInvalidError` (`IDEMPOTENCY_KEY_INVALID`),
+not a `TypeError`: the offending value is data, usually straight from a
+client header, so it carries a code and the HTTP adapters answer `400`.
+Percent-encoding counts toward the cap, so a key of multibyte characters can
+overflow well before 512 of them. `TypeError` is kept for genuine misuse of
+the API — a non-string key, an empty key, `ignoreFields` together with
+`pickFields`.
 
 ## Events reference
 

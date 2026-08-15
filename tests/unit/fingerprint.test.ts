@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { Idempotency, IdempotencyKeyReuseError } from '../../src/index'
+import { Idempotency, IdempotencyKeyInvalidError, IdempotencyKeyReuseError } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 
 function gate () {
@@ -141,14 +141,14 @@ describe('key hygiene', () => {
 
   test('rejects keys longer than maxKeyLength instead of truncating', async () => {
     const idempotency = instance()
-    await assert.rejects(idempotency.execute('x'.repeat(600), async () => 'v'), TypeError)
+    await assert.rejects(idempotency.execute('x'.repeat(600), async () => 'v'), IdempotencyKeyInvalidError)
   })
 
   test('maxKeyLength is configurable', async () => {
     const idempotency = instance({ maxKeyLength: 2048 })
     assert.equal(await idempotency.execute('x'.repeat(600), async () => 'v'), 'v')
     const strict = instance({ maxKeyLength: 16 })
-    await assert.rejects(strict.execute('x'.repeat(17), async () => 'v'), TypeError)
+    await assert.rejects(strict.execute('x'.repeat(17), async () => 'v'), IdempotencyKeyInvalidError)
   })
 
   test('get and invalidate address the same hygienic key as execute', async () => {

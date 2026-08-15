@@ -69,7 +69,12 @@ export function HonoMiddleware (
 ): (c: HonoContextLike, next: HonoNext) => Promise<Response | undefined> {
   const kernel = new HttpIdempotencyKernel(idempotency, options)
   return async function quaysideIdempotency (c, next) {
-    const body = await requestBody(c.req.raw)
+    // Fingerprinting is the only reason to read the body, and reading it
+    // clones and buffers the whole request: requests the kernel would only
+    // wave through never pay for it.
+    const body = kernel.handles(c.req.method, c.req.header(kernel.header))
+      ? await requestBody(c.req.raw)
+      : undefined
     const outcome = await kernel.handle(
       {
         method: c.req.method,

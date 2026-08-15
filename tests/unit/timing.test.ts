@@ -7,6 +7,7 @@ import { Idempotency, WaitTimeoutError } from '../../src/index'
 import type { IdempotencyEvent, IdempotencyStorage, StoredRecord } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 import { ManualClock } from '../helpers/manual-clock'
+import { warningsDuring } from '../helpers/warnings'
 
 describe('durations through the clock seam', () => {
   test('terminal events measure the exact execution duration', async () => {
@@ -222,26 +223,57 @@ describe('the wait loop under a manual clock', () => {
     assert.deepEqual(clock.sleeps, [], 'a successful wake-up never falls back to polling')
   })
 
-  test('a rejecting notification channel degrades to the polling sleeps', async () => {
-    const clock = new ManualClock()
-    let reads = 0
-    const storage: IdempotencyStorage = {
+  function pollingStorage (clock: ManualClock, reads: { count: number }, waitForChange?: unknown): IdempotencyStorage {
+    return {
       acquire: async () => inProgressRecord(clock),
       complete: async () => {},
       release: async () => {},
       extend: async () => {},
       get: async () => {
-        reads += 1
-        if (reads < 3) return inProgressRecord(clock)
+        reads.count += 1
+        if (reads.count < 3) return inProgressRecord(clock)
         return { key: 'k', token: 'holder', status: 'completed', result: '"done"', storedAt: clock.now(), expiresAt: clock.now() + 60_000 }
       },
       delete: async () => {},
-      waitForChange: async () => { throw new Error('channel broken') }
-    }
-    const idempotency = new Idempotency({ storage, clock, onConflict: 'wait' })
+      waitForChange
+    } as unknown as IdempotencyStorage
+  }
 
-    assert.equal(await idempotency.execute('k', async () => 'never'), 'done')
+  test('a broken notification channel polls instead, and says so once', async () => {
+    // The channel is a public extension point: a plain-JS adapter can throw
+    // synchronously (a not-connected guard) or hand back something that is
+    // not a promise at all. Neither may escape as the caller's failure, and
+    // neither may pass for an instant wake-up that spins the loop.
+    for (const broken of [
+      () => { throw new Error('not connected') },
+      () => undefined,
+      async () => { throw new Error('subscriber down') }
+    ]) {
+      const clock = new ManualClock()
+      const reads = { count: 0 }
+      const idempotency = new Idempotency({
+        storage: pollingStorage(clock, reads, broken),
+        clock,
+        onConflict: 'wait'
+      })
+      const warnings = await warningsDuring(async () => {
+        assert.equal(await idempotency.execute('k', async () => 'never'), 'done')
+      })
+      assert.deepEqual(clock.sleeps, [25, 50], 'every failed wake-up fell back to a polling pause')
+      assert.equal(warnings.length, 1, 'the broken channel is reported once per wait, not once per poll')
+      assert.match(warnings[0] ?? '', /notification channel failed for "k"/)
+    }
+  })
+
+  test('a storage without a notification channel polls silently', async () => {
+    const clock = new ManualClock()
+    const reads = { count: 0 }
+    const idempotency = new Idempotency({ storage: pollingStorage(clock, reads), clock, onConflict: 'wait' })
+    const warnings = await warningsDuring(async () => {
+      assert.equal(await idempotency.execute('k', async () => 'never'), 'done')
+    })
     assert.deepEqual(clock.sleeps, [25, 50])
+    assert.deepEqual(warnings, [], 'not offering a channel is not a failure')
   })
 })
 
@@ -259,20 +291,6 @@ describe('expiry boundaries under a manual clock', () => {
 })
 
 describe('listener failures surface as process warnings', () => {
-  async function warningsDuring (work: () => Promise<void>): Promise<string[]> {
-    const seen: string[] = []
-    const capture = (warning: Error): void => { seen.push(warning.message) }
-    process.on('warning', capture)
-    try {
-      await work()
-      await new Promise((resolve) => setImmediate(resolve))
-      await new Promise((resolve) => setImmediate(resolve))
-    } finally {
-      process.off('warning', capture)
-    }
-    return seen
-  }
-
   test('a throwing listener emits a warning naming the event type', async () => {
     const warnings = await warningsDuring(async () => {
       const idempotency = new Idempotency({

@@ -6,6 +6,7 @@ import type { CapturedHttpResponse, HttpKernelOptions, HttpRequestFacts } from '
 import { FencingError, Idempotency } from '../../src/index'
 import type { IdempotencyStorage } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
+import { warningsDuring } from '../helpers/warnings'
 
 function kernelWith (options: HttpKernelOptions = {}, idempotencyOverrides = {}) {
   const idempotency = new Idempotency({ storage: new MemoryStorage(), ...idempotencyOverrides })
@@ -199,19 +200,47 @@ describe('http kernel cacheability', () => {
     assert.notEqual(second.kind, 'respond')
   })
 
-  test('a replayed uncacheable sentinel passes the request through unprotected', async () => {
+  test('an uncacheable response leaves no record for a waiter to replay', async () => {
+    // The sentinel is control flow, never state: nothing is stored even with
+    // persistFailures on, so no concurrent waiter can ever observe it and
+    // run unprotected, and no failed record survives to poison the key.
     const storage = new MemoryStorage()
-    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const idempotency = new Idempotency({ storage, persistFailures: true, onConflict: 'wait' })
     const kernel = new HttpIdempotencyKernel(idempotency)
-    // A concurrent waiter can read the FAILED sentinel before the kernel
-    // invalidates it; the stored shape is what settleFailure writes.
-    await storage.acquire({ key: 'k-1', token: 't', storedAt: Date.now() }, 60_000)
-    await storage.complete('k-1', 't', {
-      status: 'failed',
-      error: JSON.stringify({ name: 'QuaysideUncacheableResponse', message: 'not cacheable' })
-    }, 60_000)
-    const outcome = await kernel.handle(post({ key: 'k-1', body: undefined }), async () => ok())
-    assert.deepEqual(outcome, { kind: 'passthrough' })
+
+    assert.deepEqual(await kernel.handle(post({ key: 'k-1' }), async () => ok('{}', 500)), { kind: 'handled' })
+    assert.equal(await idempotency.get('k-1'), null, 'the uncacheable run stored nothing')
+
+    // The key is still fully protected on the next attempt.
+    let calls = 0
+    const run = async () => { calls += 1; return ok() }
+    assert.deepEqual(await kernel.handle(post({ key: 'k-1' }), run), { kind: 'handled' })
+    const replay = await kernel.handle(post({ key: 'k-1' }), run)
+    assert.equal(calls, 1)
+    assert.equal(replay.kind, 'respond')
+  })
+
+  test('a waiter blocked on an uncacheable run takes the key over instead of passing through', async () => {
+    const idempotency = new Idempotency({
+      storage: new MemoryStorage(),
+      persistFailures: true,
+      onConflict: 'wait'
+    })
+    const kernel = new HttpIdempotencyKernel(idempotency)
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+
+    const uncacheable = kernel.handle(post({ key: 'k-2' }), async () => { await gate; return null })
+    await new Promise((resolve) => setImmediate(resolve))
+    let waiterRan = 0
+    const waiter = kernel.handle(post({ key: 'k-2' }), async () => { waiterRan += 1; return ok() })
+    release()
+
+    assert.deepEqual(await uncacheable, { kind: 'handled' })
+    // The waiter runs the handler through the kernel, under its own lock,
+    // rather than being waved past the protection entirely.
+    assert.deepEqual(await waiter, { kind: 'handled' })
+    assert.equal(waiterRan, 1)
   })
 
   test('a request without a body fingerprints nothing and still replays', async () => {
@@ -245,7 +274,9 @@ describe('http kernel configuration', () => {
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 400)
   })
 
-  test('fencing and serialization failures map to 500, storage to 503', async () => {
+  test('a settlement failure after the response was sent is reported, never answered', async () => {
+    // The handler already responded: replacing its 2xx with a 5xx would tell
+    // the client the work did not happen when it did.
     const memory = new MemoryStorage()
     const fencing: IdempotencyStorage = {
       acquire: (record, ttl) => memory.acquire(record, ttl),
@@ -256,12 +287,56 @@ describe('http kernel configuration', () => {
       delete: (key) => memory.delete(key)
     }
     const kernel = new HttpIdempotencyKernel(new Idempotency({ storage: fencing }))
-    const outcome = await kernel.handle(post(), async () => ok())
+    const warnings = await warningsDuring(async () => {
+      assert.deepEqual(await kernel.handle(post(), async () => ok()), { kind: 'handled' })
+    })
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0] ?? '', /k-1|after the response was sent/)
+  })
+
+  test('a key the client cannot use answers 400, not 500', async () => {
+    // The header is client input: a 5xx here would blame the server and page
+    // someone for a malformed request.
+    const kernel = kernelWith({}, { maxKeyLength: 16 })
+    let calls = 0
+    const outcome = await kernel.handle(
+      post({ key: 'x'.repeat(20) }),
+      async () => { calls += 1; return ok() }
+    )
+    assert.equal(outcome.kind, 'respond')
+    if (outcome.kind === 'respond') {
+      assert.equal(outcome.response.status, 400)
+      const body = JSON.parse(outcome.response.body) as { error: string, detail: string }
+      assert.equal(body.error, 'IDEMPOTENCY_KEY_INVALID')
+      assert.match(body.detail, /16/, 'the client is told the limit it broke')
+    }
+    assert.equal(calls, 0, 'the handler never ran')
+  })
+
+  test('failures before the handler runs still map to a status', async () => {
+    // Nothing was sent yet, so these can and must become responses.
+    const unserializable = kernelWith()
+    const outcome = await unserializable.handle(
+      { ...post(), body: { fn: () => 'not fingerprintable' } },
+      async () => ok()
+    )
     assert.equal(outcome.kind, 'respond')
     if (outcome.kind === 'respond') {
       assert.equal(outcome.response.status, 500)
-      assert.match(outcome.response.body, /IDEMPOTENCY_FENCING/)
+      assert.match(outcome.response.body, /IDEMPOTENCY_SERIALIZATION/)
     }
+
+    const down: IdempotencyStorage = {
+      acquire: async () => { throw new Error('down') },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const unavailable = new HttpIdempotencyKernel(new Idempotency({ storage: down }))
+    const outage = await unavailable.handle(post(), async () => ok())
+    assert.equal(outage.kind === 'respond' && outage.response.status, 503)
   })
 
   test('problem responses declare a JSON content type and a non-empty detail', async () => {
@@ -309,26 +384,49 @@ describe('http kernel configuration', () => {
     assert.equal(second.kind, 'respond')
   })
 
-  test('the stored uncacheable sentinel keeps its diagnostic message', async () => {
+  test('a stored record holding no response cannot be replayed', async () => {
+    // The kernel never stores a null, so only a hand-written or corrupted
+    // record reaches this: there is nothing to serve, and answering with an
+    // empty shell would be worse than letting the request run.
+    const poisoned: IdempotencyStorage = {
+      acquire: async () => ({
+        key: 'k-null',
+        token: 't',
+        status: 'completed',
+        result: 'null',
+        storedAt: 1,
+        expiresAt: Date.now() + 60_000
+      }),
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const kernel = new HttpIdempotencyKernel(new Idempotency({ storage: poisoned }))
+    const outcome = await kernel.handle(post({ key: 'k-null', body: undefined }), async () => ok())
+    assert.deepEqual(outcome, { kind: 'passthrough' })
+  })
+
+  test('an uncacheable response writes no failed record and releases the key', async () => {
     const memory = new MemoryStorage()
     const stored: string[] = []
+    let released = 0
     const spy: IdempotencyStorage = {
       acquire: (record, ttl) => memory.acquire(record, ttl),
       complete: async (key, token, outcome, ttl) => {
         if (outcome.status === 'failed') stored.push(outcome.error)
         return memory.complete(key, token, outcome, ttl)
       },
-      release: (key, token) => memory.release(key, token),
+      release: async (key, token) => { released += 1; await memory.release(key, token) },
       extend: (key, token, ttl) => memory.extend(key, token, ttl),
       get: (key) => memory.get(key),
       delete: (key) => memory.delete(key)
     }
     const kernel = new HttpIdempotencyKernel(new Idempotency({ storage: spy, persistFailures: true }))
     await kernel.handle(post({ body: undefined }), async () => null)
-    assert.equal(stored.length, 1)
-    const parsed = JSON.parse(stored[0] ?? '{}') as { name: string, message: string }
-    assert.equal(parsed.name, 'QuaysideUncacheableResponse')
-    assert.match(parsed.message, /not cacheable/)
+    assert.deepEqual(stored, [], 'persistFailures must not turn the sentinel into a record')
+    assert.equal(released, 1, 'the record is released, not completed')
   })
 
   test('custom header and method set are honored', async () => {

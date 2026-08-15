@@ -157,6 +157,29 @@ describe('canonicalize', () => {
   })
 })
 
+describe('raw binary buffers', () => {
+  test('ArrayBuffer contents drive the fingerprint, like every view of them', () => {
+    const first = new Uint8Array([1, 2, 3]).buffer
+    const second = new Uint8Array([9, 9, 9]).buffer
+    // Without a branch of their own these hash as an empty object: two
+    // different binary payloads would share a key and replay each other.
+    assert.notEqual(hashCanonical({ file: first }), hashCanonical({ file: second }))
+    assert.equal(hashCanonical({ file: first }), hashCanonical({ file: new Uint8Array([1, 2, 3]).buffer }))
+    // A buffer and a view over the same bytes describe the same payload.
+    assert.equal(canonicalize(first), canonicalize(new Uint8Array([1, 2, 3])))
+    assert.equal(canonicalize(new ArrayBuffer(0)), 'bytes:')
+  })
+
+  test('SharedArrayBuffer contents drive the fingerprint too', () => {
+    const shared = new SharedArrayBuffer(3)
+    new Uint8Array(shared).set([1, 2, 3])
+    const other = new SharedArrayBuffer(3)
+    new Uint8Array(other).set([4, 5, 6])
+    assert.notEqual(hashCanonical({ file: shared }), hashCanonical({ file: other }))
+    assert.equal(canonicalize(shared), canonicalize(new Uint8Array([1, 2, 3])))
+  })
+})
+
 describe('fingerprintsEqual', () => {
   test('compares fingerprints and treats undefined as its own value', () => {
     assert.equal(fingerprintsEqual('abc', 'abc'), true)

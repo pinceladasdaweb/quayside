@@ -1,15 +1,19 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
+import { hashCanonical } from '../../src/canonical'
 import {
   ConcurrentExecutionError,
   Idempotency,
+  IdempotencyKeyReuseError,
   SerializationError,
   StorageUnavailableError,
   WaitTimeoutError
 } from '../../src/index'
 import type { IdempotencyEvent, IdempotencyStorage, StoredRecord } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
+import { ManualClock } from '../helpers/manual-clock'
+import { warningsDuring } from '../helpers/warnings'
 
 function gate () {
   let open: () => void = () => {}
@@ -199,12 +203,16 @@ describe('Idempotency concurrency', () => {
       onConflict: 'wait'
     })
     const secondGate = gate()
-    const winner2 = broken.execute('k2', async () => { await secondGate.opened; return 'w2' })
-    await new Promise((resolve) => setImmediate(resolve))
-    const waiter2 = broken.execute('k2', async () => 'l2')
-    setTimeout(secondGate.open, 40)
-    assert.equal(await winner2, 'w2')
-    assert.equal(await waiter2, 'w2')
+    // The expected warning is captured so it does not land in the output.
+    const warnings = await warningsDuring(async () => {
+      const winner2 = broken.execute('k2', async () => { await secondGate.opened; return 'w2' })
+      await new Promise((resolve) => setImmediate(resolve))
+      const waiter2 = broken.execute('k2', async () => 'l2')
+      setTimeout(secondGate.open, 40)
+      assert.equal(await winner2, 'w2')
+      assert.equal(await waiter2, 'w2')
+    })
+    assert.ok(warnings.some((message) => message.includes('notification channel failed')))
   })
 
   test('a waiter takes over after the holder fails', async () => {
@@ -570,7 +578,7 @@ describe('Idempotency observability', () => {
     assert.deepEqual(events, ['acquired', 'conflict', 'completed', 'acquired', 'failed'])
   })
 
-  test('routes events to the MetricsCollector and swallows listener failures', async () => {
+  test('routes events to the MetricsCollector and survives listener failures', async () => {
     const seen: string[] = []
     const idempotency = instance({
       onEvent: () => { throw new Error('listener bug') },
@@ -580,8 +588,12 @@ describe('Idempotency observability', () => {
         onReplayed: (event) => seen.push(`replayed:${event.key}`)
       }
     })
-    assert.equal(await idempotency.execute('k', async () => 'v'), 'v')
-    assert.equal(await idempotency.execute('k', async () => 'v'), 'v')
+    // The failures are expected: capturing them keeps the reported warnings
+    // out of the test output.
+    await warningsDuring(async () => {
+      assert.equal(await idempotency.execute('k', async () => 'v'), 'v')
+      assert.equal(await idempotency.execute('k', async () => 'v'), 'v')
+    })
     assert.deepEqual(seen, ['acquired:k', 'completed:k', 'replayed:k'])
   })
 
@@ -590,6 +602,171 @@ describe('Idempotency observability', () => {
     const idempotency = instance({ namespace: 'payments', onEvent: (event) => events.push(event) })
     await idempotency.execute('k', async () => 1)
     assert.ok(events.every((event) => event.namespace === 'payments'))
+  })
+})
+
+describe('doNotStore', () => {
+  test('the value reaches the caller and nothing is left to replay', async () => {
+    let runs = 0
+    const idempotency = instance()
+    const run = async () => idempotency.execute('k', async (ctx) => {
+      runs += 1
+      ctx.doNotStore()
+      return `run-${runs}`
+    })
+
+    assert.equal(await run(), 'run-1')
+    assert.equal(await idempotency.get('k'), null, 'the record is released, never completed')
+    assert.equal(await run(), 'run-2', 'the next call executes fresh instead of replaying')
+  })
+
+  test('it overrides persistFailures for that run', async () => {
+    let runs = 0
+    const idempotency = instance({ persistFailures: true })
+    await assert.rejects(idempotency.execute('k', async (ctx) => {
+      runs += 1
+      ctx.doNotStore()
+      throw new Error('transient')
+    }), /transient/)
+    assert.equal(await idempotency.get('k'), null)
+
+    // Without the opt-out the same instance does persist the failure.
+    await assert.rejects(idempotency.execute('k', async () => { throw new Error('permanent') }), /permanent/)
+    const record = await idempotency.get('k')
+    assert.equal(record?.status, 'failed')
+    assert.equal(runs, 1)
+  })
+
+  test('concurrent callers stay protected while it runs', async () => {
+    const idempotency = instance()
+    const { open, opened } = gate()
+    const running = idempotency.execute('k', async (ctx) => {
+      ctx.doNotStore()
+      await opened
+      return 'first'
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    await assert.rejects(idempotency.execute('k', async () => 'second'), ConcurrentExecutionError)
+    open()
+    assert.equal(await running, 'first')
+  })
+
+  test('it reports completion, its exact duration and a fresh result', async () => {
+    const clock = new ManualClock(7_000)
+    const events: IdempotencyEvent[] = []
+    const idempotency = new Idempotency({
+      storage: new MemoryStorage({ now: () => clock.now() }),
+      clock,
+      onEvent: (event) => events.push(event)
+    })
+    const outcome = await idempotency.executeWithMetadata('k', async (ctx) => {
+      ctx.doNotStore()
+      clock.advance(250)
+      return 'v'
+    })
+    assert.equal(outcome.value, 'v')
+    assert.equal(outcome.replayed, false, 'the caller ran the function itself')
+    assert.equal(outcome.storedAt, 7_000)
+    assert.deepEqual(events.map((event) => event.type), ['acquired', 'completed'])
+    assert.equal(events[1]?.durationMs, 250)
+  })
+
+  test('fail-open executions accept the opt-out as a no-op', async () => {
+    const down: IdempotencyStorage = {
+      acquire: async () => { throw new Error('down') },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const open = new Idempotency({ storage: down, onStorageError: 'open' })
+    const value = await open.execute('k', async (ctx) => {
+      ctx.doNotStore()
+      return 'unguarded'
+    })
+    assert.equal(value, 'unguarded', 'nothing is stored either way, so the call changes nothing')
+  })
+})
+
+describe('waiters and key identity', () => {
+  test('a waiter refuses an outcome stored under a different payload', async () => {
+    // The holder's lock expires mid-wait and another payload takes the key
+    // over: its result belongs to that payload, not to the waiter's.
+    let reads = 0
+    const takeover = {
+      key: 'k',
+      token: 'other-holder',
+      status: 'completed' as const,
+      result: '"someone else\'s result"',
+      // the canonical hash of a different payload
+      fingerprint: 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+      storedAt: 1,
+      expiresAt: Date.now() + 60_000
+    }
+    const storage: IdempotencyStorage = {
+      acquire: async (record) => ({ ...takeover, status: 'in-progress', fingerprint: record.fingerprint, result: undefined }),
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => {
+        reads += 1
+        return takeover
+      },
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage, onConflict: 'wait' })
+    await assert.rejects(
+      idempotency.execute({ key: 'k', payload: { amount: 1 } }, async () => 'never'),
+      IdempotencyKeyReuseError
+    )
+    assert.equal(reads, 1)
+  })
+
+  test('a waiter still replays an outcome stored under its own payload', async () => {
+    let reads = 0
+    const storage: IdempotencyStorage = {
+      acquire: async (record) => ({
+        key: 'k',
+        token: 'holder',
+        status: 'in-progress',
+        fingerprint: record.fingerprint,
+        storedAt: 1,
+        expiresAt: Date.now() + 60_000
+      }),
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => {
+        reads += 1
+        return {
+          key: 'k',
+          token: 'holder',
+          status: 'completed' as const,
+          result: '"winner"',
+          fingerprint: hashCanonical({ amount: 1 }),
+          storedAt: 1,
+          expiresAt: Date.now() + 60_000
+        }
+      },
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage, onConflict: 'wait' })
+    assert.equal(await idempotency.execute({ key: 'k', payload: { amount: 1 } }, async () => 'never'), 'winner')
+    assert.equal(reads, 1)
+  })
+
+  test('a keyless waiter tolerates an outcome with no fingerprint', async () => {
+    const storage: IdempotencyStorage = {
+      acquire: async () => ({ key: 'k', token: 'holder', status: 'in-progress', storedAt: 1, expiresAt: Date.now() + 60_000 }),
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => ({ key: 'k', token: 'holder', status: 'completed' as const, result: '"winner"', storedAt: 1, expiresAt: Date.now() + 60_000 }),
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage, onConflict: 'wait' })
+    assert.equal(await idempotency.execute('k', async () => 'never'), 'winner')
   })
 })
 

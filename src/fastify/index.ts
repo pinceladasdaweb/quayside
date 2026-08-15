@@ -15,6 +15,11 @@ export interface FastifyRequestLike {
 
 export interface FastifyReplyLike {
   statusCode: number
+  /**
+   * Node's raw ServerResponse. Its 'close' event is the only signal that
+   * arrives for every request, whatever the reply lifecycle does.
+   */
+  raw: { on (event: 'close', listener: () => void): unknown }
   getHeader (name: string): unknown
   header (name: string, value: string): unknown
   code (status: number): unknown
@@ -81,6 +86,11 @@ export function FastifyPlugin (
       const capture = new Promise<CapturedHttpResponse | null>((resolve) => {
         resolveCapture = resolve
       })
+      // onSend never runs for a hijacked reply, an aborted connection or a
+      // handler that never answers. Without this backstop the capture would
+      // never settle and the key would stay locked until its TTL expired;
+      // resolving a promise twice is a no-op, so onSend still wins.
+      reply.raw.on('close', () => { resolveCapture(null) })
 
       const outcome = kernel.handle(
         {

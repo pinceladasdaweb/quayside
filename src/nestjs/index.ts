@@ -16,6 +16,7 @@ import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } fr
 import {
   ConcurrentExecutionError,
   Idempotency,
+  IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   QuaysideError,
   WaitTimeoutError
@@ -27,9 +28,11 @@ export const QUAYSIDE_IDEMPOTENCY = 'QUAYSIDE_IDEMPOTENCY'
 /** Injection token for the module options (storage, TTLs, header). */
 export const QUAYSIDE_MODULE_OPTIONS = 'QUAYSIDE_MODULE_OPTIONS'
 
-// A symbol cannot collide with foreign metadata and needs no name: the
-// decorator and the interceptor share this reference.
-const IDEMPOTENT_METADATA = Symbol('quayside idempotent')
+// A symbol cannot collide with foreign metadata. Registered rather than
+// unique: this package ships dual CJS and ESM builds, and an app that loads
+// both would otherwise have the decorator write under one key and the
+// interceptor read another, silently leaving every route unprotected.
+const IDEMPOTENT_METADATA = Symbol.for('quayside:idempotent')
 
 export interface NestRequestLike {
   headers: Record<string, unknown>
@@ -68,6 +71,18 @@ export function Idempotent (options: IdempotentOptions = {}): MethodDecorator {
 function headerValue (value: unknown): string | undefined {
   if (Array.isArray(value)) return headerValue(value[0])
   return typeof value === 'string' ? value : undefined
+}
+
+// A persisted failure replays as a reconstruction: the own fields of an
+// HttpException survive, its prototype does not, and Nest's exception filter
+// answers 500 for anything that is not an instance. Rebuilding one restores
+// the status and body the first attempt already answered with: retries of
+// the same key must not change the response.
+function reviveHttpException (error: unknown): unknown {
+  if (!(error instanceof Error) || error instanceof HttpException) return error
+  const replayed = error as unknown as { status?: unknown, response?: unknown }
+  if (typeof replayed.status !== 'number' || replayed.response === undefined) return error
+  return new HttpException(replayed.response as string | Record<string, unknown>, replayed.status)
 }
 
 // Platform-neutral: express exposes setHeader, fastify exposes header.
@@ -155,11 +170,15 @@ export class IdempotencyInterceptor implements NestInterceptor {
         422
       )
     }
+    if (error instanceof IdempotencyKeyInvalidError) {
+      // Client-supplied value, client error: never a 5xx.
+      return new HttpException({ statusCode: 400, error: error.code, message: error.message }, 400)
+    }
     if (error instanceof QuaysideError) {
       const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500
       return new HttpException({ statusCode: status, error: error.code, message: error.message }, status)
     }
-    return error
+    return reviveHttpException(error)
   }
 }
 

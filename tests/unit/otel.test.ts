@@ -152,6 +152,22 @@ describe('otel collector', () => {
     assert.notEqual(span.status.code, SpanStatusCode.ERROR)
   })
 
+  test('a storage bypass consumes the recorded start instead of leaking it', async () => {
+    // Fail-open with a storage that dies on the completion write emits
+    // 'acquired' then 'storage-bypass' and no terminal event: the recorded
+    // start must not outlive the execution that registered it.
+    const { exporter, tracer } = tracing()
+    const collector = otelSpans({ tracer })
+    const base = { key: 'k', correlationId: 'c-bypass' } as const
+    collector.onAcquired?.({ ...base, type: 'acquired', timestamp: 1_000 })
+    collector.onStorageBypass?.({ ...base, type: 'storage-bypass', timestamp: 1_100 })
+    collector.onCompleted?.({ ...base, type: 'completed', timestamp: 2_000, durationMs: 50 })
+
+    const executeSpan = exporter.getFinishedSpans().find((span) => span.name === 'quayside.execute')
+    assert.ok(executeSpan)
+    assert.equal(hrTimeToMs(executeSpan.startTime), 1_950, 'a stale start would backdate this span to 1000')
+  })
+
   test('storage bypasses emit their own span', async () => {
     const { exporter, tracer } = tracing()
     const down: IdempotencyStorage = {
