@@ -1,0 +1,30 @@
+# CHANGELOG
+
+## 0.1.0 (2026-08-14)
+
+* chore: scaffold project foundation by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/3a55f0e462d06b7a56c688d289eb18d270b10c4a)
+* build: ship dual ESM and CJS output by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/0f6cc2e78b00622bdd1a8f1a34949ad107926fce)
+* feat: core idempotency engine with in-memory storage by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/db202799b505bcd353e339171e7482c7038653a7)
+* feat: payload fingerprints, derived keys, key hygiene and failure policies by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/77e6bf84c589a121157480ac07d91045ad1c496c)
+* feat: redis storage adapter with fenced Lua transitions by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/b21b6bd86f6843c7497a8bd112359f6ae5d10c89)
+* chore: add docker compose for local redis experimentation by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/5ae3cf4dce7a5a413dfed06f5ff4d5f16eb9c637)
+* chore: drop the docker compose file by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/815aa3c6d649b627c1425094020d8e93299f08f2)
+* chore: add community health files by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/251e8e3c32a9be38ebecf14f5845526b2af7daf7)
+* chore: stop generating a package lock by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/a4b8116bce4d4a621171886527debf8cd6ed85bd)
+* feat: http kernel and express, fastify and hono adapters by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/657bc6cb2f57687fc78069feb35378de40c2dd65)
+* feat: nestjs module, interceptor and Idempotent decorator by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/0e827f18af979f449dc3486f033d810add1d78b5)
+* feat: postgres and mysql storage adapters by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/859238995479c298cbc920c1f5136caeb4462232)
+* docs: comparison table, full README and core semantics reference by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/f9510e761443365aa25c094647b098fa80f68144)
+* feat: prometheus and otel observability entry points by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/d38b80334274a53aad67e149ff8724b9d2bfd708)
+* docs: queue recipes and per-storage benchmarks by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/288f0e97a504b54c38e5ec3cc99725518574bc3f)
+* test: keep expected handler errors out of the test output by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/f29cbc13e309b296a7688917d590958ce4e4a55e)
+* chore: wire Stryker mutation testing by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/cab84cf89006fac311346b2746177fb10fb656db)
+* chore: scope the coverage report to src by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/c0ca31e6f4761a80cc15f99a953f31be8862a20c)
+* test: eliminate every uncovered mutant and reach full line coverage by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/0fbd5da18215589fc0167c195e353b0d168812bb)
+* test: kill every surviving mutant by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/cd22f46cdf061cd3ab934c5bf58f9b3ae01f87f8)
+* fix: close the gaps found by the code review by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/cf08a9346d575603ae85c38057b9f6e896c04490)
+* fix: answer 4xx for a key the client cannot use by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/a58f51f167d852689fe2999abe8770377570868e)
+* fix: never release a fastify lock while its handler runs on by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/94160a657e9cfc07373334fb485a91a837de0357)
+* chore: set the initial published version to 0.1.0 by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/9117995c56352a7df3317906dfffe68c10274a36)
+
+

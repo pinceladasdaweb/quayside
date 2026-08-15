@@ -94,3 +94,16 @@ Commit messages follow Conventional Commits and are checked by commitlint on
 commit. Branch names start with a type prefix (`feat/`, `fix/`, `chore/`,
 ...) and are checked on push. Identifiers and comments are English-only and
 `enum` is banned — the linter enforces both.
+
+Open pull requests against `development`, not `main`.
+
+## How a release happens
+
+Merging to `main` publishes. The workflow reads the version already on the
+registry, bumps it from the merge commit message, publishes to npm through
+OIDC trusted publishing (no token secret, provenance attached), then writes
+`CHANGELOG.md`, tags `vX.Y.Z` and opens the GitHub release.
+
+The bump follows the commit subject: `BREAKING CHANGE` or `major` for a
+major, `minor` for a minor, anything else for a patch. Commit subjects are
+the release notes, so write them for the person reading them later.
