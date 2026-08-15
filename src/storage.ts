@@ -18,7 +18,6 @@ export type Outcome =
   | { status: 'failed', error: string }
 
 export interface StoredRecord {
-  key: string
   token: string
   status: RecordStatus
   fingerprint?: string

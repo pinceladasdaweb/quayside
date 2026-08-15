@@ -24,9 +24,12 @@ const outcome = await kernel.handle(requestFacts, runDownstream)
 
 `runDownstream` runs the rest of the pipeline and resolves with a
 `CapturedHttpResponse` — or `null` when the response must be served without
-being cached. Two helpers do the heavy lifting: `kernel.cacheableBody(data)`
-applies the UTF-8 and `maxBodyBytes` gates, and `kernel.selectHeaders(get)`
-collects the replay-relevant headers.
+being cached. Three helpers do the heavy lifting: `kernel.cacheableBody(data)`
+applies the UTF-8 and `maxBodyBytes` gates, `kernel.selectHeaders(get)`
+collects the replay-relevant headers, and `kernel.handles(method, key)`
+answers whether this request gets anything but a pass-through — adapters
+that must buffer the request body to fingerprint it call it first, so an
+unprotected method or a keyless request never pays for the read.
 
 ## Worked example: Koa
 
@@ -93,3 +96,10 @@ kernel and behave identically to the shipped adapters.
 - [ ] Frameworks whose pipeline cannot be wrapped in one function (hook
   models like Fastify) can bridge the kernel's continuation with a deferred:
   see `src/fastify/index.ts`
+- [ ] If you settle that deferred from a lifecycle event rather than from
+  the response hook, settle it **only for a response that finished**. A
+  connection that dies mid-handler says nothing about the handler, which
+  keeps running — resolving there releases the record while the work is
+  still in flight, and the client's next retry executes it a second time.
+  Leaving the record locked costs a bounded `lockTtl` of 409s; releasing it
+  early costs the guarantee

@@ -52,7 +52,6 @@ function mapRow (key: string, row: Record<string, unknown>): StoredRecord {
     throw new Error(`corrupt idempotency record under key "${key}"`)
   }
   const record: StoredRecord = {
-    key,
     token: String(row.token),
     status: status as RecordStatus,
     storedAt: Number(row.stored_at),

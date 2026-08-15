@@ -30,7 +30,6 @@ export class MemoryStorage implements IdempotencyStorage {
     const existing = this.lookup(record.key)
     if (existing !== undefined) return { ...existing }
     this.records.set(record.key, {
-      key: record.key,
       token: record.token,
       status: RECORD_STATUS.inProgress,
       fingerprint: record.fingerprint,

@@ -334,8 +334,6 @@ export interface StoredRecord {
     // (undocumented)
     fingerprint?: string;
     // (undocumented)
-    key: string;
-    // (undocumented)
     result?: string;
     // (undocumented)
     status: RecordStatus;

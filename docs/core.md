@@ -6,12 +6,10 @@ contract suite against real servers.
 
 ## The state machine
 
-```
-                    ┌──────────────┐
-   execute(key) ──▶ │  IN_PROGRESS │──── fn resolves ────▶ COMPLETED (result stored, resultTtl)
-                    │  (lockTtl)   │──── fn rejects ─────▶ record deleted → retry allowed *
-                    └──────────────┘──── process crash ──▶ lock expires → retry allowed
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/atomic-write-lock-dark.svg">
+  <img src="assets/atomic-write-lock.svg" alt="State machine: execute(key) creates an IN_PROGRESS record with a single atomic create-if-absent write, bounded by lockTtl — that write is the lock. The record then either completes and is replayed for resultTtl, or the key is freed again when the function rejects or the lock expires. Every exit is fenced: a holder that lost its lock gets FencingError and can never overwrite the new holder's result.">
+</picture>
 
 - The `IN_PROGRESS` record is written atomically (create-if-absent) before
   `fn` runs. The atomic write *is* the lock.
@@ -19,8 +17,9 @@ contract suite against real servers.
   and `extend` are validated against it *inside the storage* — a holder that
   lost its lock gets `FencingError` and can never overwrite a newer
   execution. This is what makes long GC pauses and expired locks safe.
-- \* With `persistFailures: true`, rejection transitions to `FAILED` instead
-  of deleting: the error is serialized and replayed on later calls.
+- The diagram shows the default. With `persistFailures: true`, a rejection
+  transitions to `FAILED` instead of deleting the record: the error is
+  serialized and replayed on later calls, so the key is not free again.
 
 ### The execution context
 
@@ -101,10 +100,17 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    remaining `waitTimeout`). Storages that implement the optional
    `waitForChange(key, timeoutMs)` cut the sleep short on change
    notifications — the Redis adapter uses keyspace events; correctness
-   never depends on the notification arriving.
+   never depends on the notification arriving. A channel that throws,
+   rejects or hands back something that is not a promise falls back to the
+   plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the
    waiter **takes over**: it attempts a fresh acquisition and executes.
 4. `WaitTimeoutError` when `waitTimeout` elapses first.
+
+The fingerprint is re-checked on every poll, not just at acquisition: a
+holder's lock can expire mid-wait and another payload take the key over,
+and that outcome is not the waiter's to replay. It gets
+`IdempotencyKeyReuseError`, exactly as if it had arrived second.
 
 ## Failure replay fidelity
 

@@ -3,6 +3,7 @@ dist/
 package-lock.json
 reports/
 .stryker-tmp/
+stryker-output-*.json
 coverage/
 temp/
 *.log
