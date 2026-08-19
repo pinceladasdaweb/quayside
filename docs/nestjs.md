@@ -87,9 +87,25 @@ configured header), `fingerprint` (function over the request or `false`;
 default is the request body), `ttl` (per-route `resultTtl` override) and
 `enforce`.
 
-Handler exceptions are not cached: a failed request can always be retried
-(unless the instance was configured with `persistFailures`). Works on both
-the Express and the Fastify platform adapters.
+Handler exceptions are not cached: a failed request can always be retried.
+With `persistFailures` configured, what persists follows the exception's
+own declaration:
+
+| The handler throws | Under `persistFailures` |
+|---|---|
+| `HttpException` with a 4xx status | Persisted and replayed: the status declares a deterministic client failure, and a retry of the same key answers exactly what the first attempt answered |
+| `HttpException` with a 5xx status | Never persisted: a declared server error is transient by definition, so the retry re-executes under a fresh lock (the same rule the HTTP kernel applies to 5xx responses) |
+| A plain `Error` | Persisted and replayed: it declares nothing, so the flag you opted into is the ruling intent — `persistFailures` means failures in your domain are deterministic |
+
+The practical advice hiding in that table: give business failures their
+status. A declined card thrown as `new HttpException(..., 402)` gets
+deterministic replay *and* tells the client the truth; thrown as a plain
+`Error` it still replays, but reaches the client as a `500`. And if a
+plain-error failure was in fact transient (a bug since fixed, a dead
+dependency), `invalidate(key)` clears the stored record without waiting
+out the result TTL.
+
+Works on both the Express and the Fastify platform adapters.
 
 A complete runnable application lives in
 [examples/nestjs.ts](../examples/nestjs.ts).
