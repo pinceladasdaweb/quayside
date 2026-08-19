@@ -7,6 +7,9 @@ import { setTimeout as sleep } from 'node:timers/promises'
 // private copy.
 import { FencingError, RECORD_STATUS } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
+// Plain shared constants carry no identity requirement, so unlike the
+// errors above they may come straight from the module that defines them.
+import { MAX_ACQUIRE_ATTEMPTS, VALID_STATUS } from '../storage'
 
 /**
  * Minimal ioredis-shaped command surface. Structural on purpose: any
@@ -75,11 +78,11 @@ interface WireRecord {
 const FENCED_HEADER = `local current = redis.call('GET', KEYS[1])
 if not current then return 0 end
 local record = cjson.decode(current)
-if record.token ~= ARGV[1] or record.status ~= 'in-progress' then return 0 end`
+if record.token ~= ARGV[1] or record.status ~= '${RECORD_STATUS.inProgress}' then return 0 end`
 
 const COMPLETE_SCRIPT = `${FENCED_HEADER}
 record.status = ARGV[2]
-if ARGV[2] == 'completed' then record.result = ARGV[3] else record.error = ARGV[3] end
+if ARGV[2] == '${RECORD_STATUS.completed}' then record.result = ARGV[3] else record.error = ARGV[3] end
 record.expiresAt = ARGV[4]
 redis.call('SET', KEYS[1], cjson.encode(record), 'PX', ARGV[5])
 return 1`
@@ -99,8 +102,6 @@ const COMPLETE_SHA = sha1(COMPLETE_SCRIPT)
 const RELEASE_SHA = sha1(RELEASE_SCRIPT)
 const EXTEND_SHA = sha1(EXTEND_SCRIPT)
 
-const VALID_STATUS = new Set<string>(Object.values(RECORD_STATUS))
-const MAX_ACQUIRE_ATTEMPTS = 5
 // How long a keyspace subscription outlives its last waiter. Longer than
 // the wait loop's polling backoff, so consecutive polls reuse it.
 const SUBSCRIPTION_LINGER_MS = 5_000

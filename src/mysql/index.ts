@@ -1,5 +1,5 @@
-import type { SqlRunner, SqlStatements } from '../sql/core'
-import { SqlStorageCore, assertSafeTableName } from '../sql/core'
+import type { SqlDialect, SqlRunner } from '../sql/core'
+import { SqlStorageCore, assertSafeTableName, buildStatements } from '../sql/core'
 
 export type { SqlRunResult, SqlRunner, SqlStatements } from '../sql/core'
 
@@ -37,18 +37,9 @@ export function mysqlMigration (tableName: string = DEFAULT_TABLE): string {
 )`
 }
 
-function statementsFor (table: string): SqlStatements {
-  return {
-    insert: `INSERT IGNORE INTO ${table} (record_key, token, status, fingerprint, stored_at, expires_at) VALUES (?, ?, 'in-progress', ?, ?, ?)`,
-    takeover: `UPDATE ${table} SET token = ?, status = 'in-progress', fingerprint = ?, result = NULL, error = NULL, stored_at = ?, expires_at = ? WHERE record_key = ? AND expires_at <= ?`,
-    select: `SELECT record_key, token, status, fingerprint, result, error, stored_at, expires_at FROM ${table} WHERE record_key = ? AND expires_at > ?`,
-    completeResult: `UPDATE ${table} SET status = 'completed', result = ?, expires_at = ? WHERE record_key = ? AND token = ? AND status = 'in-progress' AND expires_at > ?`,
-    completeError: `UPDATE ${table} SET status = 'failed', error = ?, expires_at = ? WHERE record_key = ? AND token = ? AND status = 'in-progress' AND expires_at > ?`,
-    release: `DELETE FROM ${table} WHERE record_key = ? AND token = ? AND status = 'in-progress' AND expires_at > ?`,
-    extend: `UPDATE ${table} SET expires_at = ? WHERE record_key = ? AND token = ? AND status = 'in-progress' AND expires_at > ?`,
-    remove: `DELETE FROM ${table} WHERE record_key = ?`,
-    sweep: `DELETE FROM ${table} WHERE expires_at <= ?`
-  }
+const MYSQL_DIALECT: SqlDialect = {
+  placeholder: () => '?',
+  insertIfAbsent: (tableAndValues) => `INSERT IGNORE INTO ${tableAndValues}`
 }
 
 /**
@@ -73,7 +64,7 @@ export class MysqlStorage extends SqlStorageCore {
       const header = result as { affectedRows?: number }
       return { affected: header.affectedRows ?? 0, rows: [] }
     }
-    super(run, statementsFor(tableName), options.maxKeyBytes ?? 512)
+    super(run, buildStatements(tableName, MYSQL_DIALECT), options.maxKeyBytes ?? 512)
     this.client = client
     this.tableName = tableName
   }

@@ -6,6 +6,17 @@ export const RECORD_STATUS = {
 
 export type RecordStatus = (typeof RECORD_STATUS)[keyof typeof RECORD_STATUS]
 
+/** The status strings a stored record may carry; anything else is corruption. */
+export const VALID_STATUS: ReadonlySet<string> = new Set(Object.values(RECORD_STATUS))
+
+/**
+ * How many times an acquire may contend before giving up: a record can
+ * expire or vanish between the steps of one attempt, so adapters loop
+ * instead of failing on the first race, bounded so a pathological storage
+ * cannot spin forever.
+ */
+export const MAX_ACQUIRE_ATTEMPTS = 5
+
 export interface PendingRecord {
   key: string
   token: string
