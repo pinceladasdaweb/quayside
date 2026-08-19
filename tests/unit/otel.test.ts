@@ -168,6 +168,22 @@ describe('otel collector', () => {
     assert.equal(hrTimeToMs(executeSpan.startTime), 1_950, 'a stale start would backdate this span to 1000')
   })
 
+  test('a terminal event consumes the recorded start instead of leaking it', async () => {
+    // Same probe as the bypass case: once a terminal event used the start,
+    // a later event carrying the same correlation id must fall back to its
+    // own duration instead of backdating to the stale start.
+    const { exporter, tracer } = tracing()
+    const collector = otelSpans({ tracer })
+    const base = { key: 'k', correlationId: 'c-terminal' } as const
+    collector.onAcquired?.({ ...base, type: 'acquired', timestamp: 1_000 })
+    collector.onCompleted?.({ ...base, type: 'completed', timestamp: 2_000 })
+    collector.onCompleted?.({ ...base, type: 'completed', timestamp: 3_000, durationMs: 50 })
+
+    const spans = exporter.getFinishedSpans().filter((span) => span.name === 'quayside.execute')
+    assert.equal(spans.length, 2)
+    assert.equal(hrTimeToMs(spans[1]!.startTime), 2_950, 'a stale start would backdate this span to 1000')
+  })
+
   test('storage bypasses emit their own span', async () => {
     const { exporter, tracer } = tracing()
     const down: IdempotencyStorage = {
