@@ -87,6 +87,13 @@ configured header), `fingerprint` (function over the request or `false`;
 default is the request body), `ttl` (per-route `resultTtl` override) and
 `enforce`.
 
+On endpoints serving more than one caller, use the `key` extractor to scope
+records to the authenticated principal — a bare header key is shared by
+every caller on the same storage, and replay happens before the route's own
+authorization runs. The request object is what your guards decorated, so
+`request.user` is reachable by casting; the pattern and its rationale live
+in [docs/http.md](http.md#scope-keys-to-the-caller).
+
 Handler exceptions are not cached: a failed request can always be retried.
 With `persistFailures` configured, what persists follows the exception's
 own declaration:

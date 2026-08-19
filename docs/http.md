@@ -54,12 +54,55 @@ app.use(HonoMiddleware(idempotency, { enforce: true }))
 | Option | Default | Meaning |
 |---|---|---|
 | `header` | `'Idempotency-Key'` | Header carrying the key |
+| `key` | header read | Derives the storage key from the request; `undefined` means no key. See [Scope keys to the caller](#scope-keys-to-the-caller) |
 | `methods` | `['POST', 'PATCH']` | Methods the adapter protects |
 | `enforce` | `false` | `true` rejects requests without a key (400); `false` passes them through unprotected |
 | `fingerprint` | `'body'` | `'body'`, `'body-and-path'` or a custom `(request) => unknown` |
 | `maxBodyBytes` | 1 MiB | Largest response body stored for replay |
 | `replayHeaders` | `['content-type', 'location']` | Response headers stored and replayed |
 | `retryAfterSeconds` | `1` | `Retry-After` hint on 409 responses |
+
+## Scope keys to the caller
+
+A bare header key is **shared by every caller** on the same storage and
+namespace: whoever presents `Idempotency-Key: abc123` first owns the record,
+and anyone presenting it later gets the stored response — *before* the route
+handler and whatever authorization lives inside it ever run. With predictable
+keys (order ids, sequential values, ids leaked into logs or support tickets)
+that is a real risk on shared endpoints: another authenticated user replaying
+a victim's response, or planting a key first so the victim's own request
+fails with `422`.
+
+The `key` option closes this: derive the storage key from the caller's
+identity plus the header, and the same header value stops colliding across
+principals. The request facts carry the adapter's native request as `raw`
+(the Express `req`, the Fastify request, the Hono context), so whatever your
+auth middleware attached is in reach:
+
+```ts
+app.use(ExpressMiddleware(idempotency, {
+  key: (request) => {
+    const key = request.header('idempotency-key')
+    const user = (request.raw as { user?: { id: string } }).user?.id
+    if (key === undefined || user === undefined) return undefined
+    // Encode the principal so an id containing ':' cannot alias another
+    // caller's composition ('u:1' + 'x' versus 'u' + '1:x').
+    return `${encodeURIComponent(user)}:${key}`
+  }
+}))
+```
+
+Returning `undefined` means "this request carries no key": it passes through
+unprotected, or answers `400` under `enforce` — so an unauthenticated request
+never shares records with anyone. The extractor must not read `body`: the
+Hono adapter derives the key before buffering the request, precisely so
+keyless requests never pay for a body nobody will fingerprint.
+
+On NestJS the same pattern goes through the decorator's own hook:
+`@Idempotent({ key: (request) => ... })` receives the request object, and an
+auth guard's `request.user` is reachable by casting. Scope keys per principal
+whenever an endpoint serves more than one caller; leave the plain header read
+for single-tenant or internal services where every caller is equally trusted.
 
 ## What is cached — and what deliberately is not
 

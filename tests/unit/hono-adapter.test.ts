@@ -227,6 +227,47 @@ describe('hono adapter', () => {
     assert.equal(clones, 1, 'a protected, keyed request is fingerprinted')
   })
 
+  test('a key extractor scopes records by principal and still gates the body read', async () => {
+    // raw is the Hono context, so the extractor reads what auth middleware
+    // stored on it; an extractor that yields no key must also keep the
+    // body-buffering gate closed.
+    const middleware = HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), {
+      key: (request) => {
+        const key = request.header('idempotency-key')
+        const user = (request.raw as { get (name: string): string | undefined }).get('user')
+        return key === undefined || user === undefined ? undefined : `${encodeURIComponent(user)}:${key}`
+      }
+    })
+    let clones = 0
+    let runs = 0
+    const contextFor = (user?: string) => ({
+      get: (name: string) => (name === 'user' ? user : undefined),
+      req: {
+        method: 'POST',
+        path: '/fake',
+        header: (name: string) => (name === 'idempotency-key' ? 'hon-scope' : undefined),
+        raw: {
+          clone () {
+            clones += 1
+            return { text: async () => '{"amount":1}' }
+          }
+        } as unknown as Request
+      },
+      res: new Response('ok', { status: 200 })
+    })
+    const next = async () => { runs += 1 }
+
+    await middleware(contextFor(), next)
+    assert.equal(clones, 0, 'an extractor yielding no key means the body is never read')
+    assert.equal(runs, 1, 'and the chain runs unprotected')
+
+    await middleware(contextFor('alice'), next)
+    const replay = await middleware(contextFor('alice'), next)
+    assert.equal(replay?.headers.get('idempotency-replayed'), 'true', 'the same principal replays')
+    await middleware(contextFor('bob'), next)
+    assert.equal(runs, 3, 'bob executes fresh under the same header key')
+  })
+
   test('enforce answers 400 without ever reading the body', async () => {
     const middleware = HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), { enforce: true })
     let clones = 0

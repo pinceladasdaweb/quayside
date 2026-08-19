@@ -17,6 +17,14 @@ export interface HttpRequestFacts {
   /** The parsed or raw request body, used only for fingerprinting. */
   body?: unknown
   header (name: string): string | undefined
+  /**
+   * The adapter's native request object (the Express req, the Fastify
+   * request, the Hono context), for key and fingerprint extractors that
+   * need framework state the facts cannot carry, such as the authenticated
+   * principal an auth middleware attached. Deliberately unknown: cast to
+   * your framework's shape inside the extractor.
+   */
+  raw?: unknown
 }
 
 /** What replay stores and serves back: status + selected headers + body. */
@@ -34,6 +42,16 @@ export type FingerprintStrategy =
 export interface HttpKernelOptions {
   /** Header carrying the idempotency key. Default: 'Idempotency-Key'. */
   header?: string
+  /**
+   * Derives the storage key from the request, replacing the plain header
+   * read. The primary use is scoping keys to the authenticated principal:
+   * a bare header key is shared by every caller on the same storage, so
+   * whoever presents it first owns the record. Return undefined to treat
+   * the request as carrying no key (passthrough, or 400 under `enforce`).
+   * Must not depend on `body`: adapters that buffer lazily derive the key
+   * before the body is read.
+   */
+  key? (request: HttpRequestFacts): string | undefined
   /** Methods the kernel protects. Default: ['POST', 'PATCH']. */
   methods?: string[]
   /** Reject requests without a key (400) instead of passing through. Default: false. */
@@ -121,6 +139,7 @@ export class HttpIdempotencyKernel {
   private readonly methods: Set<string>
   private readonly enforce: boolean
   private readonly fingerprintPayload: (request: HttpRequestFacts) => unknown
+  private readonly keyOf: (request: HttpRequestFacts) => string | undefined
   private readonly replayHeaders: string[]
   private readonly retryAfterSeconds: number
 
@@ -136,6 +155,7 @@ export class HttpIdempotencyKernel {
       : fingerprint === 'body-and-path'
         ? (request) => ({ path: request.path, body: request.body ?? null })
         : (request) => request.body
+    this.keyOf = options.key ?? ((request) => request.header(this.header))
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
     this.replayHeaders = (options.replayHeaders ?? DEFAULT_REPLAY_HEADERS).map((name) => name.toLowerCase())
     this.retryAfterSeconds = options.retryAfterSeconds ?? 1
@@ -155,12 +175,22 @@ export class HttpIdempotencyKernel {
     return this.shouldHandle(method) && key !== undefined && key !== ''
   }
 
+  /**
+   * The storage key this request executes under: the configured extractor,
+   * or the plain header read. Adapters that gate work before calling
+   * handle() derive the key here so both paths agree; the facts may carry
+   * no body yet at that point, which is why extractors must not read it.
+   */
+  keyFor (request: HttpRequestFacts): string | undefined {
+    return this.keyOf(request)
+  }
+
   async handle (
     request: HttpRequestFacts,
     runDownstream: () => Promise<CapturedHttpResponse | null>
   ): Promise<KernelOutcome> {
     if (!this.shouldHandle(request.method)) return { kind: 'passthrough' }
-    const key = request.header(this.header)
+    const key = this.keyOf(request)
     if (key === undefined || key === '') {
       if (!this.enforce) return { kind: 'passthrough' }
       return {

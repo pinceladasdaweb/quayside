@@ -98,7 +98,8 @@ export function ExpressMiddleware (
         method: req.method,
         path: req.path,
         body: req.body,
-        header: (name) => headerValue(req.headers[name])
+        header: (name) => headerValue(req.headers[name]),
+        raw: req
       },
       () => captureResponse(kernel, res, next)
     ).then((outcome) => {
