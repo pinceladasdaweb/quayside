@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 1.1.1 (2026-08-19)
+
+* chore: update dev dependencies by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/25f655725990c53b5156370a39691a0cc2c44068)
+* refactor: resolve the call-removal mutants stryker 10 introduced by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/406b451bafa642b496e73a62ea809f8782e5b44f)
+
+
 ## 1.1.0 (2026-08-15)
 
 * fix: put persisted failures through the configured codec (minor) by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/8e0c819eb9282c4331dd690cb945bba090aab710)
