@@ -50,6 +50,53 @@ describe('http kernel routing', () => {
   })
 })
 
+describe('http kernel key extraction', () => {
+  const scoped: HttpKernelOptions['key'] = (request) => {
+    const key = request.header('idempotency-key')
+    const user = request.header('x-user')
+    return key === undefined || user === undefined
+      ? undefined
+      : `${encodeURIComponent(user)}:${key}`
+  }
+
+  function postAs (user: string | undefined, key = 'k-1'): HttpRequestFacts {
+    const headers: Record<string, string | undefined> = { 'idempotency-key': key, 'x-user': user }
+    return { method: 'POST', path: '/payments', body: { amount: 10 }, header: (name) => headers[name] }
+  }
+
+  test('a key extractor scopes the record: the same header key is not shared across principals', async () => {
+    const kernel = kernelWith({ key: scoped })
+    let calls = 0
+    const run = async () => { calls += 1; return ok(`{"call":${calls}}`) }
+
+    await kernel.handle(postAs('alice'), run)
+    const replayed = await kernel.handle(postAs('alice'), run)
+    assert.equal(replayed.kind === 'respond' && replayed.response.body, '{"call":1}', 'the same principal replays')
+
+    const other = await kernel.handle(postAs('bob'), run)
+    assert.deepEqual(other, { kind: 'handled' }, 'another principal with the same header key executes fresh')
+    assert.equal(calls, 2)
+  })
+
+  test('an extractor returning undefined means no key: passthrough, or 400 under enforce', async () => {
+    const relaxed = kernelWith({ key: scoped })
+    assert.deepEqual(await relaxed.handle(postAs(undefined), async () => ok()), { kind: 'passthrough' })
+
+    const strict = kernelWith({ key: scoped, enforce: true })
+    const outcome = await strict.handle(postAs(undefined), async () => ok())
+    assert.equal(outcome.kind === 'respond' && outcome.response.status, 400)
+  })
+
+  test('keyFor exposes the extractor to adapters, and defaults to the header read', async () => {
+    const custom = kernelWith({ key: scoped })
+    assert.equal(custom.keyFor(postAs('alice', 'abc')), 'alice:abc')
+    assert.equal(custom.keyFor(postAs(undefined)), undefined)
+
+    const plain = kernelWith()
+    assert.equal(plain.keyFor(post({ key: 'abc' })), 'abc')
+  })
+})
+
 describe('http kernel replay', () => {
   test('first execution is handled downstream, replay serves status, headers, body and the marker', async () => {
     const kernel = kernelWith()

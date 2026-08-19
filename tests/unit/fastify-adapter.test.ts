@@ -49,6 +49,47 @@ async function post (path: string, key: string | undefined, body: unknown) {
 }
 
 describe('fastify adapter', () => {
+  test('a key extractor reaches the native request and scopes records by principal', async () => {
+    const scoped = Fastify()
+    scoped.addHook('onRequest', async (request) => {
+      const user = request.headers['x-user']
+      if (typeof user === 'string') (request as unknown as { user: { id: string } }).user = { id: user }
+    })
+    await scoped.register(FastifyPlugin(new Idempotency({ storage: new MemoryStorage() }), {
+      key: (request) => {
+        const key = request.header('idempotency-key')
+        const user = (request.raw as { user?: { id: string } }).user?.id
+        return key === undefined || user === undefined ? undefined : `${encodeURIComponent(user)}:${key}`
+      }
+    }) as never)
+    let count = 0
+    scoped.post('/scoped', async (_request, reply) => {
+      count += 1
+      return reply.status(201).send({ call: count })
+    })
+    await scoped.ready()
+
+    const send = async (user?: string) => scoped.inject({
+      method: 'POST',
+      url: '/scoped',
+      headers: { 'idempotency-key': 'shared-key', ...(user === undefined ? {} : { 'x-user': user }) },
+      payload: { amount: 10 }
+    })
+
+    const alice = await send('alice')
+    const aliceRetry = await send('alice')
+    assert.deepEqual(alice.json(), { call: 1 })
+    assert.deepEqual(aliceRetry.json(), { call: 1 }, 'the same principal replays')
+    assert.equal(aliceRetry.headers['idempotency-replayed'], 'true')
+
+    const bob = await send('bob')
+    assert.deepEqual(bob.json(), { call: 2 }, 'another principal with the same header key executes fresh')
+
+    const anonymous = await send()
+    assert.deepEqual(anonymous.json(), { call: 3 }, 'no principal means no key: unprotected passthrough')
+    await scoped.close()
+  })
+
   test('replays status, location and body with the replay marker', async () => {
     const first = await post('/payments', 'fas-1', { amount: 10 })
     assert.equal(first.statusCode, 201)

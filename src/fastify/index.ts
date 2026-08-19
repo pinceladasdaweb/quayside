@@ -106,7 +106,8 @@ export function FastifyPlugin (
           method: request.method,
           path: pathOf(request.url),
           body: request.body,
-          header: (name) => headerValue(request.headers[name])
+          header: (name) => headerValue(request.headers[name]),
+          raw: request
         },
         () => {
           proceed()

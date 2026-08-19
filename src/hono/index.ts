@@ -69,19 +69,23 @@ export function HonoMiddleware (
 ): (c: HonoContextLike, next: HonoNext) => Promise<Response | undefined> {
   const kernel = new HttpIdempotencyKernel(idempotency, options)
   return async function quaysideIdempotency (c, next) {
+    // The facts are built before the body is read, so the key extractor
+    // (which must not depend on the body) can gate the buffering below.
+    const facts = {
+      method: c.req.method,
+      path: c.req.path,
+      body: undefined as unknown,
+      header: (name: string) => c.req.header(name),
+      raw: c
+    }
     // Fingerprinting is the only reason to read the body, and reading it
     // clones and buffers the whole request: requests the kernel would only
     // wave through never pay for it.
-    const body = kernel.handles(c.req.method, c.req.header(kernel.header))
-      ? await requestBody(c.req.raw)
-      : undefined
+    if (kernel.handles(c.req.method, kernel.keyFor(facts))) {
+      facts.body = await requestBody(c.req.raw)
+    }
     const outcome = await kernel.handle(
-      {
-        method: c.req.method,
-        path: c.req.path,
-        body,
-        header: (name) => c.req.header(name)
-      },
+      facts,
       async () => {
         await next()
         return captureWebResponse(kernel, c.res)
