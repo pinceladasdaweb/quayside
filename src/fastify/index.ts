@@ -118,8 +118,9 @@ export function FastifyPlugin (
           return capture
         }
       )
-      outcome.catch(() => {}) // observed again in onSend
-
+      // The race also gives outcome its rejection handler: when onSend never
+      // runs, nothing else observes it, and without a reaction attached an
+      // abandoned request would surface as an unhandled rejection.
       const first = await Promise.race([proceeded, outcome])
       if (first === 'execute') {
         pending.set(request as object, { resolveCapture, outcome })
@@ -134,9 +135,10 @@ export function FastifyPlugin (
     })
 
     instance.addHook('onSend', async (request, reply, payload) => {
+      // No cleanup: pending is a WeakMap, so entries die with the request,
+      // and re-resolving a settled capture on a repeated onSend is a no-op.
       const entry = pending.get(request as object)
       if (entry === undefined) return payload
-      pending.delete(request as object)
       entry.resolveCapture(capturedFrom(kernel, reply, payload))
       try {
         // The record is committed before the response leaves the server.
