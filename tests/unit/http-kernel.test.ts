@@ -75,6 +75,8 @@ describe('http kernel replay', () => {
     await kernel.handle(post({ body: { amount: 10 } }), async () => ok())
     const outcome = await kernel.handle(post({ body: { amount: 99 } }), async () => ok())
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 422)
+    // Retrying a reuse can never succeed, so hinting a retry would lie.
+    assert.ok(outcome.kind === 'respond' && !('retry-after' in outcome.response.headers))
   })
 
   test('body-and-path fingerprinting distinguishes the same body on another path', async () => {
@@ -135,6 +137,8 @@ describe('http kernel conflicts and failures', () => {
     const kernel = new HttpIdempotencyKernel(idempotency)
     const outcome = await kernel.handle(post(), async () => ok())
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 503)
+    // Retry-After is the 409's hint: an outage makes no timing promise.
+    assert.ok(outcome.kind === 'respond' && !('retry-after' in outcome.response.headers))
   })
 
   test('application errors from downstream are rethrown for the framework to handle', async () => {
@@ -309,6 +313,7 @@ describe('http kernel configuration', () => {
       const body = JSON.parse(outcome.response.body) as { error: string, detail: string }
       assert.equal(body.error, 'IDEMPOTENCY_KEY_INVALID')
       assert.match(body.detail, /16/, 'the client is told the limit it broke')
+      assert.ok(!('retry-after' in outcome.response.headers), 'a rejected key does not improve by retrying')
     }
     assert.equal(calls, 0, 'the handler never ran')
   })

@@ -319,7 +319,9 @@ describe('nestjs interceptor glue', () => {
     const { HttpException } = await import('@nestjs/common')
     const options = { storage: new MemoryStorage(), maxKeyLength: 16 }
     const interceptor = new IdempotencyInterceptor(new Idempotency(options), options)
-    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, {}, decorated())
+    const headersSet: Record<string, string> = {}
+    const response = { setHeader: (name: string, value: string) => { headersSet[name] = value } }
+    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, response, decorated())
 
     await assert.rejects(intercept(interceptor, context), (error: unknown) => {
       assert.ok(error instanceof HttpException)
@@ -329,6 +331,8 @@ describe('nestjs interceptor glue', () => {
       assert.match(body.message, /16/)
       return true
     })
+    // Retry-After belongs to the 409 alone: a rejected key never improves.
+    assert.ok(!('retry-after' in headersSet))
   })
 
   test('only a complete http shape is rebuilt as an HttpException', async () => {
