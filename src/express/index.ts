@@ -1,5 +1,5 @@
 import type { Idempotency } from '../index'
-import { HttpIdempotencyKernel } from '../http/kernel'
+import { HttpIdempotencyKernel, headerValue } from '../http/kernel'
 import type { CapturedHttpResponse, HttpKernelOptions } from '../http/kernel'
 
 export type { CapturedHttpResponse, FingerprintStrategy, HttpKernelOptions, HttpRequestFacts } from '../http/kernel'
@@ -22,11 +22,6 @@ export interface ExpressResponseLike {
 }
 
 export type ExpressNext = (error?: unknown) => void
-
-function headerValue (value: unknown): string | undefined {
-  if (Array.isArray(value)) return headerValue(value[0])
-  return typeof value === 'string' ? value : undefined
-}
 
 // Response capture is the framework-specific part: Express writes through
 // res.write/res.end (res.send and res.json funnel into them), so both are

@@ -13,15 +13,9 @@ import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } fr
 // paths: error identity (instanceof) must hold against errors thrown by the
 // user's Idempotency instance, so the build maps '../index' onto the shipped
 // core bundle instead of inlining a private copy.
-import {
-  ConcurrentExecutionError,
-  Idempotency,
-  IdempotencyKeyInvalidError,
-  IdempotencyKeyReuseError,
-  QuaysideError,
-  WaitTimeoutError
-} from '../index'
+import { Idempotency } from '../index'
 import type { Duration, IdempotencyOptions } from '../index'
+import { headerValue, httpErrorFacts } from '../http/kernel'
 
 /** Injection token for the Idempotency instance built by QuaysideModule. */
 export const QUAYSIDE_IDEMPOTENCY = 'QUAYSIDE_IDEMPOTENCY'
@@ -64,13 +58,6 @@ export interface QuaysideModuleAsyncOptions {
 /** Marks a handler as idempotent; enforced by the IdempotencyInterceptor. */
 export function Idempotent (options: IdempotentOptions = {}): MethodDecorator {
   return SetMetadata(IDEMPOTENT_METADATA, options)
-}
-
-// An empty-string header falls out at the caller's key check, together with
-// the absent-key case.
-function headerValue (value: unknown): string | undefined {
-  if (Array.isArray(value)) return headerValue(value[0])
-  return typeof value === 'string' ? value : undefined
 }
 
 // A persisted failure replays as a reconstruction: the own fields of an
@@ -139,7 +126,22 @@ export class IdempotencyInterceptor implements NestInterceptor {
     try {
       const outcome = await this.idempotency.executeWithMetadata(
         { key, payload, resultTtl: options.ttl },
-        async () => lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
+        async (ctx) => {
+          try {
+            return await lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
+          } catch (error) {
+            // The kernel's rule, applied at the value level: a response
+            // that declares a server status is transient by definition and
+            // must never persist as a replayable failure. Under
+            // persistFailures a stored 500 would answer every retry until
+            // the result TTL ran out; releasing instead lets the retry
+            // re-execute under a fresh lock. A plain thrown error keeps the
+            // core persistFailures contract (domain failures replay): only
+            // an exception that names its own server status is overruled.
+            if (error instanceof HttpException && error.getStatus() >= 500) ctx.doNotStore()
+            throw error
+          }
+        }
       )
       if (outcome.replayed) setResponseHeader(response, 'idempotency-replayed', 'true')
       return outcome.value
@@ -149,28 +151,12 @@ export class IdempotencyInterceptor implements NestInterceptor {
   }
 
   private mapError (error: unknown, response: unknown): unknown {
-    if (error instanceof ConcurrentExecutionError || error instanceof WaitTimeoutError) {
-      setResponseHeader(response, 'retry-after', '1')
-      return new HttpException(
-        { statusCode: 409, error: error.code, message: 'another request with this idempotency key is still in progress' },
-        409
-      )
-    }
-    if (error instanceof IdempotencyKeyReuseError) {
-      return new HttpException(
-        { statusCode: 422, error: error.code, message: 'this idempotency key was already used with a different payload' },
-        422
-      )
-    }
-    if (error instanceof IdempotencyKeyInvalidError) {
-      // Client-supplied value, client error: never a 5xx.
-      return new HttpException({ statusCode: 400, error: error.code, message: error.message }, 400)
-    }
-    if (error instanceof QuaysideError) {
-      const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500
-      return new HttpException({ statusCode: status, error: error.code, message: error.message }, status)
-    }
-    return reviveHttpException(error)
+    // The kernel's error table, rendered as Nest's exception shape: what a
+    // client is told cannot depend on which adapter answered.
+    const facts = httpErrorFacts(error)
+    if (facts === null) return reviveHttpException(error)
+    if (facts.retryAfter) setResponseHeader(response, 'retry-after', '1')
+    return new HttpException({ statusCode: facts.status, error: facts.code, message: facts.message }, facts.status)
   }
 }
 
