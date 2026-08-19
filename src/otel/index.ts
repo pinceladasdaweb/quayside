@@ -60,6 +60,7 @@ export function otelSpans (options: OtelSpansOptions = {}): MetricsCollector {
     onReplayed: terminal('replayed'),
     onFailed: terminal('failed'),
     onConflict: instant('quayside.conflict'),
+    onExpiredRecovery: instant('quayside.expired-recovery'),
     onStorageBypass: (event) => {
       // A bypass after a successful acquire is terminal: the completion write
       // failed once the function had already run, so no completed/failed

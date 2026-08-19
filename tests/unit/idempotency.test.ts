@@ -4,6 +4,7 @@ import assert from 'node:assert/strict'
 import { hashCanonical } from '../../src/canonical'
 import {
   ConcurrentExecutionError,
+  FencingError,
   Idempotency,
   IdempotencyKeyReuseError,
   SerializationError,
@@ -215,8 +216,9 @@ describe('Idempotency concurrency', () => {
     assert.ok(warnings.some((message) => message.includes('notification channel failed')))
   })
 
-  test('a waiter takes over after the holder fails', async () => {
-    const idempotency = instance({ onConflict: 'wait' })
+  test('a waiter takes over after the holder fails, and that is not an expired recovery', async () => {
+    const events: string[] = []
+    const idempotency = instance({ onConflict: 'wait', onEvent: (event) => events.push(event.type) })
     const { open, opened } = gate()
     const failing = idempotency.execute('k', async () => {
       await opened
@@ -229,6 +231,36 @@ describe('Idempotency concurrency', () => {
     const outcome = await waiting
     assert.equal(outcome.value, 'recovered')
     assert.equal(outcome.replayed, false)
+    // The holder released its record deliberately; its lock never ran out.
+    assert.ok(!events.includes('expired-recovery'), 'a failure release must not read as a lock expiry')
+  })
+
+  test('a waiter taking over an expired lock emits expired-recovery', async () => {
+    const clock = new ManualClock()
+    const events: string[] = []
+    const idempotency = new Idempotency({
+      storage: new MemoryStorage({ now: () => clock.now() }),
+      clock,
+      onConflict: 'wait',
+      lockTtl: '1s',
+      onEvent: (event) => events.push(event.type)
+    })
+    // A holder that stalls through its whole lease: the waiter's polling
+    // sleeps drive the manual clock past the lock TTL, the record reads as
+    // absent, and the takeover is a recovery, not a hand-off.
+    const { open, opened } = gate()
+    const stalled = idempotency.execute('k', async () => {
+      await opened
+      return 'late'
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(await idempotency.execute('k', async () => 'recovered'), 'recovered')
+    assert.equal(events.filter((type) => type === 'expired-recovery').length, 1)
+
+    // The stalled holder wakes up to find it no longer owns the key: the
+    // fencing token protects the recovered execution from its late write.
+    open()
+    await assert.rejects(stalled, FencingError)
   })
 })
 
