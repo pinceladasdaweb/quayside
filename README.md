@@ -185,8 +185,9 @@ app.use(ExpressMiddleware(idempotency, { enforce: true }))
 - **Faithful replay**: original status + selected headers + body, with `Idempotency-Replayed: true`. A `201` + `Location` replays as `201` + `Location`, never a generic `200`.
 - **Error mapping**: `409` + `Retry-After` while the first request runs, `422` on key reuse with a different payload, `503` fail-closed, optional `400` for missing keys.
 - **Safe caching**: binary, oversized (`maxBodyBytes`, default 1 MiB) and 5xx responses are served but never stored — and the endpoint keeps its concurrency protection on every attempt.
+- **Principal scoping**: a bare header key is shared by every caller on the same storage — on multi-tenant endpoints, derive the key from the authenticated principal with the `key` option (the request facts carry the framework's native request as `raw`), so the same header value never collides across callers.
 
-Options and cacheability rules: [docs/http.md](docs/http.md). Adding another framework is an afternoon of work: [docs/writing-an-adapter.md](docs/writing-an-adapter.md).
+Options, cacheability rules and the key-scoping pattern: [docs/http.md](docs/http.md). Adding another framework is an afternoon of work: [docs/writing-an-adapter.md](docs/writing-an-adapter.md).
 
 ## NestJS
 
