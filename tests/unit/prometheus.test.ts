@@ -44,6 +44,15 @@ describe('prometheus collector', () => {
     assert.ok(sum >= 0.015, `expected the completed duration to include the sleep, got ${sum}`)
   })
 
+  test('counts expired recoveries, with and without a namespace', async () => {
+    const registry = new Registry()
+    const collector = prometheusMetrics({ register: registry })
+    collector.onExpiredRecovery?.({ type: 'expired-recovery', key: 'k', namespace: 'jobs', correlationId: 'c-1', timestamp: 1 })
+    collector.onExpiredRecovery?.({ type: 'expired-recovery', key: 'k', correlationId: 'c-2', timestamp: 2 })
+    assert.equal(await metricValue(registry, 'quayside_expired_recovery_total', { namespace: 'jobs' }), 1)
+    assert.equal(await metricValue(registry, 'quayside_expired_recovery_total', { namespace: '' }), 1)
+  })
+
   test('counts conflicts and storage bypasses', async () => {
     const registry = new Registry()
     const collector = prometheusMetrics({ register: registry, prefix: 'q2_' })

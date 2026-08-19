@@ -131,6 +131,8 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the
    waiter **takes over**: it attempts a fresh acquisition and executes.
+   When the disappearance was the lock running out its TTL rather than the
+   holder releasing on failure, the takeover emits `expired-recovery`.
 4. `WaitTimeoutError` when `waitTimeout` elapses first.
 
 The fingerprint is re-checked on every poll, not just at acquisition: a
@@ -177,7 +179,7 @@ The `correlationId` is stable across all events of one `execute` call.
 | `replayed` | A stored outcome (result or persisted failure) was served |
 | `conflict` | The key was already in progress (before rejecting or waiting) |
 | `failed` | The function failed, the result was unstorable, or the completion write failed |
-| `expired-recovery` | Reserved: acquisition over an expired record (not detectable through the storage contract today) |
+| `expired-recovery` | A waiter observed the holder's lock run out its TTL and took the key over — the signal that holders are dying or stalling mid-execution. Emitted from the wait path only: on direct acquisition an expired record reads as absent by contract, so there is nothing to observe |
 | `storage-bypass` | `onStorageError: 'open'` ran an execution without the guarantee |
 
 `metrics` receives the same events through named methods (`onAcquired`,

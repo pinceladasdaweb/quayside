@@ -4,6 +4,9 @@
 // private copy.
 import { FencingError, RECORD_STATUS } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
+// Plain shared constants carry no identity requirement, so unlike the
+// errors above they may come straight from the module that defines them.
+import { MAX_ACQUIRE_ATTEMPTS, VALID_STATUS } from '../storage'
 
 /**
  * The dialect-specific SQL. Both adapters share one algorithm; only the
@@ -37,8 +40,33 @@ export interface SqlRunResult {
 
 export type SqlRunner = (sql: string, params: unknown[]) => Promise<SqlRunResult>
 
-const VALID_STATUS = new Set<string>(Object.values(RECORD_STATUS))
-const MAX_ACQUIRE_ATTEMPTS = 5
+/**
+ * What actually separates the two supported dialects: the parameter marker
+ * and the insert-if-absent syntax. Everything else is one algorithm and one
+ * set of statements, written once in buildStatements.
+ */
+export interface SqlDialect {
+  /** Positional parameter marker for the 1-based index: '?' or '$1'. */
+  placeholder (index: number): string
+  /** Renders the insert-if-absent form around the shared columns/values body. */
+  insertIfAbsent (tableAndValues: string): string
+}
+
+export function buildStatements (table: string, dialect: SqlDialect): SqlStatements {
+  const p = (index: number): string => dialect.placeholder(index)
+  const inProgress = `'${RECORD_STATUS.inProgress}'`
+  return {
+    insert: dialect.insertIfAbsent(`${table} (record_key, token, status, fingerprint, stored_at, expires_at) VALUES (${p(1)}, ${p(2)}, ${inProgress}, ${p(3)}, ${p(4)}, ${p(5)})`),
+    takeover: `UPDATE ${table} SET token = ${p(1)}, status = ${inProgress}, fingerprint = ${p(2)}, result = NULL, error = NULL, stored_at = ${p(3)}, expires_at = ${p(4)} WHERE record_key = ${p(5)} AND expires_at <= ${p(6)}`,
+    select: `SELECT record_key, token, status, fingerprint, result, error, stored_at, expires_at FROM ${table} WHERE record_key = ${p(1)} AND expires_at > ${p(2)}`,
+    completeResult: `UPDATE ${table} SET status = '${RECORD_STATUS.completed}', result = ${p(1)}, expires_at = ${p(2)} WHERE record_key = ${p(3)} AND token = ${p(4)} AND status = ${inProgress} AND expires_at > ${p(5)}`,
+    completeError: `UPDATE ${table} SET status = '${RECORD_STATUS.failed}', error = ${p(1)}, expires_at = ${p(2)} WHERE record_key = ${p(3)} AND token = ${p(4)} AND status = ${inProgress} AND expires_at > ${p(5)}`,
+    release: `DELETE FROM ${table} WHERE record_key = ${p(1)} AND token = ${p(2)} AND status = ${inProgress} AND expires_at > ${p(3)}`,
+    extend: `UPDATE ${table} SET expires_at = ${p(1)} WHERE record_key = ${p(2)} AND token = ${p(3)} AND status = ${inProgress} AND expires_at > ${p(4)}`,
+    remove: `DELETE FROM ${table} WHERE record_key = ${p(1)}`,
+    sweep: `DELETE FROM ${table} WHERE expires_at <= ${p(1)}`
+  }
+}
 
 export function assertSafeTableName (tableName: string): void {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) {

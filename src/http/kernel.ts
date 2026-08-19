@@ -53,6 +53,50 @@ export type KernelOutcome =
   | { kind: 'handled' }
   | { kind: 'respond', response: CapturedHttpResponse }
 
+/**
+ * Normalizes a framework's header slot to the single string the kernel
+ * reads: node frameworks surface header values as string, string[] or
+ * undefined, and a repeated header reads as its first value.
+ */
+export function headerValue (value: unknown): string | undefined {
+  if (Array.isArray(value)) return headerValue(value[0])
+  return typeof value === 'string' ? value : undefined
+}
+
+/**
+ * The kernel's error policy as data: status, stable code and message for
+ * every quayside error an execution can surface, or null for a foreign
+ * error the adapter must rethrow untouched. One table serves the kernel's
+ * problem responses and the NestJS interceptor's HttpExceptions, so the
+ * adapters cannot drift apart on what a client is told.
+ */
+export interface HttpErrorFacts {
+  status: number
+  code: string
+  message: string
+  /** The response should carry a Retry-After hint (in-progress conflicts). */
+  retryAfter: boolean
+}
+
+export function httpErrorFacts (error: unknown): HttpErrorFacts | null {
+  if (error instanceof ConcurrentExecutionError || error instanceof WaitTimeoutError) {
+    return { status: 409, code: error.code, message: 'another request with this idempotency key is still in progress', retryAfter: true }
+  }
+  if (error instanceof IdempotencyKeyReuseError) {
+    return { status: 422, code: error.code, message: 'this idempotency key was already used with a different payload', retryAfter: false }
+  }
+  if (error instanceof IdempotencyKeyInvalidError) {
+    // The offending value came from the request, so this is a client
+    // error: answering 5xx would blame the server and page someone.
+    return { status: 400, code: error.code, message: error.message, retryAfter: false }
+  }
+  if (error instanceof QuaysideError) {
+    const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500
+    return { status, code: error.code, message: error.message, retryAfter: false }
+  }
+  return null
+}
+
 // A non-streaming decode keeps no state between calls, so one decoder
 // serves every response instead of one per captured body.
 const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true })
@@ -168,30 +212,13 @@ export class HttpIdempotencyKernel {
         process.emitWarning(`quayside could not settle the record for "${key}" after the response was sent: ${String(error)}`)
         return { kind: 'handled' }
       }
-      if (error instanceof ConcurrentExecutionError || error instanceof WaitTimeoutError) {
-        return {
-          kind: 'respond',
-          response: this.problem(409, error.code, 'another request with this idempotency key is still in progress', {
-            'retry-after': String(this.retryAfterSeconds)
-          })
-        }
+      const facts = httpErrorFacts(error)
+      if (facts === null) throw error
+      return {
+        kind: 'respond',
+        response: this.problem(facts.status, facts.code, facts.message,
+          facts.retryAfter ? { 'retry-after': String(this.retryAfterSeconds) } : {})
       }
-      if (error instanceof IdempotencyKeyReuseError) {
-        return {
-          kind: 'respond',
-          response: this.problem(422, error.code, 'this idempotency key was already used with a different payload')
-        }
-      }
-      if (error instanceof IdempotencyKeyInvalidError) {
-        // The offending value came from the request, so this is a client
-        // error: answering 5xx would blame the server and page someone.
-        return { kind: 'respond', response: this.problem(400, error.code, error.message) }
-      }
-      if (error instanceof QuaysideError) {
-        const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500
-        return { kind: 'respond', response: this.problem(status, error.code, error.message) }
-      }
-      throw error
     }
   }
 

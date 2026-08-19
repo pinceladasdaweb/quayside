@@ -196,6 +196,31 @@ describe('the wait loop under a manual clock', () => {
     assert.deepEqual(clock.sleeps, [], 'the first poll already found the outcome')
   })
 
+  test('a lock observed exactly at its expiry boundary recovers as expired', async () => {
+    // The storages treat expiresAt <= now as expired, so the engine has to
+    // agree at the boundary: a record last seen with expiresAt equal to the
+    // clock is an expiry, not a deliberate release.
+    const clock = new ManualClock(9_000)
+    const events: string[] = []
+    let acquires = 0
+    const storage: IdempotencyStorage = {
+      acquire: async () => {
+        acquires += 1
+        if (acquires > 1) return null
+        return { token: 'holder', status: 'in-progress', storedAt: clock.now() - 100, expiresAt: clock.now() }
+      },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage, clock, onConflict: 'wait', onEvent: (event) => events.push(event.type) })
+
+    assert.equal(await idempotency.execute('k', async () => 'recovered'), 'recovered')
+    assert.ok(events.includes('expired-recovery'), 'expiresAt equal to now is an expiry, not a hand-off')
+  })
+
   test('a working notification channel replaces the polling sleeps entirely', async () => {
     const clock = new ManualClock()
     let notifies = 0

@@ -282,11 +282,46 @@ describe('nestjs interceptor glue', () => {
     )
   })
 
+  test('a server-status HttpException is never persisted as a replayable failure', async () => {
+    // The kernel never caches a 5xx response; the value-level interceptor
+    // has to agree. A stored 500 would answer every retry until the result
+    // TTL ran out, on exactly the requests persistFailures exists for.
+    const { HttpException } = await import('@nestjs/common')
+    const { lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const interceptor = new IdempotencyInterceptor(idempotency, { storage, persistFailures: true })
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': 'nest-500' }, {}, handler)
+
+    // Status 500 exactly: the boundary of "server error" is inclusive.
+    const { of } = await import('rxjs')
+    let attempts = 0
+    const flaky = {
+      handle: () => {
+        attempts += 1
+        if (attempts === 1) throw new HttpException({ statusCode: 500, message: 'upstream timeout' }, 500)
+        return of('recovered')
+      }
+    }
+    await assert.rejects(
+      lastValueFrom(interceptor.intercept(context as never, flaky)),
+      (error: unknown) => error instanceof HttpException && error.getStatus() === 500
+    )
+
+    // The retry re-executes under a fresh lock instead of replaying the 500.
+    const retried = await lastValueFrom(interceptor.intercept(context as never, flaky))
+    assert.equal(retried, 'recovered', 'a transient 500 must not become the stored answer')
+    assert.equal(attempts, 2, 'the retry ran the handler again')
+  })
+
   test('an oversized key answers 400, not 500', async () => {
     const { HttpException } = await import('@nestjs/common')
     const options = { storage: new MemoryStorage(), maxKeyLength: 16 }
     const interceptor = new IdempotencyInterceptor(new Idempotency(options), options)
-    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, {}, decorated())
+    const headersSet: Record<string, string> = {}
+    const response = { setHeader: (name: string, value: string) => { headersSet[name] = value } }
+    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, response, decorated())
 
     await assert.rejects(intercept(interceptor, context), (error: unknown) => {
       assert.ok(error instanceof HttpException)
@@ -296,6 +331,8 @@ describe('nestjs interceptor glue', () => {
       assert.match(body.message, /16/)
       return true
     })
+    // Retry-After belongs to the 409 alone: a rejected key never improves.
+    assert.ok(!('retry-after' in headersSet))
   })
 
   test('only a complete http shape is rebuilt as an HttpException', async () => {

@@ -24,6 +24,7 @@ Peer dependency: `prom-client`. Exposed metrics (default prefix `quayside_`):
 | `quayside_executions_total` | counter | `outcome`, `namespace` | Terminal outcomes: `completed`, `replayed`, `failed` |
 | `quayside_conflicts_total` | counter | `namespace` | Calls that found their key already executing |
 | `quayside_storage_bypass_total` | counter | `namespace` | Unguarded executions (`onStorageError: 'open'`) — alert on this |
+| `quayside_expired_recovery_total` | counter | `namespace` | Waiters that took a key over after the holder's lock expired — holders dying or stalling mid-execution |
 | `quayside_execution_duration_seconds` | histogram | `outcome`, `namespace` | Time from `execute()` to the terminal outcome; `replayed` durations approximate the time a waiter spent blocked |
 
 Replay ratio in PromQL:
@@ -52,7 +53,7 @@ Peer dependency: `@opentelemetry/api` (bring your own SDK setup). Spans:
   `quayside.outcome` and `quayside.replayed`; `failed` sets the span status
   to error. The span is created at the terminal event with a backdated
   start, so a crashed process never leaks an open span.
-- `quayside.conflict` and `quayside.storage-bypass` — instant spans.
+- `quayside.conflict`, `quayside.expired-recovery` and `quayside.storage-bypass` — instant spans.
 
 Events are emitted synchronously inside `execute()`, so spans parent to
 whatever span is active at the call site. If a breakwater policy wraps the

@@ -184,6 +184,13 @@ describe('otel collector', () => {
     assert.equal(hrTimeToMs(spans[1]!.startTime), 2_950, 'a stale start would backdate this span to 1000')
   })
 
+  test('expired recoveries emit their own span', async () => {
+    const { exporter, tracer } = tracing()
+    const collector = otelSpans({ tracer })
+    collector.onExpiredRecovery?.({ type: 'expired-recovery', key: 'k', correlationId: 'c-exp', timestamp: 1_000 })
+    assert.ok(exporter.getFinishedSpans().some((span) => span.name === 'quayside.expired-recovery'))
+  })
+
   test('storage bypasses emit their own span', async () => {
     const { exporter, tracer } = tracing()
     const down: IdempotencyStorage = {

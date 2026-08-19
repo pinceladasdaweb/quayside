@@ -310,7 +310,7 @@ export class Idempotency {
     if (this.onConflict === 'reject') {
       throw new ConcurrentExecutionError(key)
     }
-    return this.waitForOutcome(input, storageKey, key, fingerprint, fn, correlationId, startedAt)
+    return this.waitForOutcome(input, storageKey, key, fingerprint, fn, correlationId, startedAt, existing)
   }
 
   private async runOwned<T> (
@@ -410,7 +410,8 @@ export class Idempotency {
     fingerprint: string | undefined,
     fn: ExecuteFunction<T>,
     correlationId: string,
-    startedAt: number
+    startedAt: number,
+    observed: StoredRecord
   ): Promise<ExecutionResult<T>> {
     const deadline = this.clock.now() + this.waitTimeoutMs
     const notify = this.storage.waitForChange?.bind(this.storage)
@@ -420,8 +421,17 @@ export class Idempotency {
       const record = await this.storageCall(() => this.storage.get(storageKey))
       if (record === null) {
         // The holder failed (record deleted) or its lock expired: take over.
+        // Which one it was is worth telling apart: a lock that ran out its
+        // TTL means a holder died or stalled mid-execution, the signal
+        // dashboards watch for. The storage cannot report it (expired reads
+        // as absent by contract), but this waiter saw the record before it
+        // vanished and knows whether its lease had run out.
+        if (observed.expiresAt <= this.clock.now()) {
+          this.emit('expired-recovery', key, correlationId)
+        }
         return this.run(input, fn, correlationId, startedAt)
       }
+      observed = record
       // The record under the key can change identity while we wait: the
       // holder's lock may expire and another payload take the key over. Its
       // outcome is not ours to replay, exactly as in the acquire path.
