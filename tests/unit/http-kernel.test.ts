@@ -87,6 +87,26 @@ describe('http kernel key extraction', () => {
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 400)
   })
 
+  test('the enforce 400 names the header only when the header is what was read', async () => {
+    // Under a custom extractor the missing ingredient may be a principal,
+    // not the header: telling that client to send a header it already sent
+    // loops it forever.
+    const plain = kernelWith({ enforce: true })
+    const plainOutcome = await plain.handle({ ...post(), header: () => undefined }, async () => ok())
+    const plainProblem = JSON.parse(plainOutcome.kind === 'respond' ? plainOutcome.response.body : '{}') as { error: string, detail: string }
+    assert.equal(plainProblem.error, 'IDEMPOTENCY_KEY_REQUIRED')
+    assert.match(plainProblem.detail, /idempotency-key header is required/)
+    assert.match(plainProblem.detail, /POST/)
+
+    const derived = kernelWith({ enforce: true, key: scoped })
+    const derivedOutcome = await derived.handle(postAs(undefined), async () => ok())
+    const derivedProblem = JSON.parse(derivedOutcome.kind === 'respond' ? derivedOutcome.response.body : '{}') as { error: string, detail: string }
+    assert.equal(derivedProblem.error, 'IDEMPOTENCY_KEY_REQUIRED', 'the code is stable across both')
+    assert.doesNotMatch(derivedProblem.detail, /header is required/, 'the header is not blamed for what an extractor declined')
+    assert.match(derivedProblem.detail, /no idempotency key could be derived/)
+    assert.match(derivedProblem.detail, /POST/, 'and the method still scopes it')
+  })
+
   test('keyFor exposes the extractor to adapters, and defaults to the header read', async () => {
     const custom = kernelWith({ key: scoped })
     assert.equal(custom.keyFor(postAs('alice', 'abc')), 'alice:abc')
@@ -94,6 +114,116 @@ describe('http kernel key extraction', () => {
 
     const plain = kernelWith()
     assert.equal(plain.keyFor(post({ key: 'abc' })), 'abc')
+  })
+})
+
+describe('http kernel unparsed-body warning', () => {
+  function bodyless (headers: Record<string, string | undefined>): HttpRequestFacts {
+    return { method: 'POST', path: '/p', body: undefined, header: (name) => headers[name] }
+  }
+
+  test('a declared body arriving unparsed is reported once per kernel', async () => {
+    // The reuse guard silently degrades to key-only matching when nobody
+    // parsed the body; the misconfiguration must be loud, not per-request.
+    const kernel = kernelWith()
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(bodyless({ 'idempotency-key': 'w-1', 'content-length': '18' }), async () => ok())
+      await kernel.handle(bodyless({ 'idempotency-key': 'w-2', 'content-length': '18' }), async () => ok())
+    })
+    assert.equal(warnings.length, 1, 'one report per kernel, not per request')
+    assert.match(warnings[0] ?? '', /received undefined/, 'the warning names the shape it received')
+    assert.match(warnings[0] ?? '', /body parser/, 'the warning names the likely fix')
+    assert.match(warnings[0] ?? '', /idempotency-key/, 'and the header it protects')
+    assert.match(warnings[0] ?? '', /a POST request/, 'and the method, in its canonical casing')
+
+    const chunked = kernelWith()
+    const chunkedWarnings = await warningsDuring(async () => {
+      await chunked.handle(bodyless({ 'idempotency-key': 'w-3', 'transfer-encoding': 'chunked' }), async () => ok())
+    })
+    assert.equal(chunkedWarnings.length, 1, 'a chunked body has no content-length and still warns')
+  })
+
+  test('an empty parsed body against a longer declared length is reported too', async () => {
+    // What express.json() leaves behind for a content type it declined:
+    // every payload then fingerprints as the same constant obj:{}, the
+    // same inert guard as an unparsed body, and just as silent before.
+    const kernel = kernelWith()
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: {}, header: (name) => ({ 'idempotency-key': 'e-1', 'content-length': '31' })[name] },
+        async () => ok()
+      )
+    })
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0] ?? '', /an empty object/, 'the warning names what it actually received')
+
+    // An empty array is the same story through a different parser.
+    const arrays = kernelWith()
+    const arrayWarnings = await warningsDuring(async () => {
+      await arrays.handle(
+        { method: 'POST', path: '/p', body: [], header: (name) => ({ 'idempotency-key': 'e-2', 'content-length': '31' })[name] },
+        async () => ok()
+      )
+    })
+    assert.equal(arrayWarnings.length, 1)
+  })
+
+  test('an empty body the wire agrees is empty stays silent', async () => {
+    // '{}' is two bytes: a client that really sent it is not misconfigured,
+    // and neither is one whose chunked body has no length to compare.
+    const kernel = kernelWith()
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: {}, header: (name) => ({ 'idempotency-key': 'q-1', 'content-length': '2' })[name] },
+        async () => ok()
+      )
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: {}, header: (name) => ({ 'idempotency-key': 'q-2', 'transfer-encoding': 'chunked' })[name] },
+        async () => ok()
+      )
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: {}, header: (name) => ({ 'idempotency-key': 'q-3' })[name] },
+        async () => ok()
+      )
+      // A literal `null` body parses to null, which fingerprints as its own
+      // value rather than as a constant: nothing was lost, and reading it
+      // as an empty container would throw.
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: null, header: (name) => ({ 'idempotency-key': 'q-null', 'content-length': '4' })[name] },
+        async () => ok()
+      )
+      // A body with content is doing its job whatever the wire said.
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: { amount: 10 }, header: (name) => ({ 'idempotency-key': 'q-4', 'content-length': '31' })[name] },
+        async () => ok()
+      )
+      // Only a container counts as empty: body-parser leaves `{}` behind
+      // for a content type it declined, never a primitive. A parsed empty
+      // string is a value with a fingerprint of its own (`str:""`), so it
+      // still tells two payloads apart and is nobody's misconfiguration.
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: '', header: (name) => ({ 'idempotency-key': 'q-str', 'content-length': '31' })[name] },
+        async () => ok()
+      )
+    })
+    assert.equal(warnings.length, 0)
+  })
+
+  test('genuinely bodyless and parsed requests stay silent', async () => {
+    const kernel = kernelWith()
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(bodyless({ 'idempotency-key': 's-1' }), async () => ok())
+      await kernel.handle(bodyless({ 'idempotency-key': 's-2', 'content-length': '0' }), async () => ok())
+      await kernel.handle(bodyless({ 'idempotency-key': 's-3', 'content-length': '' }), async () => ok())
+      // The everyday case: a parsed body whose content-length is still on
+      // the wire. Only the unparsed combination may warn.
+      const headers: Record<string, string | undefined> = { 'idempotency-key': 's-4', 'content-length': '18' }
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: { amount: 10 }, header: (name) => headers[name] },
+        async () => ok()
+      )
+    })
+    assert.equal(warnings.length, 0, 'no wire body, or a parsed one: the fingerprint is doing its job')
   })
 })
 

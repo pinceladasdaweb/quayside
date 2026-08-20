@@ -90,6 +90,31 @@ describe('fastify adapter', () => {
     await scoped.close()
   })
 
+  test('header lookups are case-insensitive for custom extractors', async () => {
+    const cased = Fastify()
+    await cased.register(FastifyPlugin(new Idempotency({ storage: new MemoryStorage() }), {
+      key: (request) => request.header('Idempotency-Key')
+    }) as never)
+    let count = 0
+    cased.post('/cased', async (_request, reply) => {
+      count += 1
+      return reply.status(201).send({ call: count })
+    })
+    await cased.ready()
+
+    const send = async () => cased.inject({
+      method: 'POST',
+      url: '/cased',
+      headers: { 'idempotency-key': 'cased-key' },
+      payload: { amount: 10 }
+    })
+    await send()
+    const replayed = await send()
+    assert.deepEqual(replayed.json(), { call: 1 }, 'the mixed-case lookup found the key, so the retry replays')
+    assert.equal(replayed.headers['idempotency-replayed'], 'true')
+    await cased.close()
+  })
+
   test('replays status, location and body with the replay marker', async () => {
     const first = await post('/payments', 'fas-1', { amount: 10 })
     assert.equal(first.statusCode, 201)

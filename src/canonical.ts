@@ -65,7 +65,23 @@ function canonicalizeValue (value: unknown, path: string, filter: PathFilter, se
     return Number.isNaN(object.getTime()) ? 'date:invalid' : `date:${object.toISOString()}`
   }
   if (ArrayBuffer.isView(object)) {
-    return `bytes:${Buffer.from(object.buffer, object.byteOffset, object.byteLength).toString('hex')}`
+    // A binary payload is a byte string: Buffer, Uint8Array and (below) the
+    // raw ArrayBuffers all canonicalize to the same bytes, because they are
+    // interchangeable carriers of the same eight-bit content.
+    if (object instanceof Uint8Array || object instanceof Uint8ClampedArray) {
+      return `bytes:${Buffer.from(object.buffer, object.byteOffset, object.byteLength).toString('hex')}`
+    }
+    if (object instanceof DataView) {
+      return `dataview:${Buffer.from(object.buffer, object.byteOffset, object.byteLength).toString('hex')}`
+    }
+    // Every other view interprets its bytes (element width, signedness,
+    // floating point), so the raw bytes are not the value: Uint16Array([1])
+    // and Uint8Array([1, 0]) share bytes without sharing meaning, and a
+    // multi-byte view's bytes depend on the host's byte order. The element
+    // values, under the view's own tag, are what the caller meant, and no
+    // machine can disagree about them.
+    const view = object as unknown as { join (separator: string): string, [Symbol.toStringTag]: string }
+    return `${view[Symbol.toStringTag].toLowerCase()}:[${view.join(',')}]`
   }
   // Raw buffers carry no own enumerable keys: without this branch they would
   // canonicalize as an empty object and every binary payload would collide.

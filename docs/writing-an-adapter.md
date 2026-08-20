@@ -24,12 +24,32 @@ const outcome = await kernel.handle(requestFacts, runDownstream)
 
 `runDownstream` runs the rest of the pipeline and resolves with a
 `CapturedHttpResponse` — or `null` when the response must be served without
-being cached. Three helpers do the heavy lifting: `kernel.cacheableBody(data)`
+being cached. Four helpers do the heavy lifting: `kernel.cacheableBody(data)`
 applies the UTF-8 and `maxBodyBytes` gates, `kernel.selectHeaders(get)`
-collects the replay-relevant headers, and `kernel.handles(method, key)`
+collects the replay-relevant headers, `kernel.handles(method, key)`
 answers whether this request gets anything but a pass-through — adapters
 that must buffer the request body to fingerprint it call it first, so an
-unprotected method or a keyless request never pays for the read.
+unprotected method or a keyless request never pays for the read — and
+`kernel.keyFor(facts)` derives the key through whatever the application
+configured, which is what a pre-gate must use so it cannot disagree with
+`handle()`. Check `kernel.shouldHandle(method)` before deriving: a custom
+extractor may assume protected-route context and must not run for methods
+the kernel ignores.
+
+Two obligations on the facts you build:
+
+- **`header(name)` must be case-insensitive.** Node lowercases incoming
+  header keys, so a raw `req.headers[name]` lookup silently returns
+  `undefined` for `header('Idempotency-Key')` — the conventional spelling
+  an application's custom key or fingerprint extractor will use, and an
+  undefined key means unprotected passthrough with no signal. Lower the
+  name yourself (`req.headers[name.toLowerCase()]`) unless your framework
+  already normalizes.
+- **`raw` carries your framework's native request.** Key and fingerprint
+  extractors cast it to reach state the facts cannot describe — the
+  authenticated principal an auth middleware attached, most of all. Pass it
+  and applications can scope keys per caller on your adapter; omit it and
+  they cannot.
 
 ## Worked example: Koa
 
@@ -49,7 +69,9 @@ export function KoaMiddleware (idempotency: Idempotency, options: HttpKernelOpti
         method: ctx.method,
         path: ctx.path,
         body: ctx.request.body,
-        header: (name) => ctx.get(name) || undefined
+        // ctx.get is already case-insensitive; a raw headers object is not.
+        header: (name) => ctx.get(name) || undefined,
+        raw: ctx
       },
       async () => {
         await next()
@@ -92,7 +114,9 @@ kernel and behave identically to the shipped adapters.
 - [ ] Tests against the real framework (dev dependency), covering at
   minimum: replay with status + headers + marker, 422 on payload change,
   passthrough without a key, binary/oversized never cached, handler errors
-  re-execute
+  re-execute, and a mixed-case `header()` lookup finding its value
+- [ ] `raw` populated with the native request, so applications can scope
+  keys to the authenticated principal (docs/http.md)
 - [ ] Frameworks whose pipeline cannot be wrapped in one function (hook
   models like Fastify) can bridge the kernel's continuation with a deferred:
   see `src/fastify/index.ts`

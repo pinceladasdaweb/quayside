@@ -141,7 +141,7 @@ The explicit key names the *intent* (an `Idempotency-Key` header, an invoice id)
 
 ### Concurrency is a policy
 
-When a call finds the key `IN_PROGRESS`: `onConflict: 'reject'` (default, HTTP-safe) throws `ConcurrentExecutionError` immediately; `'wait'` blocks until the winner finishes and replays its outcome, bounded by `waitTimeout` — ideal for consumers and workers. Waiters poll with exponential backoff, and storages that support notifications (Redis keyspace events) wake them early.
+When a call finds the key `IN_PROGRESS`: `onConflict: 'reject'` (default, HTTP-safe) throws `ConcurrentExecutionError` immediately; `'wait'` blocks until the winner finishes and replays its outcome, bounded by `waitTimeout` over the whole call (a waiter that takes over a dead holder's key and then loses the race keeps the same budget) — ideal for consumers and workers. Waiters poll with exponential backoff, and storages that support notifications (Redis keyspace events) wake them early.
 
 ### Failures are not idempotent
 
@@ -149,7 +149,7 @@ A rejection deletes the record; retries run fresh. `persistFailures: true` opts 
 
 ### Fail closed, bypass loudly
 
-If the storage is unreachable, `execute` throws `StorageUnavailableError` instead of running without the guarantee. `onStorageError: 'open'` flips the trade-off — the function runs unguarded and every bypass emits a `storage-bypass` event, so degradation is always observable.
+If the storage is unreachable, `execute` throws `StorageUnavailableError` instead of running without the guarantee. `onStorageError: 'open'` flips the trade-off — the function runs unguarded and every bypass emits a `storage-bypass` event, so degradation is always observable. Fail-open covers every storage interaction (acquire, completion write, a poll that fails mid-wait, a `ctx.extend` heartbeat), but **not** a storage that answers with a record the contract cannot describe: that raises `StorageCorruptError`, because a data bug decodes the same way on every attempt and running unguarded would last as long as the record rather than as long as an outage.
 
 ### Keys are never truncated
 
@@ -243,6 +243,7 @@ All errors extend `QuaysideError` and carry a stable `code` — codes are contra
 | `WaitTimeoutError` | `IDEMPOTENCY_WAIT_TIMEOUT` | 409 |
 | `FencingError` | `IDEMPOTENCY_FENCING` | 500 |
 | `SerializationError` | `IDEMPOTENCY_SERIALIZATION` | 500 |
+| `StorageCorruptError` | `IDEMPOTENCY_STORAGE_CORRUPT` | 500 |
 | `StorageUnavailableError` | `IDEMPOTENCY_STORAGE_UNAVAILABLE` | 503 |
 
 ## API
@@ -257,7 +258,7 @@ new Idempotency(options)
 | `resultTtl` | `'24h'` | Replay window for completed results |
 | `lockTtl` | `'30s'` | How long an in-progress record survives without completion |
 | `onConflict` | `'reject'` | `'reject'` throws immediately; `'wait'` blocks until the winner finishes |
-| `waitTimeout` | `'10s'` | Upper bound for `onConflict: 'wait'` |
+| `waitTimeout` | `'10s'` | Upper bound for `onConflict: 'wait'`, measured over the whole call |
 | `namespace` | — | Key prefix isolating domains that share one storage |
 | `maxKeyLength` | `512` | Longest composed storage key; longer keys are rejected |
 | `codec` | JSON | Serialization of stored results **and** persisted failures (`Codec` interface for superjson/msgpack/encrypt-at-rest users) |

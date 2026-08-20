@@ -98,7 +98,11 @@ export function ExpressMiddleware (
         method: req.method,
         path: req.path,
         body: req.body,
-        header: (name) => headerValue(req.headers[name]),
+        // Node lowercases incoming header keys; lowering the lookup name
+        // makes header() case-insensitive, so a custom key or fingerprint
+        // extractor written with HTTP's conventional casing reads the same
+        // value on every adapter.
+        header: (name) => headerValue(req.headers[name.toLowerCase()]),
         raw: req
       },
       () => captureResponse(kernel, res, next)

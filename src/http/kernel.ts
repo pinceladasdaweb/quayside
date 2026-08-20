@@ -16,6 +16,11 @@ export interface HttpRequestFacts {
   path: string
   /** The parsed or raw request body, used only for fingerprinting. */
   body?: unknown
+  /**
+   * Case-insensitive header lookup: every adapter accepts any casing, so
+   * an extractor written as header('Idempotency-Key') reads the same value
+   * everywhere. Adapters implementing the facts by hand must honor this.
+   */
   header (name: string): string | undefined
   /**
    * The adapter's native request object (the Express req, the Fastify
@@ -71,6 +76,29 @@ export type KernelOutcome =
   | { kind: 'handled' }
   | { kind: 'respond', response: CapturedHttpResponse }
 
+/** Marker added to every replayed response. */
+export const REPLAYED_HEADER = 'idempotency-replayed'
+
+/** Stable code for a protected request that carries no usable key. */
+export const KEY_REQUIRED_CODE = 'IDEMPOTENCY_KEY_REQUIRED'
+
+/**
+ * What to tell a client whose request produced no key. Naming the header
+ * is only truthful when the header is what was read: under a custom
+ * extractor the missing ingredient may be something else entirely (an
+ * authenticated principal, a tenant), and telling that client to send a
+ * header it already sent loops it forever.
+ */
+export function keyRequiredMessage (
+  header: string,
+  options: { method?: string, derived?: boolean } = {}
+): string {
+  const scope = options.method === undefined ? '' : ` on ${options.method.toUpperCase()} requests`
+  return options.derived === true
+    ? `no idempotency key could be derived for this request${scope}`
+    : `the ${header} header is required${scope}`
+}
+
 /**
  * Normalizes a framework's header slot to the single string the kernel
  * reads: node frameworks surface header values as string, string[] or
@@ -119,6 +147,17 @@ export function httpErrorFacts (error: unknown): HttpErrorFacts | null {
 // serves every response instead of one per captured body.
 const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true })
 
+// The wire size of the shortest body that legitimately parses to an empty
+// container: '{}' and '[]' are both two bytes.
+const EMPTY_BODY_BYTES = 2
+
+// A parser that declined this request's content type leaves an empty
+// container behind. Own enumerable keys are what the fingerprint reads, so
+// they are what "empty" means here.
+function isEmptyObject (body: unknown): boolean {
+  return typeof body === 'object' && body !== null && Object.keys(body).length === 0
+}
+
 const DEFAULT_METHODS = ['POST', 'PATCH']
 const DEFAULT_REPLAY_HEADERS = ['content-type', 'location']
 const DEFAULT_MAX_BODY_BYTES = 1_048_576
@@ -140,8 +179,10 @@ export class HttpIdempotencyKernel {
   private readonly enforce: boolean
   private readonly fingerprintPayload: (request: HttpRequestFacts) => unknown
   private readonly keyOf: (request: HttpRequestFacts) => string | undefined
+  private readonly derivesKey: boolean
   private readonly replayHeaders: string[]
   private readonly retryAfterSeconds: number
+  private warnedUnparsedBody = false
 
   constructor (idempotency: Idempotency, options: HttpKernelOptions = {}) {
     this.idempotency = idempotency
@@ -155,6 +196,7 @@ export class HttpIdempotencyKernel {
       : fingerprint === 'body-and-path'
         ? (request) => ({ path: request.path, body: request.body ?? null })
         : (request) => request.body
+    this.derivesKey = options.key !== undefined
     this.keyOf = options.key ?? ((request) => request.header(this.header))
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
     this.replayHeaders = (options.replayHeaders ?? DEFAULT_REPLAY_HEADERS).map((name) => name.toLowerCase())
@@ -195,8 +237,19 @@ export class HttpIdempotencyKernel {
       if (!this.enforce) return { kind: 'passthrough' }
       return {
         kind: 'respond',
-        response: this.problem(400, 'IDEMPOTENCY_KEY_REQUIRED', `the ${this.header} header is required on ${request.method.toUpperCase()} requests`)
+        response: this.problem(400, KEY_REQUIRED_CODE, keyRequiredMessage(this.header, { method: request.method, derived: this.derivesKey }))
       }
+    }
+
+    // A protected, keyed request whose wire carries a body that nobody
+    // parsed cannot be fingerprinted: the reuse guard silently degrades to
+    // key-only matching, and two different payloads under one key would
+    // replay instead of answering 422. That is a mount-order or parser
+    // misconfiguration, and staying quiet about it is the actual bug, so
+    // it is reported once per kernel.
+    if (!this.warnedUnparsedBody && this.bodyWentMissing(request)) {
+      this.warnedUnparsedBody = true
+      process.emitWarning(`quayside: a ${request.method.toUpperCase()} request carrying "${this.header}" declares a body that did not survive parsing (received ${request.body === undefined ? 'undefined' : 'an empty object'}), so the payload fingerprint cannot validate key reuse. Is a body parser mounted before the idempotency middleware, and does it handle this content type?`)
     }
 
     const payload = this.fingerprintPayload(request)
@@ -228,7 +281,7 @@ export class HttpIdempotencyKernel {
         kind: 'respond',
         response: {
           status: stored.status,
-          headers: { ...stored.headers, 'idempotency-replayed': 'true' },
+          headers: { ...stored.headers, [REPLAYED_HEADER]: 'true' },
           body: stored.body
         }
       }
@@ -250,6 +303,36 @@ export class HttpIdempotencyKernel {
           facts.retryAfter ? { 'retry-after': String(this.retryAfterSeconds) } : {})
       }
     }
+  }
+
+  // Whether the wire says a request body exists: a content-length above
+  // zero or any transfer-encoding. A bodyless request has neither, and its
+  // absent fingerprint is legitimate (interchangeable with a payload-less
+  // core caller of the same key).
+  private declaresBody (request: HttpRequestFacts): boolean {
+    if (request.header('transfer-encoding') !== undefined) return true
+    const declared = request.header('content-length')
+    return declared !== undefined && declared !== '' && declared !== '0'
+  }
+
+  /**
+   * Whether the body the wire announced reached the kernel intact. Two
+   * shapes say it did not: `undefined`, when no parser ran at all, and an
+   * empty object, which is what a parser leaves behind for a content type
+   * it declined (`express.json()` on `text/plain`, on `multipart`). Both
+   * fingerprint every payload identically, so the reuse guard is inert.
+   *
+   * An empty body is only suspicious against a declared length: `{}` and
+   * `[]` are two bytes on the wire, so a longer content-length means the
+   * content was dropped. Under a chunked encoding there is no length to
+   * compare, and a genuinely empty parsed body is indistinguishable from a
+   * dropped one, so that combination stays quiet rather than crying wolf.
+   */
+  private bodyWentMissing (request: HttpRequestFacts): boolean {
+    if (request.body === undefined) return this.declaresBody(request)
+    if (!isEmptyObject(request.body)) return false
+    const declared = Number(request.header('content-length'))
+    return declared > EMPTY_BODY_BYTES
   }
 
   /**

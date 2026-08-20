@@ -17,6 +17,9 @@ describe('canonicalize', () => {
     assert.equal(canonicalize(new Date(0)), 'date:1970-01-01T00:00:00.000Z')
     assert.equal(canonicalize(new Date('nope')), 'date:invalid')
     assert.equal(canonicalize(new Uint8Array([1, 255])), 'bytes:01ff')
+    assert.equal(canonicalize(new Uint16Array([1, 257])), 'uint16array:[1,257]')
+    assert.equal(canonicalize(new BigInt64Array([2n])), 'bigint64array:[2]')
+    assert.equal(canonicalize(new DataView(new Uint8Array([1, 255]).buffer)), 'dataview:01ff')
     assert.equal(canonicalize([1, 'a']), 'arr:[num:1,str:"a"]')
     assert.equal(canonicalize({ b: 2, a: 1 }), 'obj:{"a":num:1,"b":num:2}')
     assert.equal(canonicalize({ nested: [true, null] }), 'obj:{"nested":arr:[bool:true,null]}')
@@ -76,6 +79,30 @@ describe('canonicalize', () => {
       hashCanonical(new Uint8Array([1, 2, 3])),
       hashCanonical(Buffer.from([1, 2, 3]))
     )
+  })
+
+  test('a typed view is its interpreted values, never its raw bytes', () => {
+    // The core collision this scheme exists to prevent: same bytes, another
+    // meaning. Uint16Array([1]) and Uint8Array([1, 0]) share their bytes.
+    assert.notEqual(hashCanonical({ v: new Uint16Array([1]) }), hashCanonical({ v: new Uint8Array([1, 0]) }))
+    // Signedness is meaning too: Int8Array([-1]) and Uint8Array([255]) share a byte.
+    assert.notEqual(hashCanonical(new Int8Array([-1])), hashCanonical(new Uint8Array([255])))
+    assert.notEqual(hashCanonical(new Uint16Array([1])), hashCanonical(new Int16Array([1])))
+    // Equal interpreted values are equal payloads, including from a subclass.
+    class Halves extends Uint16Array {}
+    assert.equal(hashCanonical(new Uint16Array([1, 2])), hashCanonical(new Halves([1, 2])))
+    // A DataView is a tagged byte window, not a byte string.
+    const bytes = new Uint8Array([1, 2])
+    assert.notEqual(hashCanonical(new DataView(bytes.buffer)), hashCanonical(bytes))
+    // Uint8ClampedArray reads exactly like Uint8Array: same byte content,
+    // same payload.
+    assert.equal(hashCanonical(new Uint8ClampedArray([1, 2])), hashCanonical(new Uint8Array([1, 2])))
+    // Element values are read through the view's own window, not the whole
+    // underlying buffer.
+    const offset = new Uint16Array(new Uint16Array([9, 1, 257, 9]).buffer, 2, 2)
+    assert.equal(hashCanonical(offset), hashCanonical(new Uint16Array([1, 257])))
+    // Floating-point views carry their values deterministically.
+    assert.equal(canonicalize(new Float64Array([1.5, NaN])), 'float64array:[1.5,NaN]')
   })
 
   test('different values of every type hash differently', () => {

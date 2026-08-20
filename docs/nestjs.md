@@ -18,6 +18,7 @@ import { RedisStorage } from 'quayside/redis'
       resultTtl: '24h',
       lockTtl: '30s'
       // header: 'Idempotency-Key' (default)
+      // retryAfterSeconds: 1 (default) — the Retry-After hint on 409s
     })
   ]
 })
@@ -76,11 +77,12 @@ to Nest `HttpException`s:
 
 | Situation | Response |
 |---|---|
-| Same key, execution still running | `409` + `Retry-After` |
+| Same key, execution still running | `409` + `Retry-After` (`retryAfterSeconds`, default 1) |
 | Same key, different payload | `422` |
-| Missing key with `enforce: true` | `400` |
+| No usable key with `enforce: true` | `400` — the message names the header when the header was read, and says no key could be derived when a `key` extractor declined |
 | Key longer than `maxKeyLength` | `400` |
 | Storage unreachable (fail-closed) | `503` |
+| Storage answered with a record the contract cannot describe | `500` (`StorageCorruptError`) |
 
 Decorator options: `key` (extractor over the request; default is the
 configured header), `fingerprint` (function over the request or `false`;
@@ -103,6 +105,16 @@ own declaration:
 | `HttpException` with a 4xx status | Persisted and replayed: the status declares a deterministic client failure, and a retry of the same key answers exactly what the first attempt answered |
 | `HttpException` with a 5xx status | Never persisted: a declared server error is transient by definition, so the retry re-executes under a fresh lock (the same rule the HTTP kernel applies to 5xx responses) |
 | A plain `Error` | Persisted and replayed: it declares nothing, so the flag you opted into is the ruling intent — `persistFailures` means failures in your domain are deterministic |
+
+Two more rules mirror the HTTP kernel at the value level. A handler that
+*returns* after declaring a server status on the passthrough response
+(`@Res({ passthrough: true })` + `res.status(503)`) is answering with a
+transient error: the value is served but never persisted, so the retry
+re-executes. And when the record cannot be settled *after* the handler
+succeeded (a lock that outlived a slow execution, a storage that died on
+the completion write), the computed value is still served — answering 500
+would discard completed work — with the failure reported as a process
+warning; nothing was stored, so a retry re-executes.
 
 The practical advice hiding in that table: give business failures their
 status. A declined card thrown as `new HttpException(..., 402)` gets

@@ -5,11 +5,11 @@ import { setTimeout as sleep } from 'node:timers/promises'
 // paths: error identity (instanceof) must hold across entry points, so the
 // build maps '../index' onto the shipped core bundle instead of inlining a
 // private copy.
-import { FencingError, RECORD_STATUS } from '../index'
-import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
+import { FencingError, RECORD_STATUS, StorageCorruptError } from '../index'
+import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
 // Plain shared constants carry no identity requirement, so unlike the
 // errors above they may come straight from the module that defines them.
-import { MAX_ACQUIRE_ATTEMPTS, VALID_STATUS } from '../storage'
+import { MAX_ACQUIRE_ATTEMPTS, buildStoredRecord } from '../storage'
 
 /**
  * Minimal ioredis-shaped command surface. Structural on purpose: any
@@ -120,21 +120,18 @@ function isManagedClient (client: RedisStorageClient): client is ManagedRedisCli
   return 'client' in client && typeof (client as { client: unknown }).client !== 'function'
 }
 
+// The wire field names are this adapter's; the validation is everyone's.
 function parseWireRecord (key: string, raw: string): StoredRecord {
   const wire = JSON.parse(raw) as Partial<WireRecord>
-  if (typeof wire.token !== 'string' || typeof wire.status !== 'string' || !VALID_STATUS.has(wire.status)) {
-    throw new Error(`corrupt idempotency record under key "${key}"`)
-  }
-  const record: StoredRecord = {
+  return buildStoredRecord(key, {
     token: wire.token,
-    status: wire.status as RecordStatus,
-    storedAt: Number(wire.storedAt),
-    expiresAt: Number(wire.expiresAt)
-  }
-  if (typeof wire.fingerprint === 'string') record.fingerprint = wire.fingerprint
-  if (typeof wire.result === 'string') record.result = wire.result
-  if (typeof wire.error === 'string') record.error = wire.error
-  return record
+    status: wire.status,
+    fingerprint: wire.fingerprint,
+    result: wire.result,
+    error: wire.error,
+    storedAt: wire.storedAt,
+    expiresAt: wire.expiresAt
+  })
 }
 
 /**
@@ -178,7 +175,7 @@ export class RedisStorage implements IdempotencyStorage {
       if (current !== null) return parseWireRecord(record.key, current)
       // The holder expired between SET NX and GET: contend again.
     }
-    throw new Error(`could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+    throw new StorageCorruptError(record.key, `could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
   }
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
