@@ -290,6 +290,36 @@ describe('express adapter glue', () => {
     assert.equal(replayed.body, 'created')
   })
 
+  test('header lookups are case-insensitive for custom extractors', async () => {
+    // Node stores incoming header keys lowercased; an extractor written
+    // with HTTP's conventional casing must still read the value, or the
+    // route silently runs unprotected.
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency, {
+      key: (request) => request.header('Idempotency-Key')
+    })
+    let handled = 0
+    const roundTrip = async () => await new Promise<ReturnType<typeof fakeResponse>>((resolve) => {
+      const res = fakeResponse()
+      middleware(
+        { method: 'POST', path: '/fake', body: { n: 1 }, headers: { 'idempotency-key': 'cased-1' } },
+        res,
+        () => {
+          handled += 1
+          res.end('ok')
+          setImmediate(() => resolve(res))
+        }
+      )
+      setImmediate(() => setImmediate(() => resolve(res)))
+    })
+
+    await roundTrip()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const replayed = await roundTrip()
+    assert.equal(handled, 1, 'the mixed-case lookup found the key, so the second call replays')
+    assert.equal(replayed.headers['idempotency-replayed'], 'true')
+  })
+
   test('distinct string keys never collapse onto their first character', async () => {
     const idempotency = new Idempotency({ storage: new MemoryStorage() })
     const middleware = ExpressMiddleware(idempotency)

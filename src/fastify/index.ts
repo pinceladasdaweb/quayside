@@ -106,7 +106,10 @@ export function FastifyPlugin (
           method: request.method,
           path: pathOf(request.url),
           body: request.body,
-          header: (name) => headerValue(request.headers[name]),
+          // Node lowercases incoming header keys; lowering the lookup name
+          // makes header() case-insensitive, matching the hono adapter and
+          // the web Headers convention custom extractors expect.
+          header: (name) => headerValue(request.headers[name.toLowerCase()]),
           raw: request
         },
         () => {

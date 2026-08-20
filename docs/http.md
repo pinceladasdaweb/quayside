@@ -101,7 +101,9 @@ app.use(ExpressMiddleware(idempotency, {
 
 Returning `undefined` means "this request carries no key": it passes through
 unprotected, or answers `400` under `enforce` — so an unauthenticated request
-never shares records with anyone. The extractor must not read `body`: the
+never shares records with anyone. `request.header(name)` is case-insensitive
+in every adapter: `header('Idempotency-Key')` and `header('idempotency-key')`
+read the same value, so an extractor ports between adapters unchanged. The extractor must not read `body`: the
 Hono adapter derives the key before buffering the request, precisely so
 keyless requests never pay for a body nobody will fingerprint.
 

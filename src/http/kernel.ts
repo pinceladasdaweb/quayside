@@ -16,6 +16,11 @@ export interface HttpRequestFacts {
   path: string
   /** The parsed or raw request body, used only for fingerprinting. */
   body?: unknown
+  /**
+   * Case-insensitive header lookup: every adapter accepts any casing, so
+   * an extractor written as header('Idempotency-Key') reads the same value
+   * everywhere. Adapters implementing the facts by hand must honor this.
+   */
   header (name: string): string | undefined
   /**
    * The adapter's native request object (the Express req, the Fastify
