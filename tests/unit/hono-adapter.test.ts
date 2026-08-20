@@ -1,11 +1,25 @@
 import { before, describe, test } from 'node:test'
 import assert from 'node:assert/strict'
+import { setTimeout as sleep } from 'node:timers/promises'
 
 import { Hono } from 'hono'
 
 import { HonoMiddleware } from '../../src/hono/index'
 import { Idempotency } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
+
+// The hono adapter settles the record concurrently with the response
+// dispatch, so a follow-up call issued immediately can still find the
+// record IN_PROGRESS: wait for it to settle (stored, or released to null)
+// before asserting on the second call.
+async function settled (instance: Idempotency, key: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const record = await instance.get(key)
+    if (record === null || record.status !== 'in-progress') return
+    await sleep(5)
+  }
+  throw new Error(`the record for "${key}" never settled`)
+}
 
 let app: Hono
 let calls: Record<string, number>
@@ -92,6 +106,7 @@ describe('hono adapter', () => {
     const first = await post('/payments', 'hon-1', { amount: 10 })
     assert.equal(first.status, 201)
     assert.equal(first.headers.get('idempotency-replayed'), null)
+    await settled(idempotency, 'hon-1')
 
     const second = await post('/payments', 'hon-1', { amount: 10 })
     assert.equal(second.status, 201)
@@ -103,6 +118,7 @@ describe('hono adapter', () => {
 
   test('the same key with a different body responds 422', async () => {
     await post('/payments', 'hon-2', { amount: 10 })
+    await settled(idempotency, 'hon-2')
     const conflict = await post('/payments', 'hon-2', { amount: 99 })
     assert.equal(conflict.status, 422)
     assert.match(await conflict.text(), /IDEMPOTENCY_KEY_REUSE/)
@@ -117,6 +133,7 @@ describe('hono adapter', () => {
 
   test('binary responses are served intact and never cached', async () => {
     const first = await post('/binary', 'hon-bin', {})
+    await settled(idempotency, 'hon-bin')
     const second = await post('/binary', 'hon-bin', {})
     assert.deepEqual(new Uint8Array(await first.arrayBuffer()), new Uint8Array([0xff, 0xfe, 0x00, 0x81]))
     assert.deepEqual(new Uint8Array(await second.arrayBuffer()), new Uint8Array([0xff, 0xfe, 0x00, 0x81]))
@@ -126,6 +143,7 @@ describe('hono adapter', () => {
   test('handler errors become 5xx responses and retries re-execute', async () => {
     const first = await post('/boom', 'hon-boom', {})
     assert.equal(first.status, 500)
+    await settled(idempotency, 'hon-boom')
     const second = await post('/boom', 'hon-boom', {})
     assert.equal(second.status, 500)
     assert.equal(calls.boom, 2)
@@ -134,6 +152,7 @@ describe('hono adapter', () => {
   test('bodyless responses replay as empty bodies', async () => {
     const first = await app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-204' } })
     assert.equal(first.status, 204)
+    await settled(idempotency, 'hon-204')
     const second = await app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-204' } })
     assert.equal(second.status, 204)
     assert.equal(second.headers.get('idempotency-replayed'), 'true')
@@ -142,12 +161,14 @@ describe('hono adapter', () => {
 
   test('declared content lengths within the cap still cache, including exactly at it', async () => {
     await post('/declared-small', 'hon-small', {})
+    await settled(idempotency, 'hon-small')
     const smallReplay = await post('/declared-small', 'hon-small', {})
     assert.equal(await smallReplay.text(), 'cached')
     assert.equal(smallReplay.headers.get('idempotency-replayed'), 'true')
     assert.equal(calls.declaredSmall, 1)
 
     await post('/declared-exact', 'hon-dexact', {})
+    await settled(idempotency, 'hon-dexact')
     const exactReplay = await post('/declared-exact', 'hon-dexact', {})
     assert.equal(exactReplay.headers.get('idempotency-replayed'), 'true')
     assert.equal(calls.declaredExact, 1)
@@ -155,6 +176,7 @@ describe('hono adapter', () => {
 
   test('a streamed body of exactly the cap is cached', async () => {
     await post('/stream-exact', 'hon-sexact', {})
+    await settled(idempotency, 'hon-sexact')
     const replay = await post('/stream-exact', 'hon-sexact', {})
     assert.equal((await replay.text()).length, 1_024)
     assert.equal(replay.headers.get('idempotency-replayed'), 'true')
@@ -166,12 +188,14 @@ describe('hono adapter', () => {
     // interchangeable with non-HTTP callers of the same key.
     const first = await app.request('/empty', { method: 'POST', headers: { 'idempotency-key': 'hon-cross' } })
     assert.equal(first.status, 204)
+    await settled(idempotency, 'hon-cross')
     const direct = await idempotency.executeWithMetadata({ key: 'hon-cross' }, async () => 'never')
     assert.equal(direct.replayed, true)
   })
 
   test('a streamed body over the cap is served and never cached', async () => {
     const first = await post('/stream-huge', 'hon-stream', {})
+    await settled(idempotency, 'hon-stream')
     const second = await post('/stream-huge', 'hon-stream', {})
     assert.equal((await first.text()).length, 1_400)
     assert.equal((await second.text()).length, 1_400)
@@ -180,6 +204,7 @@ describe('hono adapter', () => {
 
   test('a declared content-length over the cap is served and never cached', async () => {
     const first = await post('/declared-huge', 'hon-declared', {})
+    await settled(idempotency, 'hon-declared')
     const second = await post('/declared-huge', 'hon-declared', {})
     assert.equal(await first.text(), 'tiny body')
     assert.equal(await second.text(), 'tiny body')
@@ -227,11 +252,80 @@ describe('hono adapter', () => {
     assert.equal(clones, 1, 'a protected, keyed request is fingerprinted')
   })
 
+  test('a streaming response reaches the client before the stream ends', async () => {
+    // The regression this adapter shipped with: the capture drained the
+    // whole clone before the middleware returned, so a streaming response
+    // (SSE, chunked) reached the client only after the source ended or hit
+    // the size cap, with the lock held throughout. The middleware must
+    // return as soon as downstream produced its response.
+    const instance = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = HonoMiddleware(instance, {})
+    let releaseStream: () => void = () => {}
+    const streamOpen = new Promise<void>((resolve) => { releaseStream = resolve })
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream<Uint8Array>({
+      start (controller) {
+        controller.enqueue(encoder.encode('first '))
+        streamOpen.then(() => {
+          controller.enqueue(encoder.encode('rest'))
+          controller.close()
+        }).catch(() => {})
+      }
+    })
+    const requestFacts = (key: string) => ({
+      method: 'POST',
+      path: '/sse',
+      header: (name: string) => (name === 'idempotency-key' ? key : undefined),
+      raw: { clone () { return { text: async () => '' } } } as unknown as Request
+    })
+    const context = { req: requestFacts('hon-sse'), res: new Response('unset') }
+
+    // Awaiting the middleware WITHOUT releasing the stream is the test:
+    // before the fix this await only resolved once the stream closed.
+    const returned = await middleware(context as never, async () => {
+      context.res = new Response(stream, { status: 200, headers: { 'content-type': 'text/plain' } })
+    })
+    assert.equal(returned, undefined, 'the middleware returned while the stream was still open')
+
+    // Once the stream ends, the concurrent capture settles the record and
+    // a retry replays the full streamed body.
+    releaseStream()
+    await settled(instance, 'hon-sse')
+    const replay = await middleware(
+      { req: requestFacts('hon-sse'), res: new Response('unset') } as never,
+      async () => { throw new Error('a replay never runs the handler') }
+    )
+    assert.equal(replay?.headers.get('idempotency-replayed'), 'true')
+    assert.equal(await replay?.text(), 'first rest', 'the replay carries the whole streamed body')
+  })
+
+  test('the key extractor never runs for unprotected methods', async () => {
+    // handle() checks the method before deriving the key; the buffering
+    // pre-gate has to do the same, or a GET on a public route crashes an
+    // extractor that assumes protected-route context, only on hono.
+    let extractions = 0
+    const middleware = HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), {
+      key: (request) => {
+        extractions += 1
+        return request.header('idempotency-key')
+      }
+    })
+    let ran = 0
+    const context = {
+      req: { method: 'GET', path: '/public', header: () => undefined, raw: {} as Request },
+      res: new Response('ok')
+    }
+    await middleware(context as never, async () => { ran += 1 })
+    assert.equal(extractions, 0, 'an unprotected method never pays for, nor can it crash, the extractor')
+    assert.equal(ran, 1, 'and passes through')
+  })
+
   test('a key extractor scopes records by principal and still gates the body read', async () => {
     // raw is the Hono context, so the extractor reads what auth middleware
     // stored on it; an extractor that yields no key must also keep the
     // body-buffering gate closed.
-    const middleware = HonoMiddleware(new Idempotency({ storage: new MemoryStorage() }), {
+    const scopedInstance = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = HonoMiddleware(scopedInstance, {
       key: (request) => {
         const key = request.header('idempotency-key')
         const user = (request.raw as { get (name: string): string | undefined }).get('user')
@@ -262,6 +356,7 @@ describe('hono adapter', () => {
     assert.equal(runs, 1, 'and the chain runs unprotected')
 
     await middleware(contextFor('alice'), next)
+    await settled(scopedInstance, 'alice:hon-scope')
     const replay = await middleware(contextFor('alice'), next)
     assert.equal(replay?.headers.get('idempotency-replayed'), 'true', 'the same principal replays')
     await middleware(contextFor('bob'), next)

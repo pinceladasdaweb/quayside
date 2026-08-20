@@ -137,9 +137,14 @@ be answered with a different status without lying to the client. The response
 stands, the failure is reported as a process warning and through the
 `failed` event, and nothing was stored, so a client retry re-executes.
 
-Note that with the Express adapter the record is committed right after the
-response is flushed; with Fastify and Hono it is committed before the
-response leaves the server.
+Note the commit timing per adapter: Fastify commits the record before the
+response leaves the server; Express commits right after the response is
+flushed; Hono commits concurrently with the dispatch — the capture drains a
+clone while the body streams to the client, so streaming responses (SSE,
+chunked) flow immediately instead of being buffered to the size cap, and
+the record settles when the body finishes. In the Express and Hono windows
+a retry arriving between the response and the commit briefly answers 409
+with `Retry-After`, which resolves itself on the next retry.
 
 The Fastify adapter also settles on the raw `close` event, so a hijacked
 reply (`reply.hijack()`, SSE, proxying) releases the key instead of holding
