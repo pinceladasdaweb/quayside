@@ -123,12 +123,29 @@ export class IdempotencyInterceptor implements NestInterceptor {
         ? options.fingerprint(request)
         : request.body
 
+    // Once the handler has produced its value there is a truthful answer to
+    // serve, whatever happens to the record afterwards.
+    let handlerValue: unknown
+    let responded = false
     try {
       const outcome = await this.idempotency.executeWithMetadata(
         { key, payload, resultTtl: options.ttl },
         async (ctx) => {
           try {
-            return await lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
+            const value = await lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
+            handlerValue = value
+            responded = true
+            // The kernel gates on the captured status; the value-level
+            // equivalent reads the platform response the interceptor
+            // already holds. A passthrough handler that declared a server
+            // status (res.status(503) and a returned body) is answering
+            // with a transient error, which must never persist as a
+            // replayable success.
+            // Number() rather than a type guard: a platform whose status
+            // reads as 5xx is answering with a server error however it
+            // spells it, and an absent status is NaN, which compares false.
+            if (Number((response as { statusCode?: unknown }).statusCode) >= 500) ctx.doNotStore()
+            return value
           } catch (error) {
             // The kernel's rule, applied at the value level: a response
             // that declares a server status is transient by definition and
@@ -146,6 +163,17 @@ export class IdempotencyInterceptor implements NestInterceptor {
       if (outcome.replayed) setResponseHeader(response, 'idempotency-replayed', 'true')
       return outcome.value
     } catch (error) {
+      if (responded) {
+        // A settlement failure after the handler succeeded (a lock that
+        // outlived a slow execution, a storage that died on the completion
+        // write). Answering 500 would discard work that completed, and the
+        // retry would run the side effect again believing nothing happened.
+        // The computed value is the truthful answer; the failure is
+        // reported, and since nothing was stored a retry re-executes,
+        // exactly the kernel's rule after a response was sent.
+        process.emitWarning(`quayside could not settle the record for "${key}" after the handler completed: ${String(error)}`)
+        return handlerValue
+      }
       throw this.mapError(error, response)
     }
   }

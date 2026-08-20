@@ -104,6 +104,16 @@ own declaration:
 | `HttpException` with a 5xx status | Never persisted: a declared server error is transient by definition, so the retry re-executes under a fresh lock (the same rule the HTTP kernel applies to 5xx responses) |
 | A plain `Error` | Persisted and replayed: it declares nothing, so the flag you opted into is the ruling intent — `persistFailures` means failures in your domain are deterministic |
 
+Two more rules mirror the HTTP kernel at the value level. A handler that
+*returns* after declaring a server status on the passthrough response
+(`@Res({ passthrough: true })` + `res.status(503)`) is answering with a
+transient error: the value is served but never persisted, so the retry
+re-executes. And when the record cannot be settled *after* the handler
+succeeded (a lock that outlived a slow execution, a storage that died on
+the completion write), the computed value is still served — answering 500
+would discard completed work — with the failure reported as a process
+warning; nothing was stored, so a retry re-executes.
+
 The practical advice hiding in that table: give business failures their
 status. A declined card thrown as `new HttpException(..., 402)` gets
 deterministic replay *and* tells the client the truth; thrown as a plain
