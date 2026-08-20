@@ -40,6 +40,7 @@ export const ERROR_CODES: {
     readonly waitTimeout: "IDEMPOTENCY_WAIT_TIMEOUT";
     readonly fencing: "IDEMPOTENCY_FENCING";
     readonly serialization: "IDEMPOTENCY_SERIALIZATION";
+    readonly storageCorrupt: "IDEMPOTENCY_STORAGE_CORRUPT";
     readonly storageUnavailable: "IDEMPOTENCY_STORAGE_UNAVAILABLE";
 };
 
@@ -313,6 +314,17 @@ export class SerializationError extends QuaysideError {
     constructor(message: string, options?: ErrorOptions);
     // (undocumented)
     readonly code: typeof ERROR_CODES.serialization;
+}
+
+// Warning: (ae-missing-release-tag) "StorageCorruptError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export class StorageCorruptError extends QuaysideError {
+    constructor(key: string, message: string);
+    // (undocumented)
+    readonly code: typeof ERROR_CODES.storageCorrupt;
+    // (undocumented)
+    readonly key: string;
 }
 
 // Warning: (ae-missing-release-tag) "StorageUnavailableError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)

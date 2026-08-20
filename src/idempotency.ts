@@ -174,15 +174,30 @@ function encodeErrorValue (error: unknown, codec: Codec): string {
   }
 }
 
-function reviveError (serialized: SerializedError): Error {
+function reviveError (serialized: SerializedError, depth = 0): Error {
   const options: ErrorOptions = {}
-  if (serialized.cause !== undefined) options.cause = reviveError(serialized.cause)
+  // The same depth cap serialization applies: a record whose cause chain
+  // was not written by this library (hand-made, tampered, another codec)
+  // must not be able to recurse without a bound.
+  if (serialized.cause !== undefined && depth < MAX_CAUSE_DEPTH) {
+    options.cause = reviveError(serialized.cause, depth + 1)
+  }
   const error = new Error(serialized.message, options)
   error.name = serialized.name
   if (serialized.stack !== undefined) error.stack = serialized.stack
-  // Object.assign ignores an undefined source, so hand-crafted or corrupt
-  // records without properties revive cleanly.
-  Object.assign(error, serialized.properties)
+  // defineProperty rather than assignment: JSON.parse creates '__proto__'
+  // as an own key, and copying it through [[Set]] would run the prototype
+  // setter and leave the revived error failing `instanceof Error`, which
+  // the adapters branch on. Own data properties are what was serialized,
+  // so own data properties are what comes back.
+  for (const field of Object.keys(serialized.properties ?? {})) {
+    Object.defineProperty(error, field, {
+      value: (serialized.properties as Record<string, unknown>)[field],
+      writable: true,
+      enumerable: true,
+      configurable: true
+    })
+  }
   return error
 }
 
@@ -310,7 +325,7 @@ export class Idempotency {
     if (this.onConflict === 'reject') {
       throw new ConcurrentExecutionError(key)
     }
-    return this.waitForOutcome(input, storageKey, key, fingerprint, fn, correlationId, startedAt)
+    return this.waitForOutcome(input, storageKey, key, fingerprint, fn, correlationId, startedAt, existing)
   }
 
   private async runOwned<T> (
@@ -331,7 +346,18 @@ export class Idempotency {
       replayed: false,
       signal: controller.signal,
       extend: async (ttl) => {
-        await this.storageCall(() => this.storage.extend(storageKey, token, ttl === undefined ? this.lockTtlMs : parseDuration(ttl)))
+        try {
+          await this.storageCall(() => this.storage.extend(storageKey, token, ttl === undefined ? this.lockTtlMs : parseDuration(ttl)))
+        } catch (error) {
+          // Fail-open covers every storage interaction, not only the ones
+          // around the execution: an outage mid-heartbeat must not abort a
+          // function the instance chose to keep running unguarded.
+          if (error instanceof StorageUnavailableError && this.failOpen) {
+            this.emit('storage-bypass', key, correlationId)
+            return
+          }
+          throw error
+        }
       },
       doNotStore: () => { stores = false }
     }
@@ -410,18 +436,51 @@ export class Idempotency {
     fingerprint: string | undefined,
     fn: ExecuteFunction<T>,
     correlationId: string,
-    startedAt: number
+    startedAt: number,
+    observed: StoredRecord
   ): Promise<ExecutionResult<T>> {
-    const deadline = this.clock.now() + this.waitTimeoutMs
+    // The deadline is measured from the call, not from this entry: a
+    // waiter that takes over and loses the re-acquire race lands in a new
+    // wait, and restarting the clock there would let sustained holder
+    // churn block one execute() forever while waitTimeout, its documented
+    // upper bound, never fired.
+    const deadline = startedAt + this.waitTimeoutMs
     const notify = this.storage.waitForChange?.bind(this.storage)
     let warned = false
     let delay = 25
     while (true) {
-      const record = await this.storageCall(() => this.storage.get(storageKey))
+      let record: StoredRecord | null
+      try {
+        record = await this.storageCall(() => this.storage.get(storageKey))
+      } catch (error) {
+        // The same trade-off the acquire path takes: an instance that
+        // chose availability must not answer a storage outage with an
+        // error just because it happened to be waiting when it hit.
+        if (error instanceof StorageUnavailableError && this.failOpen) {
+          return this.runUnguarded(key, fn, correlationId)
+        }
+        throw error
+      }
       if (record === null) {
         // The holder failed (record deleted) or its lock expired: take over.
+        // Which one it was is worth telling apart: a lock that ran out its
+        // TTL means a holder died or stalled mid-execution, the signal
+        // dashboards watch for. The storage cannot report it (expired reads
+        // as absent by contract), but this waiter saw the record before it
+        // vanished and knows whether its lease had run out.
+        if (observed.expiresAt <= this.clock.now()) {
+          this.emit('expired-recovery', key, correlationId)
+        }
+        // The takeover re-enters run(), which may land back here when a
+        // contender wins the race: without spending the same budget the
+        // polls do, sustained churn would spin through that cycle with
+        // neither a sleep nor a deadline in the way.
+        if (deadline - this.clock.now() <= 0) {
+          throw new WaitTimeoutError(key, this.waitTimeoutMs)
+        }
         return this.run(input, fn, correlationId, startedAt)
       }
+      observed = record
       // The record under the key can change identity while we wait: the
       // holder's lock may expire and another payload take the key over. Its
       // outcome is not ours to replay, exactly as in the acquire path.

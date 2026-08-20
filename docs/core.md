@@ -68,9 +68,13 @@ The default codec is JSON with two deliberate hardenings:
   can never collide with the string `'undefined'`.
 - Values JSON would silently drop or mangle **fail loudly** with
   `SerializationError` instead: functions, symbols, `bigint`, non-finite
-  numbers (`NaN`, `Infinity`), *nested* `undefined` and circular references.
-  A stored result that differs from what the function returned would be a
-  silent correctness bug.
+  numbers (`NaN`, `Infinity`), *nested* `undefined`, circular references —
+  and any value whose own `toJSON` would transform it (a `Buffer`, an ORM
+  entity), because the first caller would receive the real value and every
+  replayed caller the converted one. A stored result that differs from what
+  the function returned would be a silent correctness bug. The one accepted
+  conversion is `Date`, which stores as its ISO instant and **replays as a
+  string** — the JSON convention every consumer already expects.
 
 If serialization fails after your function succeeded, the record is
 released (retries allowed) and the `SerializationError` surfaces — the
@@ -94,7 +98,11 @@ the codec cannot read back replays as an `Error` carrying the raw text.
   hash differently.
 - **Order-independent for objects, order-preserving for arrays.**
 - **Machine- and locale-independent** — keys sort by code unit, numbers
-  normalize `-0`, dates hash as ISO instants, binary views hash as bytes.
+  normalize `-0`, dates hash as ISO instants. Byte carriers (`Buffer`,
+  `Uint8Array`, `ArrayBuffer`) hash as bytes and are interchangeable;
+  every other typed view hashes as its *interpreted element values* under
+  its own type tag, so `Uint16Array([1])` never collides with
+  `Uint8Array([1, 0])` and no host byte order leaks into a fingerprint.
 - **Prototype-pollution safe** — only own enumerable keys are read; an own
   `__proto__` key is treated as plain data.
 - **Loud on ambiguity** — functions, symbols, `Map`/`Set`/`RegExp` and
@@ -131,7 +139,12 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    plain sleep and reports itself once per wait as a process warning.
 3. If the record disappears (the holder failed or its lock expired), the
    waiter **takes over**: it attempts a fresh acquisition and executes.
-4. `WaitTimeoutError` when `waitTimeout` elapses first.
+   When the disappearance was the lock running out its TTL rather than the
+   holder releasing on failure, the takeover emits `expired-recovery`.
+4. `WaitTimeoutError` when `waitTimeout` elapses first. The budget covers
+   the **whole call**, not each wait: a waiter that takes over and then
+   loses the re-acquire race continues on the same deadline, so sustained
+   holder churn cannot keep one `execute` blocked past its upper bound.
 
 The fingerprint is re-checked on every poll, not just at acquisition: a
 holder's lock can expire mid-wait and another payload take the key over,
@@ -177,7 +190,7 @@ The `correlationId` is stable across all events of one `execute` call.
 | `replayed` | A stored outcome (result or persisted failure) was served |
 | `conflict` | The key was already in progress (before rejecting or waiting) |
 | `failed` | The function failed, the result was unstorable, or the completion write failed |
-| `expired-recovery` | Reserved: acquisition over an expired record (not detectable through the storage contract today) |
+| `expired-recovery` | A waiter observed the holder's lock run out its TTL and took the key over — the signal that holders are dying or stalling mid-execution. Emitted from the wait path only: on direct acquisition an expired record reads as absent by contract, so there is nothing to observe |
 | `storage-bypass` | `onStorageError: 'open'` ran an execution without the guarantee |
 
 `metrics` receives the same events through named methods (`onAcquired`,
@@ -186,9 +199,19 @@ they surface as process warnings instead of failing the operation.
 
 ## Storage errors
 
-Any storage failure surfaces as `StorageUnavailableError` with the driver
-error as `cause` (fail-closed, default) unless `onStorageError: 'open'`
-accepted the trade-off. Two subtleties:
+A storage that cannot be reached surfaces as `StorageUnavailableError`
+with the driver error as `cause` (fail-closed, default) unless
+`onStorageError: 'open'` accepted the trade-off — which it does for every
+interaction, including a poll that fails mid-wait and a heartbeat
+(`ctx.extend`) that cannot reach the storage.
+
+A storage that *answers* with something the record contract cannot
+describe raises `StorageCorruptError` instead, and **fail-open does not
+cover it**: the storage is healthy, the record decodes the same way on
+every attempt, so running unguarded would duplicate side effects for as
+long as the record lived rather than for as long as an outage lasted.
+Same for an acquire that exhausted its bounded contention retries. Two
+subtleties:
 
 - If the **completion write** fails after your function ran, fail-closed
   throws (the caller cannot know the result was registered) and fail-open

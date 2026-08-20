@@ -90,6 +90,60 @@ async function post (path: string, key: string | undefined, body: unknown): Prom
 }
 
 describe('express adapter', () => {
+  test('a key extractor reaches the native request and scopes records by principal', async () => {
+    // The facts carry the adapter's native req as `raw`, so the extractor
+    // can read what auth middleware attached: the same header key stops
+    // being shared across principals.
+    const scoped = express()
+    scoped.use(express.json())
+    scoped.use((req, _res, next) => {
+      const user = req.headers['x-user']
+      if (typeof user === 'string') (req as unknown as { user: { id: string } }).user = { id: user }
+      next()
+    })
+    scoped.use(ExpressMiddleware(new Idempotency({ storage: new MemoryStorage() }), {
+      key: (request) => {
+        const key = request.header('idempotency-key')
+        const user = (request.raw as { user?: { id: string } }).user?.id
+        return key === undefined || user === undefined ? undefined : `${encodeURIComponent(user)}:${key}`
+      }
+    }) as never)
+    let count = 0
+    scoped.post('/scoped', (_req, res) => { count += 1; res.status(201).json({ call: count }) })
+
+    const scopedServer = await new Promise<Server>((resolve) => {
+      const listening: Server = scoped.listen(0, () => resolve(listening))
+    })
+    try {
+      const address = scopedServer.address()
+      if (address === null || typeof address === 'string') throw new Error('no port')
+      const send = async (user?: string) => fetch(`http://127.0.0.1:${address.port}/scoped`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'shared-key',
+          ...(user === undefined ? {} : { 'x-user': user })
+        },
+        body: JSON.stringify({ amount: 10 })
+      })
+
+      const alice = await send('alice')
+      const aliceRetry = await send('alice')
+      assert.deepEqual(await alice.json(), { call: 1 })
+      assert.deepEqual(await aliceRetry.json(), { call: 1 }, 'the same principal replays')
+      assert.equal(aliceRetry.headers.get('idempotency-replayed'), 'true')
+
+      const bob = await send('bob')
+      assert.deepEqual(await bob.json(), { call: 2 }, 'another principal with the same header key executes fresh')
+
+      const anonymous = await send()
+      assert.deepEqual(await anonymous.json(), { call: 3 }, 'no principal means no key: unprotected passthrough')
+      assert.equal(anonymous.headers.get('idempotency-replayed'), null)
+    } finally {
+      await new Promise((resolve) => scopedServer.close(resolve))
+    }
+  })
+
   test('replays status, location and body with the replay marker', async () => {
     const first = await post('/payments', 'exp-1', { amount: 10 })
     assert.equal(first.status, 201)
@@ -234,6 +288,36 @@ describe('express adapter glue', () => {
     assert.equal(handled, 1)
     assert.equal(replayed.headers['idempotency-replayed'], 'true')
     assert.equal(replayed.body, 'created')
+  })
+
+  test('header lookups are case-insensitive for custom extractors', async () => {
+    // Node stores incoming header keys lowercased; an extractor written
+    // with HTTP's conventional casing must still read the value, or the
+    // route silently runs unprotected.
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency, {
+      key: (request) => request.header('Idempotency-Key')
+    })
+    let handled = 0
+    const roundTrip = async () => await new Promise<ReturnType<typeof fakeResponse>>((resolve) => {
+      const res = fakeResponse()
+      middleware(
+        { method: 'POST', path: '/fake', body: { n: 1 }, headers: { 'idempotency-key': 'cased-1' } },
+        res,
+        () => {
+          handled += 1
+          res.end('ok')
+          setImmediate(() => resolve(res))
+        }
+      )
+      setImmediate(() => setImmediate(() => resolve(res)))
+    })
+
+    await roundTrip()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const replayed = await roundTrip()
+    assert.equal(handled, 1, 'the mixed-case lookup found the key, so the second call replays')
+    assert.equal(replayed.headers['idempotency-replayed'], 'true')
   })
 
   test('distinct string keys never collapse onto their first character', async () => {

@@ -1,6 +1,6 @@
 import type { Idempotency } from '../index'
 import { HttpIdempotencyKernel } from '../http/kernel'
-import type { CapturedHttpResponse, HttpKernelOptions } from '../http/kernel'
+import type { CapturedHttpResponse, HttpKernelOptions, KernelOutcome } from '../http/kernel'
 
 export type { CapturedHttpResponse, FingerprintStrategy, HttpKernelOptions, HttpRequestFacts } from '../http/kernel'
 
@@ -69,36 +69,61 @@ export function HonoMiddleware (
 ): (c: HonoContextLike, next: HonoNext) => Promise<Response | undefined> {
   const kernel = new HttpIdempotencyKernel(idempotency, options)
   return async function quaysideIdempotency (c, next) {
+    // The facts are built before the body is read, so the key extractor
+    // (which must not depend on the body) can gate the buffering below.
+    const facts = {
+      method: c.req.method,
+      path: c.req.path,
+      body: undefined as unknown,
+      header: (name: string) => c.req.header(name),
+      raw: c
+    }
     // Fingerprinting is the only reason to read the body, and reading it
     // clones and buffers the whole request: requests the kernel would only
-    // wave through never pay for it.
-    const body = kernel.handles(c.req.method, c.req.header(kernel.header))
-      ? await requestBody(c.req.raw)
-      : undefined
-    const outcome = await kernel.handle(
-      {
-        method: c.req.method,
-        path: c.req.path,
-        body,
-        header: (name) => c.req.header(name)
-      },
-      async () => {
-        await next()
-        return captureWebResponse(kernel, c.res)
-      }
-    )
-    if (outcome.kind === 'passthrough') {
+    // wave through never pay for it. The method gate comes first so the
+    // key extractor never runs for a method the kernel ignores: handle()
+    // checks the method before deriving the key, and a GET on a public
+    // route must not be able to crash an extractor that assumes
+    // protected-route context.
+    if (kernel.shouldHandle(c.req.method) && kernel.handles(c.req.method, kernel.keyFor(facts))) {
+      facts.body = await requestBody(c.req.raw)
+    }
+    // Hono only dispatches c.res after the middleware chain returns, so
+    // awaiting the whole kernel outcome would hold every streamed byte
+    // hostage until the source ended or hit the size cap: an SSE client
+    // would see nothing at all. The race lets the middleware return the
+    // moment downstream produced its response; the capture drains a clone
+    // (taken synchronously, before dispatch reads the original) and the
+    // record settles concurrently with the body leaving the server. The
+    // race also gives the floating outcome its rejection handler.
+    let proceed!: () => void
+    const proceeded = new Promise<KernelOutcome>((resolve) => {
+      proceed = () => resolve({ kind: 'handled' })
+    })
+    const outcome = kernel.handle(facts, async () => {
+      await next()
+      proceed()
+      return captureWebResponse(kernel, c.res)
+    })
+    const first = await Promise.race([proceeded, outcome])
+    if (first.kind === 'handled') {
+      // Downstream answered on c.res; returning lets it flow. A retry
+      // arriving before the concurrent settlement finished still sees the
+      // in-progress record and gets its 409 (or waits), exactly as it
+      // would have mid-execution. (The kernel's own 'handled' cannot win
+      // the race: a running executor resolves it first.)
+      return
+    }
+    if (first.kind === 'passthrough') {
       await next()
       return
     }
-    if (outcome.kind === 'respond') {
-      // Null-body statuses (204, 304) reject any body, even an empty
-      // string; an empty replay body is a no-body response.
-      return new Response(outcome.response.body === '' ? null : outcome.response.body, {
-        status: outcome.response.status,
-        headers: outcome.response.headers
-      })
-    }
-    // 'handled': the downstream response is already on c.res.
+    // Only 'respond' remains: a replay, a conflict, an enforce rejection or
+    // a mapped error. Null-body statuses (204, 304) reject any body, even
+    // an empty string; an empty replay body is a no-body response.
+    return new Response(first.response.body === '' ? null : first.response.body, {
+      status: first.response.status,
+      headers: first.response.headers
+    })
   }
 }

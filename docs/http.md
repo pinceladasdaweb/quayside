@@ -11,7 +11,10 @@ only, implementing the IETF `Idempotency-Key` draft:
   running (or when a wait times out), `422` when the same key arrives with a
   different payload, `503` when the storage is unreachable, `400` for a
   missing key under `enforce` or a key that breaks `maxKeyLength` (both are
-  client input, so neither is ever answered with a 5xx).
+  client input, so neither is ever answered with a 5xx). Under `enforce`
+  with a custom `key` extractor the `400` says no key could be *derived*
+  rather than naming the header: the client may well have sent it, and the
+  missing ingredient was something else.
 - **Route policies**: which methods to protect, enforce-vs-passthrough,
   fingerprint strategy.
 
@@ -32,6 +35,20 @@ import { ExpressMiddleware } from 'quayside/express'
 app.use(express.json())
 app.use(ExpressMiddleware(idempotency, { enforce: true }))
 ```
+
+The body parser must run **before** the middleware, and must handle the
+content types you protect: the payload fingerprint covers the parsed body,
+so a body that arrives unparsed cannot validate key reuse — every payload
+then fingerprints identically and two different requests under one key
+replay each other instead of answering `422`.
+
+The kernel reports that misconfiguration as a process warning, once per
+instance, whenever a protected, keyed request declares a body on the wire
+that did not survive parsing: `undefined` (no parser ran) or an empty
+object (a parser declined the content type, as `express.json()` does for
+`text/plain` or `multipart`). An empty body is only flagged against a
+longer declared `content-length` — `{}` is two bytes, so a client that
+genuinely sent it is not misconfigured.
 
 Fastify:
 
@@ -54,12 +71,57 @@ app.use(HonoMiddleware(idempotency, { enforce: true }))
 | Option | Default | Meaning |
 |---|---|---|
 | `header` | `'Idempotency-Key'` | Header carrying the key |
+| `key` | header read | Derives the storage key from the request; `undefined` means no key. See [Scope keys to the caller](#scope-keys-to-the-caller) |
 | `methods` | `['POST', 'PATCH']` | Methods the adapter protects |
 | `enforce` | `false` | `true` rejects requests without a key (400); `false` passes them through unprotected |
 | `fingerprint` | `'body'` | `'body'`, `'body-and-path'` or a custom `(request) => unknown` |
 | `maxBodyBytes` | 1 MiB | Largest response body stored for replay |
 | `replayHeaders` | `['content-type', 'location']` | Response headers stored and replayed |
 | `retryAfterSeconds` | `1` | `Retry-After` hint on 409 responses |
+
+## Scope keys to the caller
+
+A bare header key is **shared by every caller** on the same storage and
+namespace: whoever presents `Idempotency-Key: abc123` first owns the record,
+and anyone presenting it later gets the stored response — *before* the route
+handler and whatever authorization lives inside it ever run. With predictable
+keys (order ids, sequential values, ids leaked into logs or support tickets)
+that is a real risk on shared endpoints: another authenticated user replaying
+a victim's response, or planting a key first so the victim's own request
+fails with `422`.
+
+The `key` option closes this: derive the storage key from the caller's
+identity plus the header, and the same header value stops colliding across
+principals. The request facts carry the adapter's native request as `raw`
+(the Express `req`, the Fastify request, the Hono context), so whatever your
+auth middleware attached is in reach:
+
+```ts
+app.use(ExpressMiddleware(idempotency, {
+  key: (request) => {
+    const key = request.header('idempotency-key')
+    const user = (request.raw as { user?: { id: string } }).user?.id
+    if (key === undefined || user === undefined) return undefined
+    // Encode the principal so an id containing ':' cannot alias another
+    // caller's composition ('u:1' + 'x' versus 'u' + '1:x').
+    return `${encodeURIComponent(user)}:${key}`
+  }
+}))
+```
+
+Returning `undefined` means "this request carries no key": it passes through
+unprotected, or answers `400` under `enforce` — so an unauthenticated request
+never shares records with anyone. `request.header(name)` is case-insensitive
+in every adapter: `header('Idempotency-Key')` and `header('idempotency-key')`
+read the same value, so an extractor ports between adapters unchanged. The extractor must not read `body`: the
+Hono adapter derives the key before buffering the request, precisely so
+keyless requests never pay for a body nobody will fingerprint.
+
+On NestJS the same pattern goes through the decorator's own hook:
+`@Idempotent({ key: (request) => ... })` receives the request object, and an
+auth guard's `request.user` is reachable by casting. Scope keys per principal
+whenever an endpoint serves more than one caller; leave the plain header read
+for single-tenant or internal services where every caller is equally trusted.
 
 ## What is cached — and what deliberately is not
 
@@ -85,9 +147,14 @@ be answered with a different status without lying to the client. The response
 stands, the failure is reported as a process warning and through the
 `failed` event, and nothing was stored, so a client retry re-executes.
 
-Note that with the Express adapter the record is committed right after the
-response is flushed; with Fastify and Hono it is committed before the
-response leaves the server.
+Note the commit timing per adapter: Fastify commits the record before the
+response leaves the server; Express commits right after the response is
+flushed; Hono commits concurrently with the dispatch — the capture drains a
+clone while the body streams to the client, so streaming responses (SSE,
+chunked) flow immediately instead of being buffered to the size cap, and
+the record settles when the body finishes. In the Express and Hono windows
+a retry arriving between the response and the commit briefly answers 409
+with `Retry-After`, which resolves itself on the next retry.
 
 The Fastify adapter also settles on the raw `close` event, so a hijacked
 reply (`reply.hijack()`, SSE, proxying) releases the key instead of holding

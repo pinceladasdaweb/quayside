@@ -2,7 +2,7 @@ import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as sleep } from 'node:timers/promises'
 
-import { FencingError, Idempotency, StorageUnavailableError } from '../../src/index'
+import { FencingError, Idempotency, StorageCorruptError, StorageUnavailableError } from '../../src/index'
 import type { IdempotencyEvent, IdempotencyStorage } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 
@@ -144,6 +144,168 @@ describe('onStorageError policies', () => {
     })
     assert.equal(await idempotency.execute('k', async () => 'v'), 'v')
     assert.deepEqual(events, ['acquired', 'storage-bypass'])
+  })
+
+  test('a corrupt record is never mistaken for an outage, in either policy', async () => {
+    // Fail-open trades the guarantee for availability during an OUTAGE. A
+    // record the contract cannot describe is a data bug on a healthy
+    // storage, and it decodes the same way on every attempt: treating it
+    // as an outage would run every request for that key unguarded until
+    // the record expired.
+    const corrupt: IdempotencyStorage = {
+      acquire: async (record) => { throw new StorageCorruptError(record.key, 'corrupt idempotency record') },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    for (const policy of ['closed', 'open'] as const) {
+      let calls = 0
+      const idempotency = new Idempotency({ storage: corrupt, onStorageError: policy })
+      await assert.rejects(
+        idempotency.execute('k', async () => { calls += 1; return 'v' }),
+        (error: unknown) => {
+          assert.ok(error instanceof StorageCorruptError, `${policy} must surface the corruption`)
+          assert.equal(error.code, 'IDEMPOTENCY_STORAGE_CORRUPT')
+          assert.equal(error.key, 'k')
+          return true
+        }
+      )
+      assert.equal(calls, 0, `${policy} must not run unguarded on a data bug`)
+    }
+  })
+
+  test('open covers a storage that dies while a waiter is polling', async () => {
+    // The acquire path and the wait path take the same trade-off: an
+    // instance that chose availability must not answer an outage with an
+    // error just because it happened to be waiting when it hit.
+    const memory = new MemoryStorage()
+    let polls = 0
+    const diesWhileWaiting: IdempotencyStorage = {
+      acquire: (record, lockTtlMs) => memory.acquire(record, lockTtlMs),
+      complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, lockTtlMs) => memory.extend(key, token, lockTtlMs),
+      get: async (key) => {
+        polls += 1
+        if (polls > 1) throw new Error('connection lost mid-wait')
+        return memory.get(key)
+      },
+      delete: (key) => memory.delete(key)
+    }
+    const events: string[] = []
+    const idempotency = new Idempotency({
+      storage: diesWhileWaiting,
+      onConflict: 'wait',
+      onStorageError: 'open',
+      onEvent: (event) => events.push(event.type)
+    })
+    const { open, opened } = gate()
+    const holder = idempotency.execute('k-wait', async () => { await opened; return 'winner' })
+    await new Promise((resolve) => setImmediate(resolve))
+    const waiter = idempotency.execute('k-wait', async () => 'unguarded')
+
+    assert.equal(await waiter, 'unguarded', 'the waiter ran instead of surfacing a 503')
+    assert.ok(events.includes('storage-bypass'), 'and the bypass is observable')
+    open()
+    assert.equal(await holder, 'winner')
+  })
+
+  test('closed still surfaces a storage that dies while a waiter is polling', async () => {
+    const memory = new MemoryStorage()
+    let polls = 0
+    const diesWhileWaiting: IdempotencyStorage = {
+      acquire: (record, lockTtlMs) => memory.acquire(record, lockTtlMs),
+      complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, lockTtlMs) => memory.extend(key, token, lockTtlMs),
+      get: async (key) => {
+        polls += 1
+        if (polls > 1) throw new Error('connection lost mid-wait')
+        return memory.get(key)
+      },
+      delete: (key) => memory.delete(key)
+    }
+    const idempotency = new Idempotency({ storage: diesWhileWaiting, onConflict: 'wait' })
+    const { open, opened } = gate()
+    const holder = idempotency.execute('k-closed', async () => { await opened; return 'winner' })
+    await new Promise((resolve) => setImmediate(resolve))
+    let ran = false
+    await assert.rejects(
+      idempotency.execute('k-closed', async () => { ran = true; return 'never' }),
+      StorageUnavailableError,
+      'fail-closed refuses to run when the poll cannot reach the storage'
+    )
+    assert.equal(ran, false)
+    open()
+    assert.equal(await holder, 'winner')
+  })
+
+  test('a corrupt record found mid-wait is surfaced even under fail-open', async () => {
+    // Availability is traded for outages, not for data bugs: the record
+    // decodes the same way on the next poll too.
+    const memory = new MemoryStorage()
+    let polls = 0
+    const corruptMidWait: IdempotencyStorage = {
+      acquire: (record, lockTtlMs) => memory.acquire(record, lockTtlMs),
+      complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, lockTtlMs) => memory.extend(key, token, lockTtlMs),
+      get: async (key) => {
+        polls += 1
+        if (polls > 1) throw new StorageCorruptError(key, 'corrupt idempotency record')
+        return memory.get(key)
+      },
+      delete: (key) => memory.delete(key)
+    }
+    const idempotency = new Idempotency({
+      storage: corruptMidWait,
+      onConflict: 'wait',
+      onStorageError: 'open'
+    })
+    const { open, opened } = gate()
+    const holder = idempotency.execute('k-corrupt', async () => { await opened; return 'winner' })
+    await new Promise((resolve) => setImmediate(resolve))
+    let ran = false
+    await assert.rejects(
+      idempotency.execute('k-corrupt', async () => { ran = true; return 'never' }),
+      StorageCorruptError
+    )
+    assert.equal(ran, false, 'a data bug must not be answered by running unguarded')
+    open()
+    assert.equal(await holder, 'winner')
+  })
+
+  test('open covers a storage that dies during a heartbeat', async () => {
+    const memory = new MemoryStorage()
+    const noExtend: IdempotencyStorage = {
+      acquire: (record, lockTtlMs) => memory.acquire(record, lockTtlMs),
+      complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+      release: (key, token) => memory.release(key, token),
+      extend: async () => { throw new Error('connection lost') },
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const events: string[] = []
+    const idempotency = new Idempotency({
+      storage: noExtend,
+      onStorageError: 'open',
+      onEvent: (event) => events.push(event.type)
+    })
+    // A heartbeat that cannot reach the storage must not abort a function
+    // this instance already chose to keep running.
+    assert.equal(await idempotency.execute('k-beat', async (ctx) => {
+      await ctx.extend('30s')
+      return 'finished'
+    }), 'finished')
+    assert.ok(events.includes('storage-bypass'))
+
+    const strict = new Idempotency({ storage: noExtend })
+    await assert.rejects(
+      strict.execute('k-beat-closed', async (ctx) => { await ctx.extend('30s'); return 'never' }),
+      StorageUnavailableError
+    )
   })
 
   test('closed surfaces a completion write failure after the function ran', async () => {

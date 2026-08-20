@@ -5,6 +5,7 @@ export const ERROR_CODES = {
   waitTimeout: 'IDEMPOTENCY_WAIT_TIMEOUT',
   fencing: 'IDEMPOTENCY_FENCING',
   serialization: 'IDEMPOTENCY_SERIALIZATION',
+  storageCorrupt: 'IDEMPOTENCY_STORAGE_CORRUPT',
   storageUnavailable: 'IDEMPOTENCY_STORAGE_UNAVAILABLE'
 } as const
 
@@ -80,6 +81,24 @@ export class SerializationError extends QuaysideError {
 
   constructor (message: string, options?: ErrorOptions) {
     super(ERROR_CODES.serialization, message, options)
+  }
+}
+
+/**
+ * The storage answered, but with something the record contract cannot
+ * describe: a row or wire record whose status is not a known state, or an
+ * acquire that kept losing its race until the bounded retries ran out.
+ * Deliberately not a StorageUnavailableError: the storage is healthy, so
+ * fail-open must not treat it as an outage and run unguarded forever on a
+ * key whose record will keep decoding the same way.
+ */
+export class StorageCorruptError extends QuaysideError {
+  declare readonly code: typeof ERROR_CODES.storageCorrupt
+  readonly key: string
+
+  constructor (key: string, message: string) {
+    super(ERROR_CODES.storageCorrupt, message)
+    this.key = key
   }
 }
 

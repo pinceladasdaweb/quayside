@@ -45,6 +45,12 @@ export function prometheusMetrics (options: PrometheusMetricsOptions = {}): Metr
     labelNames: ['namespace'],
     registers: [registry]
   })
+  const recoveries = new Counter({
+    name: `${prefix}expired_recovery_total`,
+    help: 'Waiters that observed the holder lock expire and took the key over (holders dying or stalling mid-execution).',
+    labelNames: ['namespace'],
+    registers: [registry]
+  })
   const duration = new Histogram({
     name: `${prefix}execution_duration_seconds`,
     help: 'Duration from execute() to the terminal outcome; replayed durations approximate the time a waiter spent blocked.',
@@ -66,6 +72,7 @@ export function prometheusMetrics (options: PrometheusMetricsOptions = {}): Metr
     onReplayed: observe('replayed'),
     onFailed: observe('failed'),
     onConflict: (event) => conflicts.inc({ namespace: event.namespace ?? '' }),
+    onExpiredRecovery: (event) => recoveries.inc({ namespace: event.namespace ?? '' }),
     onStorageBypass: (event) => bypasses.inc({ namespace: event.namespace ?? '' })
   }
 }

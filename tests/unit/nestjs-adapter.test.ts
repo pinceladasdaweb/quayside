@@ -7,11 +7,12 @@ import { Body, Controller, Post, UseInterceptors } from '@nestjs/common'
 import type { INestApplication } from '@nestjs/common'
 import { Test } from '@nestjs/testing'
 
-import { Idempotency } from '../../src/index'
+import { FencingError, Idempotency } from '../../src/index'
 import type { IdempotencyStorage } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 import { Idempotent, IdempotencyInterceptor, QuaysideModule } from '../../src/nestjs/index'
 import type { NestRequestLike } from '../../src/nestjs/index'
+import { warningsDuring } from '../helpers/warnings'
 
 let app: INestApplication
 let base: string
@@ -282,11 +283,181 @@ describe('nestjs interceptor glue', () => {
     )
   })
 
+  test('a server-status HttpException is never persisted as a replayable failure', async () => {
+    // The kernel never caches a 5xx response; the value-level interceptor
+    // has to agree. A stored 500 would answer every retry until the result
+    // TTL ran out, on exactly the requests persistFailures exists for.
+    const { HttpException } = await import('@nestjs/common')
+    const { lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    const interceptor = new IdempotencyInterceptor(idempotency, { storage, persistFailures: true })
+    const handler = decorated()
+    const context = fakeContext({ 'idempotency-key': 'nest-500' }, {}, handler)
+
+    // Status 500 exactly: the boundary of "server error" is inclusive.
+    const { of } = await import('rxjs')
+    let attempts = 0
+    const flaky = {
+      handle: () => {
+        attempts += 1
+        if (attempts === 1) throw new HttpException({ statusCode: 500, message: 'upstream timeout' }, 500)
+        return of('recovered')
+      }
+    }
+    await assert.rejects(
+      lastValueFrom(interceptor.intercept(context as never, flaky)),
+      (error: unknown) => error instanceof HttpException && error.getStatus() === 500
+    )
+
+    // The retry re-executes under a fresh lock instead of replaying the 500.
+    const retried = await lastValueFrom(interceptor.intercept(context as never, flaky))
+    assert.equal(retried, 'recovered', 'a transient 500 must not become the stored answer')
+    assert.equal(attempts, 2, 'the retry ran the handler again')
+  })
+
+  test('the enforce 400 names the header only when the header is what was read', async () => {
+    const { HttpException } = await import('@nestjs/common')
+    const storage = new MemoryStorage()
+    const interceptor = new IdempotencyInterceptor(new Idempotency({ storage }), { storage })
+
+    const plain = decorated({ enforce: true })
+    await assert.rejects(
+      intercept(interceptor, fakeContext({}, {}, plain)),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        const body = error.getResponse() as { error: string, message: string }
+        assert.equal(body.error, 'IDEMPOTENCY_KEY_REQUIRED')
+        // Exact: the decorator path has no method to scope the message with.
+        assert.equal(body.message, 'the idempotency-key header is required')
+        return true
+      }
+    )
+
+    // The extractor declined for its own reason (no principal here); the
+    // client sent the header and must not be told to send it again.
+    const derived = decorated({ enforce: true, key: () => undefined })
+    await assert.rejects(
+      intercept(interceptor, fakeContext({ 'idempotency-key': 'present' }, {}, derived)),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        const body = error.getResponse() as { error: string, message: string }
+        assert.equal(body.error, 'IDEMPOTENCY_KEY_REQUIRED')
+        assert.doesNotMatch(body.message, /header is required/)
+        assert.equal(body.message, 'no idempotency key could be derived for this request')
+        return true
+      }
+    )
+  })
+
+  test('retry-after on 409 follows the configured hint', async () => {
+    // The other three adapters take retryAfterSeconds; a NestJS app used to
+    // be stuck on 1 second while sharing the same storage.
+    const { from, lastValueFrom, of } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const options = { storage, retryAfterSeconds: 7 }
+    const idempotency = new Idempotency(options)
+    const interceptor = new IdempotencyInterceptor(idempotency, options)
+    const handler = decorated()
+    const headersSet: Record<string, string> = {}
+    const response = { setHeader: (name: string, value: string) => { headersSet[name] = value } }
+    const context = fakeContext({ 'idempotency-key': 'nest-retry' }, response, handler)
+
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const holder = lastValueFrom(interceptor.intercept(context as never, {
+      handle: () => from(gate.then(() => 'held'))
+    }))
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await assert.rejects(
+      lastValueFrom(interceptor.intercept(context as never, { handle: () => of('second') })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        return true
+      }
+    )
+    assert.equal(headersSet['retry-after'], '7', 'the configured hint reaches the client')
+    release()
+    await holder
+  })
+
+  test('a passthrough handler that set a server status is never persisted as success', async () => {
+    // The gate reads the platform response the interceptor already holds:
+    // res.status(500) plus a returned body is a declared server error, and
+    // caching it would replay the degraded body as a 2xx success.
+    const { of, lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const interceptor = new IdempotencyInterceptor(new Idempotency({ storage }), { storage })
+    const handler = decorated()
+    let attempts = 0
+    const degraded = { statusCode: 200, setHeader: (_n: string, _v: string) => {} }
+    const context = fakeContext({ 'idempotency-key': 'nest-passthrough' }, degraded, handler)
+    const flaky = {
+      handle: () => {
+        attempts += 1
+        // Status 500 exactly: the boundary of "server error" is inclusive.
+        degraded.statusCode = attempts === 1 ? 500 : 200
+        return of(attempts === 1 ? { error: 'temporarily unavailable' } : { ok: true })
+      }
+    }
+
+    assert.deepEqual(await lastValueFrom(interceptor.intercept(context as never, flaky)), { error: 'temporarily unavailable' })
+    assert.deepEqual(await lastValueFrom(interceptor.intercept(context as never, flaky)), { ok: true }, 'the retry re-executed instead of replaying the degraded body')
+    assert.equal(attempts, 2)
+  })
+
+  test('a success status on the platform response still replays', async () => {
+    const { of, lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const interceptor = new IdempotencyInterceptor(new Idempotency({ storage }), { storage })
+    const created = { statusCode: 201, setHeader: (_n: string, _v: string) => {} }
+    const context = fakeContext({ 'idempotency-key': 'nest-201' }, created, decorated())
+    let runs = 0
+    const handle = { handle: () => { runs += 1; return of({ id: runs }) } }
+
+    assert.deepEqual(await lastValueFrom(interceptor.intercept(context as never, handle)), { id: 1 })
+    assert.deepEqual(await lastValueFrom(interceptor.intercept(context as never, handle)), { id: 1 }, 'a 2xx platform status is stored and replayed')
+    assert.equal(runs, 1)
+  })
+
+  test('a settlement failure after the handler succeeded serves the value, not a 500', async () => {
+    // The kernel warns and serves the response when settlement fails after
+    // the downstream answered; the value-level equivalent returns the
+    // computed value. Answering 500 would discard completed work and the
+    // retry would re-run the side effect.
+    const { of, lastValueFrom } = await import('rxjs')
+    const fencing: IdempotencyStorage = {
+      acquire: async () => null,
+      complete: async () => { throw new FencingError('nest-fence') },
+      release: async () => {},
+      extend: async () => {},
+      get: async () => null,
+      delete: async () => {}
+    }
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: fencing }),
+      { storage: fencing }
+    )
+    const context = fakeContext({ 'idempotency-key': 'nest-fence' }, {}, decorated())
+
+    let served: unknown
+    const warnings = await warningsDuring(async () => {
+      served = await lastValueFrom(interceptor.intercept(context as never, { handle: () => of('done') }))
+    })
+    assert.equal(served, 'done', 'the computed value is the truthful answer')
+    assert.equal(warnings.length, 1, 'and the settlement failure is reported')
+    assert.match(warnings[0] ?? '', /could not settle/)
+    assert.match(warnings[0] ?? '', /nest-fence/, 'naming the key it affects')
+  })
+
   test('an oversized key answers 400, not 500', async () => {
     const { HttpException } = await import('@nestjs/common')
     const options = { storage: new MemoryStorage(), maxKeyLength: 16 }
     const interceptor = new IdempotencyInterceptor(new Idempotency(options), options)
-    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, {}, decorated())
+    const headersSet: Record<string, string> = {}
+    const response = { setHeader: (name: string, value: string) => { headersSet[name] = value } }
+    const context = fakeContext({ 'idempotency-key': 'x'.repeat(20) }, response, decorated())
 
     await assert.rejects(intercept(interceptor, context), (error: unknown) => {
       assert.ok(error instanceof HttpException)
@@ -296,6 +467,8 @@ describe('nestjs interceptor glue', () => {
       assert.match(body.message, /16/)
       return true
     })
+    // Retry-After belongs to the 409 alone: a rejected key never improves.
+    assert.ok(!('retry-after' in headersSet))
   })
 
   test('only a complete http shape is rebuilt as an HttpException', async () => {
@@ -362,9 +535,12 @@ describe('nestjs interceptor glue', () => {
     const { HttpException } = await import('@nestjs/common')
     const { FencingError } = await import('../../src/index')
 
+    // A fencing failure BEFORE the handler ran still maps through the
+    // error table; one after a successful handler serves the value instead
+    // (covered by the settlement-failure test above).
     const fencing: IdempotencyStorage = {
-      acquire: async () => null,
-      complete: async () => { throw new FencingError('k') },
+      acquire: async () => { throw new FencingError('k') },
+      complete: async () => {},
       release: async () => {},
       extend: async () => {},
       get: async () => null,

@@ -1,5 +1,5 @@
-import type { SqlRunner, SqlStatements } from '../sql/core'
-import { SqlStorageCore, assertSafeTableName } from '../sql/core'
+import type { SqlDialect, SqlRunner } from '../sql/core'
+import { SqlStorageCore, assertSafeTableName, buildStatements } from '../sql/core'
 
 export type { SqlRunResult, SqlRunner, SqlStatements } from '../sql/core'
 
@@ -36,18 +36,9 @@ export function postgresMigration (tableName: string = DEFAULT_TABLE): string {
 CREATE INDEX IF NOT EXISTS ${tableName}_expires_at ON ${tableName} (expires_at);`
 }
 
-function statementsFor (table: string): SqlStatements {
-  return {
-    insert: `INSERT INTO ${table} (record_key, token, status, fingerprint, stored_at, expires_at) VALUES ($1, $2, 'in-progress', $3, $4, $5) ON CONFLICT (record_key) DO NOTHING`,
-    takeover: `UPDATE ${table} SET token = $1, status = 'in-progress', fingerprint = $2, result = NULL, error = NULL, stored_at = $3, expires_at = $4 WHERE record_key = $5 AND expires_at <= $6`,
-    select: `SELECT record_key, token, status, fingerprint, result, error, stored_at, expires_at FROM ${table} WHERE record_key = $1 AND expires_at > $2`,
-    completeResult: `UPDATE ${table} SET status = 'completed', result = $1, expires_at = $2 WHERE record_key = $3 AND token = $4 AND status = 'in-progress' AND expires_at > $5`,
-    completeError: `UPDATE ${table} SET status = 'failed', error = $1, expires_at = $2 WHERE record_key = $3 AND token = $4 AND status = 'in-progress' AND expires_at > $5`,
-    release: `DELETE FROM ${table} WHERE record_key = $1 AND token = $2 AND status = 'in-progress' AND expires_at > $3`,
-    extend: `UPDATE ${table} SET expires_at = $1 WHERE record_key = $2 AND token = $3 AND status = 'in-progress' AND expires_at > $4`,
-    remove: `DELETE FROM ${table} WHERE record_key = $1`,
-    sweep: `DELETE FROM ${table} WHERE expires_at <= $1`
-  }
+const POSTGRES_DIALECT: SqlDialect = {
+  placeholder: (index) => `$${index}`,
+  insertIfAbsent: (tableAndValues) => `INSERT INTO ${tableAndValues} ON CONFLICT (record_key) DO NOTHING`
 }
 
 /**
@@ -67,7 +58,7 @@ export class PostgresStorage extends SqlStorageCore {
       const result = await client.query(sql, params)
       return { affected: result.rowCount ?? 0, rows: result.rows }
     }
-    super(run, statementsFor(tableName), options.maxKeyBytes ?? 512)
+    super(run, buildStatements(tableName, POSTGRES_DIALECT), options.maxKeyBytes ?? 512)
     this.client = client
     this.tableName = tableName
   }

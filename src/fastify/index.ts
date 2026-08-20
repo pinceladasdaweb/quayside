@@ -1,5 +1,5 @@
 import type { Idempotency } from '../index'
-import { HttpIdempotencyKernel } from '../http/kernel'
+import { HttpIdempotencyKernel, headerValue } from '../http/kernel'
 import type { CapturedHttpResponse, HttpKernelOptions, KernelOutcome } from '../http/kernel'
 
 export type { CapturedHttpResponse, FingerprintStrategy, HttpKernelOptions, HttpRequestFacts } from '../http/kernel'
@@ -38,11 +38,6 @@ export interface FastifyInstanceLike {
 interface PendingExecution {
   resolveCapture (captured: CapturedHttpResponse | null): void
   outcome: Promise<KernelOutcome>
-}
-
-function headerValue (value: unknown): string | undefined {
-  if (Array.isArray(value)) return headerValue(value[0])
-  return typeof value === 'string' ? value : undefined
 }
 
 function pathOf (url: string): string {
@@ -111,7 +106,11 @@ export function FastifyPlugin (
           method: request.method,
           path: pathOf(request.url),
           body: request.body,
-          header: (name) => headerValue(request.headers[name])
+          // Node lowercases incoming header keys; lowering the lookup name
+          // makes header() case-insensitive, matching the hono adapter and
+          // the web Headers convention custom extractors expect.
+          header: (name) => headerValue(request.headers[name.toLowerCase()]),
+          raw: request
         },
         () => {
           proceed()

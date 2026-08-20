@@ -1,3 +1,5 @@
+import { StorageCorruptError } from './errors'
+
 export const RECORD_STATUS = {
   inProgress: 'in-progress',
   completed: 'completed',
@@ -5,6 +7,66 @@ export const RECORD_STATUS = {
 } as const
 
 export type RecordStatus = (typeof RECORD_STATUS)[keyof typeof RECORD_STATUS]
+
+/** The status strings a stored record may carry; anything else is corruption. */
+export const VALID_STATUS: ReadonlySet<string> = new Set(Object.values(RECORD_STATUS))
+
+/**
+ * How many times an acquire may contend before giving up: a record can
+ * expire or vanish between the steps of one attempt, so adapters loop
+ * instead of failing on the first race, bounded so a pathological storage
+ * cannot spin forever.
+ */
+export const MAX_ACQUIRE_ATTEMPTS = 5
+
+/**
+ * A stored record as its storage hands it back, before validation: SQL
+ * rows and the Redis wire shape name these fields differently and type
+ * them differently (a BIGINT may arrive as a string, the Redis wire keeps
+ * epochs as strings on purpose), so adapters map their names onto this
+ * shape and share the decoding below.
+ */
+export interface RawRecordFields {
+  token: unknown
+  status: unknown
+  fingerprint: unknown
+  result: unknown
+  error: unknown
+  storedAt: unknown
+  expiresAt: unknown
+}
+
+/**
+ * Validates and normalizes what a storage returned. Every adapter decodes
+ * through here so a record that the contract cannot describe is caught the
+ * same way everywhere: a status outside the state machine, a token that is
+ * not a string, or a timestamp that is not a number are corruption, not
+ * values to carry into fencing and expiry decisions.
+ */
+export function buildStoredRecord (key: string, fields: RawRecordFields): StoredRecord {
+  const storedAt = Number(fields.storedAt)
+  const expiresAt = Number(fields.expiresAt)
+  if (
+    typeof fields.token !== 'string' ||
+    // A non-string status cannot be a member either, so the set lookup is
+    // the whole status check.
+    !VALID_STATUS.has(fields.status as string) ||
+    !Number.isFinite(storedAt) ||
+    !Number.isFinite(expiresAt)
+  ) {
+    throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}"`)
+  }
+  const record: StoredRecord = {
+    token: fields.token,
+    status: fields.status as RecordStatus,
+    storedAt,
+    expiresAt
+  }
+  if (typeof fields.fingerprint === 'string') record.fingerprint = fields.fingerprint
+  if (typeof fields.result === 'string') record.result = fields.result
+  if (typeof fields.error === 'string') record.error = fields.error
+  return record
+}
 
 export interface PendingRecord {
   key: string

@@ -1,5 +1,5 @@
 import type { Idempotency } from '../index'
-import { HttpIdempotencyKernel } from '../http/kernel'
+import { HttpIdempotencyKernel, headerValue } from '../http/kernel'
 import type { CapturedHttpResponse, HttpKernelOptions } from '../http/kernel'
 
 export type { CapturedHttpResponse, FingerprintStrategy, HttpKernelOptions, HttpRequestFacts } from '../http/kernel'
@@ -22,11 +22,6 @@ export interface ExpressResponseLike {
 }
 
 export type ExpressNext = (error?: unknown) => void
-
-function headerValue (value: unknown): string | undefined {
-  if (Array.isArray(value)) return headerValue(value[0])
-  return typeof value === 'string' ? value : undefined
-}
 
 // Response capture is the framework-specific part: Express writes through
 // res.write/res.end (res.send and res.json funnel into them), so both are
@@ -103,7 +98,12 @@ export function ExpressMiddleware (
         method: req.method,
         path: req.path,
         body: req.body,
-        header: (name) => headerValue(req.headers[name])
+        // Node lowercases incoming header keys; lowering the lookup name
+        // makes header() case-insensitive, so a custom key or fingerprint
+        // extractor written with HTTP's conventional casing reads the same
+        // value on every adapter.
+        header: (name) => headerValue(req.headers[name.toLowerCase()]),
+        raw: req
       },
       () => captureResponse(kernel, res, next)
     ).then((outcome) => {
