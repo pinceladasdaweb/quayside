@@ -33,6 +33,13 @@ app.use(express.json())
 app.use(ExpressMiddleware(idempotency, { enforce: true }))
 ```
 
+The body parser must run **before** the middleware: the payload fingerprint
+covers the parsed body, so a body that arrives unparsed (parser mounted
+after, or a content type no parser handles) cannot validate key reuse. The
+kernel reports that misconfiguration as a process warning — once per
+instance — whenever a protected, keyed request declares a body on the wire
+that reaches it as `undefined`.
+
 Fastify:
 
 ```ts

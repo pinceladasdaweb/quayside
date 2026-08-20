@@ -97,6 +97,49 @@ describe('http kernel key extraction', () => {
   })
 })
 
+describe('http kernel unparsed-body warning', () => {
+  function bodyless (headers: Record<string, string | undefined>): HttpRequestFacts {
+    return { method: 'POST', path: '/p', body: undefined, header: (name) => headers[name] }
+  }
+
+  test('a declared body arriving unparsed is reported once per kernel', async () => {
+    // The reuse guard silently degrades to key-only matching when nobody
+    // parsed the body; the misconfiguration must be loud, not per-request.
+    const kernel = kernelWith()
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(bodyless({ 'idempotency-key': 'w-1', 'content-length': '18' }), async () => ok())
+      await kernel.handle(bodyless({ 'idempotency-key': 'w-2', 'content-length': '18' }), async () => ok())
+    })
+    assert.equal(warnings.length, 1, 'one report per kernel, not per request')
+    assert.match(warnings[0] ?? '', /body parser/, 'the warning names the likely fix')
+    assert.match(warnings[0] ?? '', /idempotency-key/, 'and the header it protects')
+    assert.match(warnings[0] ?? '', /a POST request/, 'and the method, in its canonical casing')
+
+    const chunked = kernelWith()
+    const chunkedWarnings = await warningsDuring(async () => {
+      await chunked.handle(bodyless({ 'idempotency-key': 'w-3', 'transfer-encoding': 'chunked' }), async () => ok())
+    })
+    assert.equal(chunkedWarnings.length, 1, 'a chunked body has no content-length and still warns')
+  })
+
+  test('genuinely bodyless and parsed requests stay silent', async () => {
+    const kernel = kernelWith()
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(bodyless({ 'idempotency-key': 's-1' }), async () => ok())
+      await kernel.handle(bodyless({ 'idempotency-key': 's-2', 'content-length': '0' }), async () => ok())
+      await kernel.handle(bodyless({ 'idempotency-key': 's-3', 'content-length': '' }), async () => ok())
+      // The everyday case: a parsed body whose content-length is still on
+      // the wire. Only the unparsed combination may warn.
+      const headers: Record<string, string | undefined> = { 'idempotency-key': 's-4', 'content-length': '18' }
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: { amount: 10 }, header: (name) => headers[name] },
+        async () => ok()
+      )
+    })
+    assert.equal(warnings.length, 0, 'no wire body, or a parsed one: the fingerprint is doing its job')
+  })
+})
+
 describe('http kernel replay', () => {
   test('first execution is handled downstream, replay serves status, headers, body and the marker', async () => {
     const kernel = kernelWith()

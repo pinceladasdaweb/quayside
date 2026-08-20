@@ -142,6 +142,7 @@ export class HttpIdempotencyKernel {
   private readonly keyOf: (request: HttpRequestFacts) => string | undefined
   private readonly replayHeaders: string[]
   private readonly retryAfterSeconds: number
+  private warnedUnparsedBody = false
 
   constructor (idempotency: Idempotency, options: HttpKernelOptions = {}) {
     this.idempotency = idempotency
@@ -199,6 +200,18 @@ export class HttpIdempotencyKernel {
       }
     }
 
+    // A protected, keyed request whose wire carries a body that nobody
+    // parsed cannot be fingerprinted: the reuse guard silently degrades to
+    // key-only matching, and two different payloads under one key would
+    // replay instead of answering 422. That is a mount-order or parser
+    // misconfiguration, and staying quiet about it is the actual bug, so
+    // it is reported once per kernel.
+    if (request.body === undefined && !this.warnedUnparsedBody && this.declaresBody(request)) {
+      this.warnedUnparsedBody = true
+
+      process.emitWarning(`quayside: a ${request.method.toUpperCase()} request carrying "${this.header}" declares a body, but request.body is undefined, so the payload fingerprint cannot validate key reuse. Is the body parser mounted before the idempotency middleware?`)
+    }
+
     const payload = this.fingerprintPayload(request)
     // Once the downstream response is out there is nothing left to answer
     // with: a late failure can only be reported, never mapped to a status.
@@ -250,6 +263,16 @@ export class HttpIdempotencyKernel {
           facts.retryAfter ? { 'retry-after': String(this.retryAfterSeconds) } : {})
       }
     }
+  }
+
+  // Whether the wire says a request body exists: a content-length above
+  // zero or any transfer-encoding. A bodyless request has neither, and its
+  // absent fingerprint is legitimate (interchangeable with a payload-less
+  // core caller of the same key).
+  private declaresBody (request: HttpRequestFacts): boolean {
+    if (request.header('transfer-encoding') !== undefined) return true
+    const declared = request.header('content-length')
+    return declared !== undefined && declared !== '' && declared !== '0'
   }
 
   /**
