@@ -30,11 +30,30 @@ function assertReplaceable (value: unknown): unknown {
   return value
 }
 
+// JSON.stringify runs a value's own toJSON before the replacer, so the
+// replacer alone only ever sees the converted output and would wave the
+// transformation through. The holder (`this` in a non-arrow replacer)
+// still carries the original, which is where the conversion is caught.
+// Dates are the one accepted conversion: storing a date as its ISO
+// instant is what every JSON consumer expects. Anything else carrying a
+// toJSON (a Buffer, an ORM entity) would silently replay as a different
+// value than the function returned.
+function assertNotConverted (original: unknown): void {
+  if (original === null || (typeof original !== 'object' && typeof original !== 'function')) return
+  if (original instanceof Date) return
+  if (typeof (original as { toJSON?: unknown }).toJSON !== 'function') return
+  const name = (original as { constructor?: { name?: string } }).constructor?.name ?? 'toJSON-bearing'
+  throw new SerializationError(`${name} values carry a toJSON conversion, so what is stored would silently differ from what the function returned; convert the value explicitly or configure a codec that supports it`)
+}
+
 export const jsonCodec: Codec = {
   encode (value) {
     if (value === undefined) return UNDEFINED_TOMBSTONE
     try {
-      return JSON.stringify(value, (_key, nested: unknown) => assertReplaceable(nested))
+      return JSON.stringify(value, function (this: Record<string, unknown>, key, nested: unknown) {
+        assertNotConverted(this[key])
+        return assertReplaceable(nested)
+      })
     } catch (error) {
       if (error instanceof SerializationError) throw error
       throw new SerializationError('value is not JSON-serializable', { cause: error })

@@ -68,9 +68,13 @@ The default codec is JSON with two deliberate hardenings:
   can never collide with the string `'undefined'`.
 - Values JSON would silently drop or mangle **fail loudly** with
   `SerializationError` instead: functions, symbols, `bigint`, non-finite
-  numbers (`NaN`, `Infinity`), *nested* `undefined` and circular references.
-  A stored result that differs from what the function returned would be a
-  silent correctness bug.
+  numbers (`NaN`, `Infinity`), *nested* `undefined`, circular references —
+  and any value whose own `toJSON` would transform it (a `Buffer`, an ORM
+  entity), because the first caller would receive the real value and every
+  replayed caller the converted one. A stored result that differs from what
+  the function returned would be a silent correctness bug. The one accepted
+  conversion is `Date`, which stores as its ISO instant and **replays as a
+  string** — the JSON convention every consumer already expects.
 
 If serialization fails after your function succeeded, the record is
 released (retries allowed) and the `SerializationError` surfaces — the

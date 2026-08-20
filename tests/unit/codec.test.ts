@@ -56,6 +56,36 @@ describe('jsonCodec', () => {
     assert.throws(() => jsonCodec.encode(circular), SerializationError)
   })
 
+  test('dates are the one accepted toJSON conversion and store as ISO instants', () => {
+    // The JSON convention every consumer expects: the first caller gets a
+    // Date, replayed callers get the ISO string. Documented, not accidental.
+    assert.equal(jsonCodec.encode(new Date(0)), '"1970-01-01T00:00:00.000Z"')
+    assert.equal(jsonCodec.encode({ createdAt: new Date(0) }), '{"createdAt":"1970-01-01T00:00:00.000Z"}')
+  })
+
+  test('any other toJSON conversion is rejected, not silently stored', () => {
+    // JSON.stringify runs toJSON before the replacer: without reading the
+    // original off the holder, a Buffer stores as {"type":"Buffer",...} and
+    // every replay serves that object instead of bytes.
+    assert.throws(() => jsonCodec.encode(Buffer.from([1, 2])), (error: unknown) => {
+      assert.ok(error instanceof SerializationError)
+      assert.match(error.message, /Buffer/, 'the offending type is named')
+      assert.match(error.message, /toJSON/, 'and the mechanism that would transform it')
+      return true
+    })
+    assert.throws(() => jsonCodec.encode({ file: Buffer.from([1]) }), SerializationError)
+
+    class Money { constructor (readonly cents: number) {} toJSON (): number { return this.cents } }
+    assert.throws(() => jsonCodec.encode({ price: new Money(100) }), /Money values carry a toJSON conversion/)
+
+    // Even carriers without a constructor, or functions dressed with a
+    // toJSON, cannot smuggle a conversion through.
+    const bare = Object.assign(Object.create(null), { toJSON: () => 1 }) as object
+    assert.throws(() => jsonCodec.encode({ bare }), /toJSON-bearing values/)
+    const sneaky = Object.assign(() => 1, { toJSON: () => 'called' })
+    assert.throws(() => jsonCodec.encode({ sneaky }), SerializationError)
+  })
+
   test('throws SerializationError on corrupt stored values', () => {
     assert.throws(() => jsonCodec.decode('{not json'), SerializationError)
   })
