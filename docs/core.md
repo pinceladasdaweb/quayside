@@ -94,7 +94,11 @@ the codec cannot read back replays as an `Error` carrying the raw text.
   hash differently.
 - **Order-independent for objects, order-preserving for arrays.**
 - **Machine- and locale-independent** — keys sort by code unit, numbers
-  normalize `-0`, dates hash as ISO instants, binary views hash as bytes.
+  normalize `-0`, dates hash as ISO instants. Byte carriers (`Buffer`,
+  `Uint8Array`, `ArrayBuffer`) hash as bytes and are interchangeable;
+  every other typed view hashes as its *interpreted element values* under
+  its own type tag, so `Uint16Array([1])` never collides with
+  `Uint8Array([1, 0])` and no host byte order leaks into a fingerprint.
 - **Prototype-pollution safe** — only own enumerable keys are read; an own
   `__proto__` key is treated as plain data.
 - **Loud on ambiguity** — functions, symbols, `Map`/`Set`/`RegExp` and
