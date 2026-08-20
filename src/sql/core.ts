@@ -2,7 +2,7 @@
 // paths: error identity (instanceof) must hold across entry points, so the
 // build maps '../index' onto the shipped core bundle instead of inlining a
 // private copy.
-import { FencingError, RECORD_STATUS } from '../index'
+import { FencingError, IdempotencyKeyInvalidError, RECORD_STATUS, StorageCorruptError } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
 // Plain shared constants carry no identity requirement, so unlike the
 // errors above they may come straight from the module that defines them.
@@ -77,7 +77,7 @@ export function assertSafeTableName (tableName: string): void {
 function mapRow (key: string, row: Record<string, unknown>): StoredRecord {
   const status = String(row.status)
   if (!VALID_STATUS.has(status)) {
-    throw new Error(`corrupt idempotency record under key "${key}"`)
+    throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}"`)
   }
   const record: StoredRecord = {
     token: String(row.token),
@@ -122,7 +122,7 @@ export class SqlStorageCore implements IdempotencyStorage {
       if (row !== undefined) return mapRow(record.key, row)
       // The row expired or vanished between statements: contend again.
     }
-    throw new Error(`could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+    throw new StorageCorruptError(record.key, `could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
   }
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
@@ -172,7 +172,7 @@ export class SqlStorageCore implements IdempotencyStorage {
   // silently).
   private assertKeyFits (key: string): void {
     if (Buffer.byteLength(key) > this.maxKeyBytes) {
-      throw new Error(`idempotency key is ${Buffer.byteLength(key)} bytes long and exceeds the ${this.maxKeyBytes}-byte key column; keys are rejected, never truncated`)
+      throw new IdempotencyKeyInvalidError(key, `idempotency key is ${Buffer.byteLength(key)} bytes long and exceeds the ${this.maxKeyBytes}-byte key column; keys are rejected, never truncated`)
     }
   }
 }

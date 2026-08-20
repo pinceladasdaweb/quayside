@@ -27,6 +27,7 @@ export {
   IdempotencyKeyReuseError,
   QuaysideError,
   SerializationError,
+  StorageCorruptError,
   StorageUnavailableError,
   WaitTimeoutError
 } from './errors'

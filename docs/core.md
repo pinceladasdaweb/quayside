@@ -141,7 +141,10 @@ With `onConflict: 'wait'`, a caller that finds the key in progress:
    waiter **takes over**: it attempts a fresh acquisition and executes.
    When the disappearance was the lock running out its TTL rather than the
    holder releasing on failure, the takeover emits `expired-recovery`.
-4. `WaitTimeoutError` when `waitTimeout` elapses first.
+4. `WaitTimeoutError` when `waitTimeout` elapses first. The budget covers
+   the **whole call**, not each wait: a waiter that takes over and then
+   loses the re-acquire race continues on the same deadline, so sustained
+   holder churn cannot keep one `execute` blocked past its upper bound.
 
 The fingerprint is re-checked on every poll, not just at acquisition: a
 holder's lock can expire mid-wait and another payload take the key over,
@@ -196,9 +199,19 @@ they surface as process warnings instead of failing the operation.
 
 ## Storage errors
 
-Any storage failure surfaces as `StorageUnavailableError` with the driver
-error as `cause` (fail-closed, default) unless `onStorageError: 'open'`
-accepted the trade-off. Two subtleties:
+A storage that cannot be reached surfaces as `StorageUnavailableError`
+with the driver error as `cause` (fail-closed, default) unless
+`onStorageError: 'open'` accepted the trade-off — which it does for every
+interaction, including a poll that fails mid-wait and a heartbeat
+(`ctx.extend`) that cannot reach the storage.
+
+A storage that *answers* with something the record contract cannot
+describe raises `StorageCorruptError` instead, and **fail-open does not
+cover it**: the storage is healthy, the record decodes the same way on
+every attempt, so running unguarded would duplicate side effects for as
+long as the record lived rather than for as long as an outage lasted.
+Same for an acquire that exhausted its bounded contention retries. Two
+subtleties:
 
 - If the **completion write** fails after your function ran, fail-closed
   throws (the caller cannot know the result was registered) and fail-open

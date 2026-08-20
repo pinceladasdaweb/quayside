@@ -243,6 +243,7 @@ All errors extend `QuaysideError` and carry a stable `code` — codes are contra
 | `WaitTimeoutError` | `IDEMPOTENCY_WAIT_TIMEOUT` | 409 |
 | `FencingError` | `IDEMPOTENCY_FENCING` | 500 |
 | `SerializationError` | `IDEMPOTENCY_SERIALIZATION` | 500 |
+| `StorageCorruptError` | `IDEMPOTENCY_STORAGE_CORRUPT` | 500 |
 | `StorageUnavailableError` | `IDEMPOTENCY_STORAGE_UNAVAILABLE` | 503 |
 
 ## API

@@ -5,7 +5,7 @@ import { setTimeout as sleep } from 'node:timers/promises'
 // paths: error identity (instanceof) must hold across entry points, so the
 // build maps '../index' onto the shipped core bundle instead of inlining a
 // private copy.
-import { FencingError, RECORD_STATUS } from '../index'
+import { FencingError, RECORD_STATUS, StorageCorruptError } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
 // Plain shared constants carry no identity requirement, so unlike the
 // errors above they may come straight from the module that defines them.
@@ -123,7 +123,7 @@ function isManagedClient (client: RedisStorageClient): client is ManagedRedisCli
 function parseWireRecord (key: string, raw: string): StoredRecord {
   const wire = JSON.parse(raw) as Partial<WireRecord>
   if (typeof wire.token !== 'string' || typeof wire.status !== 'string' || !VALID_STATUS.has(wire.status)) {
-    throw new Error(`corrupt idempotency record under key "${key}"`)
+    throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}"`)
   }
   const record: StoredRecord = {
     token: wire.token,
@@ -178,7 +178,7 @@ export class RedisStorage implements IdempotencyStorage {
       if (current !== null) return parseWireRecord(record.key, current)
       // The holder expired between SET NX and GET: contend again.
     }
-    throw new Error(`could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+    throw new StorageCorruptError(record.key, `could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
   }
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {

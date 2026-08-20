@@ -196,6 +196,65 @@ describe('the wait loop under a manual clock', () => {
     assert.deepEqual(clock.sleeps, [], 'the first poll already found the outcome')
   })
 
+  test('waitTimeout bounds the whole call, not each wait after a takeover', async () => {
+    // A waiter whose holder vanishes takes over; losing the re-acquire
+    // race lands it in a new wait. Restarting the deadline there would let
+    // sustained holder churn block one execute() forever while the
+    // documented upper bound never fired.
+    const clock = new ManualClock()
+    const started = clock.now()
+    let acquires = 0
+    const churning: IdempotencyStorage = {
+      // Every acquire loses to a fresh holder and every poll finds the
+      // record gone, so the waiter cycles takeover -> conflict -> wait.
+      // Each storage round trip costs a millisecond, as real I/O does.
+      acquire: async () => {
+        acquires += 1
+        clock.advance(1)
+        return { token: `holder-${acquires}`, status: 'in-progress', storedAt: clock.now(), expiresAt: clock.now() + 60_000 }
+      },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      get: async () => { clock.advance(1); return null },
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage: churning, clock, onConflict: 'wait', waitTimeout: 200 })
+
+    await assert.rejects(
+      idempotency.execute('churn', async () => 'never'),
+      WaitTimeoutError,
+      'the cumulative wait is bounded even though every takeover restarts the loop'
+    )
+    // The budget covers the whole call: a per-wait deadline would have let
+    // these cycles run forever, and the cycle itself cannot spin free of it.
+    assert.ok(clock.now() - started <= 200 + 25, `the call outlived its budget by ${clock.now() - started - 200}ms`)
+    assert.ok(acquires > 1, 'the waiter really did take over more than once')
+  })
+
+  test('a takeover exactly at the deadline times out instead of running one more cycle', async () => {
+    // The budget is spent, not nearly spent: taking over here would start
+    // an execution the caller already stopped waiting for.
+    const clock = new ManualClock()
+    let acquires = 0
+    const storage: IdempotencyStorage = {
+      acquire: async () => {
+        acquires += 1
+        return { token: 'holder', status: 'in-progress', storedAt: clock.now(), expiresAt: clock.now() + 60_000 }
+      },
+      complete: async () => {},
+      release: async () => {},
+      extend: async () => {},
+      // The poll consumes exactly the whole budget and finds the record gone.
+      get: async () => { clock.advance(100); return null },
+      delete: async () => {}
+    }
+    const idempotency = new Idempotency({ storage, clock, onConflict: 'wait', waitTimeout: 100 })
+
+    await assert.rejects(idempotency.execute('boundary', async () => 'never'), WaitTimeoutError)
+    assert.equal(acquires, 1, 'no takeover was attempted once the budget was exactly spent')
+  })
+
   test('a lock observed exactly at its expiry boundary recovers as expired', async () => {
     // The storages treat expiresAt <= now as expired, so the engine has to
     // agree at the boundary: a record last seen with expiresAt equal to the

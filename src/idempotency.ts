@@ -331,7 +331,18 @@ export class Idempotency {
       replayed: false,
       signal: controller.signal,
       extend: async (ttl) => {
-        await this.storageCall(() => this.storage.extend(storageKey, token, ttl === undefined ? this.lockTtlMs : parseDuration(ttl)))
+        try {
+          await this.storageCall(() => this.storage.extend(storageKey, token, ttl === undefined ? this.lockTtlMs : parseDuration(ttl)))
+        } catch (error) {
+          // Fail-open covers every storage interaction, not only the ones
+          // around the execution: an outage mid-heartbeat must not abort a
+          // function the instance chose to keep running unguarded.
+          if (error instanceof StorageUnavailableError && this.failOpen) {
+            this.emit('storage-bypass', key, correlationId)
+            return
+          }
+          throw error
+        }
       },
       doNotStore: () => { stores = false }
     }
@@ -413,12 +424,28 @@ export class Idempotency {
     startedAt: number,
     observed: StoredRecord
   ): Promise<ExecutionResult<T>> {
-    const deadline = this.clock.now() + this.waitTimeoutMs
+    // The deadline is measured from the call, not from this entry: a
+    // waiter that takes over and loses the re-acquire race lands in a new
+    // wait, and restarting the clock there would let sustained holder
+    // churn block one execute() forever while waitTimeout, its documented
+    // upper bound, never fired.
+    const deadline = startedAt + this.waitTimeoutMs
     const notify = this.storage.waitForChange?.bind(this.storage)
     let warned = false
     let delay = 25
     while (true) {
-      const record = await this.storageCall(() => this.storage.get(storageKey))
+      let record: StoredRecord | null
+      try {
+        record = await this.storageCall(() => this.storage.get(storageKey))
+      } catch (error) {
+        // The same trade-off the acquire path takes: an instance that
+        // chose availability must not answer a storage outage with an
+        // error just because it happened to be waiting when it hit.
+        if (error instanceof StorageUnavailableError && this.failOpen) {
+          return this.runUnguarded(key, fn, correlationId)
+        }
+        throw error
+      }
       if (record === null) {
         // The holder failed (record deleted) or its lock expired: take over.
         // Which one it was is worth telling apart: a lock that ran out its
@@ -428,6 +455,13 @@ export class Idempotency {
         // vanished and knows whether its lease had run out.
         if (observed.expiresAt <= this.clock.now()) {
           this.emit('expired-recovery', key, correlationId)
+        }
+        // The takeover re-enters run(), which may land back here when a
+        // contender wins the race: without spending the same budget the
+        // polls do, sustained churn would spin through that cycle with
+        // neither a sleep nor a deadline in the way.
+        if (deadline - this.clock.now() <= 0) {
+          throw new WaitTimeoutError(key, this.waitTimeoutMs)
         }
         return this.run(input, fn, correlationId, startedAt)
       }
