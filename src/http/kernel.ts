@@ -147,6 +147,17 @@ export function httpErrorFacts (error: unknown): HttpErrorFacts | null {
 // serves every response instead of one per captured body.
 const UTF8_STRICT = new TextDecoder('utf-8', { fatal: true })
 
+// The wire size of the shortest body that legitimately parses to an empty
+// container: '{}' and '[]' are both two bytes.
+const EMPTY_BODY_BYTES = 2
+
+// A parser that declined this request's content type leaves an empty
+// container behind. Own enumerable keys are what the fingerprint reads, so
+// they are what "empty" means here.
+function isEmptyObject (body: unknown): boolean {
+  return typeof body === 'object' && body !== null && Object.keys(body).length === 0
+}
+
 const DEFAULT_METHODS = ['POST', 'PATCH']
 const DEFAULT_REPLAY_HEADERS = ['content-type', 'location']
 const DEFAULT_MAX_BODY_BYTES = 1_048_576
@@ -236,10 +247,9 @@ export class HttpIdempotencyKernel {
     // replay instead of answering 422. That is a mount-order or parser
     // misconfiguration, and staying quiet about it is the actual bug, so
     // it is reported once per kernel.
-    if (request.body === undefined && !this.warnedUnparsedBody && this.declaresBody(request)) {
+    if (!this.warnedUnparsedBody && this.bodyWentMissing(request)) {
       this.warnedUnparsedBody = true
-
-      process.emitWarning(`quayside: a ${request.method.toUpperCase()} request carrying "${this.header}" declares a body, but request.body is undefined, so the payload fingerprint cannot validate key reuse. Is the body parser mounted before the idempotency middleware?`)
+      process.emitWarning(`quayside: a ${request.method.toUpperCase()} request carrying "${this.header}" declares a body that did not survive parsing (received ${request.body === undefined ? 'undefined' : 'an empty object'}), so the payload fingerprint cannot validate key reuse. Is a body parser mounted before the idempotency middleware, and does it handle this content type?`)
     }
 
     const payload = this.fingerprintPayload(request)
@@ -303,6 +313,26 @@ export class HttpIdempotencyKernel {
     if (request.header('transfer-encoding') !== undefined) return true
     const declared = request.header('content-length')
     return declared !== undefined && declared !== '' && declared !== '0'
+  }
+
+  /**
+   * Whether the body the wire announced reached the kernel intact. Two
+   * shapes say it did not: `undefined`, when no parser ran at all, and an
+   * empty object, which is what a parser leaves behind for a content type
+   * it declined (`express.json()` on `text/plain`, on `multipart`). Both
+   * fingerprint every payload identically, so the reuse guard is inert.
+   *
+   * An empty body is only suspicious against a declared length: `{}` and
+   * `[]` are two bytes on the wire, so a longer content-length means the
+   * content was dropped. Under a chunked encoding there is no length to
+   * compare, and a genuinely empty parsed body is indistinguishable from a
+   * dropped one, so that combination stays quiet rather than crying wolf.
+   */
+  private bodyWentMissing (request: HttpRequestFacts): boolean {
+    if (request.body === undefined) return this.declaresBody(request)
+    if (!isEmptyObject(request.body)) return false
+    const declared = Number(request.header('content-length'))
+    return declared > EMPTY_BODY_BYTES
   }
 
   /**

@@ -57,7 +57,15 @@ Run it from a cron if table size matters; skip it if it does not.
 - **Keys are rejected, never truncated.** The key column is
   `VARCHAR(512)`; the adapter rejects longer keys before any statement
   touches the database, so a MySQL server in non-strict `sql_mode` can
-  never truncate a key into a silent collision.
+  never truncate a key into a silent collision. The rejection raises
+  `IdempotencyKeyInvalidError` (the HTTP adapters answer `400`): the
+  offending value is client data, not an outage, so `onStorageError:
+  'open'` deliberately does not wave it through unguarded.
+- **A row the record contract cannot describe raises
+  `StorageCorruptError`** — a status outside the state machine, a
+  non-string token, a timestamp that does not parse. Fail-open does not
+  cover it either, for the same reason: it is a data bug, not an outage,
+  and it would decode the same way on every retry.
 - **Timestamps are compared in the client's clock** (epoch ms as `BIGINT`),
   the same convention as every other adapter — the database server's clock
   is irrelevant.

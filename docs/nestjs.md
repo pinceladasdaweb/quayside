@@ -77,11 +77,12 @@ to Nest `HttpException`s:
 
 | Situation | Response |
 |---|---|
-| Same key, execution still running | `409` + `Retry-After` |
+| Same key, execution still running | `409` + `Retry-After` (`retryAfterSeconds`, default 1) |
 | Same key, different payload | `422` |
-| Missing key with `enforce: true` | `400` |
+| No usable key with `enforce: true` | `400` — the message names the header when the header was read, and says no key could be derived when a `key` extractor declined |
 | Key longer than `maxKeyLength` | `400` |
 | Storage unreachable (fail-closed) | `503` |
+| Storage answered with a record the contract cannot describe | `500` (`StorageCorruptError`) |
 
 Decorator options: `key` (extractor over the request; default is the
 configured header), `fingerprint` (function over the request or `false`;

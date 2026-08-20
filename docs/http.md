@@ -11,7 +11,10 @@ only, implementing the IETF `Idempotency-Key` draft:
   running (or when a wait times out), `422` when the same key arrives with a
   different payload, `503` when the storage is unreachable, `400` for a
   missing key under `enforce` or a key that breaks `maxKeyLength` (both are
-  client input, so neither is ever answered with a 5xx).
+  client input, so neither is ever answered with a 5xx). Under `enforce`
+  with a custom `key` extractor the `400` says no key could be *derived*
+  rather than naming the header: the client may well have sent it, and the
+  missing ingredient was something else.
 - **Route policies**: which methods to protect, enforce-vs-passthrough,
   fingerprint strategy.
 
@@ -33,12 +36,19 @@ app.use(express.json())
 app.use(ExpressMiddleware(idempotency, { enforce: true }))
 ```
 
-The body parser must run **before** the middleware: the payload fingerprint
-covers the parsed body, so a body that arrives unparsed (parser mounted
-after, or a content type no parser handles) cannot validate key reuse. The
-kernel reports that misconfiguration as a process warning — once per
-instance — whenever a protected, keyed request declares a body on the wire
-that reaches it as `undefined`.
+The body parser must run **before** the middleware, and must handle the
+content types you protect: the payload fingerprint covers the parsed body,
+so a body that arrives unparsed cannot validate key reuse — every payload
+then fingerprints identically and two different requests under one key
+replay each other instead of answering `422`.
+
+The kernel reports that misconfiguration as a process warning, once per
+instance, whenever a protected, keyed request declares a body on the wire
+that did not survive parsing: `undefined` (no parser ran) or an empty
+object (a parser declined the content type, as `express.json()` does for
+`text/plain` or `multipart`). An empty body is only flagged against a
+longer declared `content-length` — `{}` is two bytes, so a client that
+genuinely sent it is not misconfigured.
 
 Fastify:
 
