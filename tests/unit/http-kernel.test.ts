@@ -87,6 +87,26 @@ describe('http kernel key extraction', () => {
     assert.equal(outcome.kind === 'respond' && outcome.response.status, 400)
   })
 
+  test('the enforce 400 names the header only when the header is what was read', async () => {
+    // Under a custom extractor the missing ingredient may be a principal,
+    // not the header: telling that client to send a header it already sent
+    // loops it forever.
+    const plain = kernelWith({ enforce: true })
+    const plainOutcome = await plain.handle({ ...post(), header: () => undefined }, async () => ok())
+    const plainProblem = JSON.parse(plainOutcome.kind === 'respond' ? plainOutcome.response.body : '{}') as { error: string, detail: string }
+    assert.equal(plainProblem.error, 'IDEMPOTENCY_KEY_REQUIRED')
+    assert.match(plainProblem.detail, /idempotency-key header is required/)
+    assert.match(plainProblem.detail, /POST/)
+
+    const derived = kernelWith({ enforce: true, key: scoped })
+    const derivedOutcome = await derived.handle(postAs(undefined), async () => ok())
+    const derivedProblem = JSON.parse(derivedOutcome.kind === 'respond' ? derivedOutcome.response.body : '{}') as { error: string, detail: string }
+    assert.equal(derivedProblem.error, 'IDEMPOTENCY_KEY_REQUIRED', 'the code is stable across both')
+    assert.doesNotMatch(derivedProblem.detail, /header is required/, 'the header is not blamed for what an extractor declined')
+    assert.match(derivedProblem.detail, /no idempotency key could be derived/)
+    assert.match(derivedProblem.detail, /POST/, 'and the method still scopes it')
+  })
+
   test('keyFor exposes the extractor to adapters, and defaults to the header read', async () => {
     const custom = kernelWith({ key: scoped })
     assert.equal(custom.keyFor(postAs('alice', 'abc')), 'alice:abc')

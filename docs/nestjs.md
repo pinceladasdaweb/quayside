@@ -18,6 +18,7 @@ import { RedisStorage } from 'quayside/redis'
       resultTtl: '24h',
       lockTtl: '30s'
       // header: 'Idempotency-Key' (default)
+      // retryAfterSeconds: 1 (default) — the Retry-After hint on 409s
     })
   ]
 })

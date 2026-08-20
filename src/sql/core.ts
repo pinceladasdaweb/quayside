@@ -3,10 +3,10 @@
 // build maps '../index' onto the shipped core bundle instead of inlining a
 // private copy.
 import { FencingError, IdempotencyKeyInvalidError, RECORD_STATUS, StorageCorruptError } from '../index'
-import type { IdempotencyStorage, Outcome, PendingRecord, RecordStatus, StoredRecord } from '../index'
+import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
 // Plain shared constants carry no identity requirement, so unlike the
 // errors above they may come straight from the module that defines them.
-import { MAX_ACQUIRE_ATTEMPTS, VALID_STATUS } from '../storage'
+import { MAX_ACQUIRE_ATTEMPTS, buildStoredRecord } from '../storage'
 
 /**
  * The dialect-specific SQL. Both adapters share one algorithm; only the
@@ -74,21 +74,17 @@ export function assertSafeTableName (tableName: string): void {
   }
 }
 
+// The column names are this dialect's; the validation is everyone's.
 function mapRow (key: string, row: Record<string, unknown>): StoredRecord {
-  const status = String(row.status)
-  if (!VALID_STATUS.has(status)) {
-    throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}"`)
-  }
-  const record: StoredRecord = {
-    token: String(row.token),
-    status: status as RecordStatus,
-    storedAt: Number(row.stored_at),
-    expiresAt: Number(row.expires_at)
-  }
-  if (typeof row.fingerprint === 'string') record.fingerprint = row.fingerprint
-  if (typeof row.result === 'string') record.result = row.result
-  if (typeof row.error === 'string') record.error = row.error
-  return record
+  return buildStoredRecord(key, {
+    token: row.token,
+    status: row.status,
+    fingerprint: row.fingerprint,
+    result: row.result,
+    error: row.error,
+    storedAt: row.stored_at,
+    expiresAt: row.expires_at
+  })
 }
 
 /**

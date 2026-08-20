@@ -316,6 +316,72 @@ describe('nestjs interceptor glue', () => {
     assert.equal(attempts, 2, 'the retry ran the handler again')
   })
 
+  test('the enforce 400 names the header only when the header is what was read', async () => {
+    const { HttpException } = await import('@nestjs/common')
+    const storage = new MemoryStorage()
+    const interceptor = new IdempotencyInterceptor(new Idempotency({ storage }), { storage })
+
+    const plain = decorated({ enforce: true })
+    await assert.rejects(
+      intercept(interceptor, fakeContext({}, {}, plain)),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        const body = error.getResponse() as { error: string, message: string }
+        assert.equal(body.error, 'IDEMPOTENCY_KEY_REQUIRED')
+        // Exact: the decorator path has no method to scope the message with.
+        assert.equal(body.message, 'the idempotency-key header is required')
+        return true
+      }
+    )
+
+    // The extractor declined for its own reason (no principal here); the
+    // client sent the header and must not be told to send it again.
+    const derived = decorated({ enforce: true, key: () => undefined })
+    await assert.rejects(
+      intercept(interceptor, fakeContext({ 'idempotency-key': 'present' }, {}, derived)),
+      (error: unknown) => {
+        assert.ok(error instanceof HttpException)
+        const body = error.getResponse() as { error: string, message: string }
+        assert.equal(body.error, 'IDEMPOTENCY_KEY_REQUIRED')
+        assert.doesNotMatch(body.message, /header is required/)
+        assert.equal(body.message, 'no idempotency key could be derived for this request')
+        return true
+      }
+    )
+  })
+
+  test('retry-after on 409 follows the configured hint', async () => {
+    // The other three adapters take retryAfterSeconds; a NestJS app used to
+    // be stuck on 1 second while sharing the same storage.
+    const { from, lastValueFrom, of } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const options = { storage, retryAfterSeconds: 7 }
+    const idempotency = new Idempotency(options)
+    const interceptor = new IdempotencyInterceptor(idempotency, options)
+    const handler = decorated()
+    const headersSet: Record<string, string> = {}
+    const response = { setHeader: (name: string, value: string) => { headersSet[name] = value } }
+    const context = fakeContext({ 'idempotency-key': 'nest-retry' }, response, handler)
+
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const holder = lastValueFrom(interceptor.intercept(context as never, {
+      handle: () => from(gate.then(() => 'held'))
+    }))
+    await new Promise((resolve) => setImmediate(resolve))
+
+    await assert.rejects(
+      lastValueFrom(interceptor.intercept(context as never, { handle: () => of('second') })),
+      (error: unknown) => {
+        assert.ok(error instanceof Error)
+        return true
+      }
+    )
+    assert.equal(headersSet['retry-after'], '7', 'the configured hint reaches the client')
+    release()
+    await holder
+  })
+
   test('a passthrough handler that set a server status is never persisted as success', async () => {
     // The gate reads the platform response the interceptor already holds:
     // res.status(500) plus a returned body is a declared server error, and

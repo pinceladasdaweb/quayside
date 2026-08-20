@@ -15,7 +15,7 @@ import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } fr
 // core bundle instead of inlining a private copy.
 import { Idempotency } from '../index'
 import type { Duration, IdempotencyOptions } from '../index'
-import { headerValue, httpErrorFacts } from '../http/kernel'
+import { KEY_REQUIRED_CODE, REPLAYED_HEADER, headerValue, httpErrorFacts, keyRequiredMessage } from '../http/kernel'
 
 /** Injection token for the Idempotency instance built by QuaysideModule. */
 export const QUAYSIDE_IDEMPOTENCY = 'QUAYSIDE_IDEMPOTENCY'
@@ -47,6 +47,8 @@ export interface IdempotentOptions {
 export type QuaysideModuleOptions = IdempotencyOptions & {
   /** Header carrying the idempotency key. Default: 'Idempotency-Key'. */
   header?: string
+  /** Retry-After hint on 409 responses, in seconds. Default: 1. */
+  retryAfterSeconds?: number
 }
 
 export interface QuaysideModuleAsyncOptions {
@@ -86,11 +88,14 @@ function setResponseHeader (response: unknown, name: string, value: string): voi
 export class IdempotencyInterceptor implements NestInterceptor {
   private readonly headerName: string
 
+  private readonly retryAfterSeconds: number
+
   constructor (
     @Inject(QUAYSIDE_IDEMPOTENCY) private readonly idempotency: Idempotency,
     @Inject(QUAYSIDE_MODULE_OPTIONS) private readonly options: QuaysideModuleOptions
   ) {
     this.headerName = (this.options.header ?? 'Idempotency-Key').toLowerCase()
+    this.retryAfterSeconds = this.options.retryAfterSeconds ?? 1
   }
 
   intercept (context: ExecutionContext, next: CallHandler): Observable<unknown> {
@@ -110,7 +115,11 @@ export class IdempotencyInterceptor implements NestInterceptor {
     if (key === undefined || key === '') {
       if (options.enforce === true) {
         throw new HttpException(
-          { statusCode: 400, error: 'IDEMPOTENCY_KEY_REQUIRED', message: `the ${this.headerName} header is required` },
+          {
+            statusCode: 400,
+            error: KEY_REQUIRED_CODE,
+            message: keyRequiredMessage(this.headerName, { derived: options.key !== undefined })
+          },
           400
         )
       }
@@ -160,7 +169,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
           }
         }
       )
-      if (outcome.replayed) setResponseHeader(response, 'idempotency-replayed', 'true')
+      if (outcome.replayed) setResponseHeader(response, REPLAYED_HEADER, 'true')
       return outcome.value
     } catch (error) {
       if (responded) {
@@ -183,7 +192,7 @@ export class IdempotencyInterceptor implements NestInterceptor {
     // client is told cannot depend on which adapter answered.
     const facts = httpErrorFacts(error)
     if (facts === null) return reviveHttpException(error)
-    if (facts.retryAfter) setResponseHeader(response, 'retry-after', '1')
+    if (facts.retryAfter) setResponseHeader(response, 'retry-after', String(this.retryAfterSeconds))
     return new HttpException({ statusCode: facts.status, error: facts.code, message: facts.message }, facts.status)
   }
 }

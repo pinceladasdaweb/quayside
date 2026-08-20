@@ -174,15 +174,30 @@ function encodeErrorValue (error: unknown, codec: Codec): string {
   }
 }
 
-function reviveError (serialized: SerializedError): Error {
+function reviveError (serialized: SerializedError, depth = 0): Error {
   const options: ErrorOptions = {}
-  if (serialized.cause !== undefined) options.cause = reviveError(serialized.cause)
+  // The same depth cap serialization applies: a record whose cause chain
+  // was not written by this library (hand-made, tampered, another codec)
+  // must not be able to recurse without a bound.
+  if (serialized.cause !== undefined && depth < MAX_CAUSE_DEPTH) {
+    options.cause = reviveError(serialized.cause, depth + 1)
+  }
   const error = new Error(serialized.message, options)
   error.name = serialized.name
   if (serialized.stack !== undefined) error.stack = serialized.stack
-  // Object.assign ignores an undefined source, so hand-crafted or corrupt
-  // records without properties revive cleanly.
-  Object.assign(error, serialized.properties)
+  // defineProperty rather than assignment: JSON.parse creates '__proto__'
+  // as an own key, and copying it through [[Set]] would run the prototype
+  // setter and leave the revived error failing `instanceof Error`, which
+  // the adapters branch on. Own data properties are what was serialized,
+  // so own data properties are what comes back.
+  for (const field of Object.keys(serialized.properties ?? {})) {
+    Object.defineProperty(error, field, {
+      value: (serialized.properties as Record<string, unknown>)[field],
+      writable: true,
+      enumerable: true,
+      configurable: true
+    })
+  }
   return error
 }
 

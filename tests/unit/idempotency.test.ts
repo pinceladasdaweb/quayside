@@ -297,6 +297,68 @@ describe('Idempotency failures', () => {
     assert.equal(calls, 1)
   })
 
+  test('a tampered record cannot swap the revived error prototype or recurse without bound', async () => {
+    // Storage contents are outside the threat model (a writer that can
+    // forge records already controls the replay), but a revived error that
+    // fails `instanceof Error` would send the adapters down their
+    // foreign-error paths, so the revival hardens against it.
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+
+    let deep = '{"name":"E","message":"bottom"}'
+    for (let level = 0; level < 40; level += 1) {
+      deep = `{"name":"E","message":"level ${level}","cause":${deep}}`
+    }
+    const forged = `{"name":"Tampered","message":"forged","properties":{"__proto__":{"admin":true},"code":"KEPT"},"cause":${deep}}`
+    await storage.acquire({ key: 'forged', token: 't', storedAt: Date.now() }, 60_000)
+    await storage.complete('forged', 't', { status: 'failed', error: forged }, 60_000)
+
+    await assert.rejects(idempotency.execute('forged', async () => 'never'), (error: unknown) => {
+      assert.ok(error instanceof Error, 'the revived failure is still an Error')
+      assert.equal((error as { code?: string }).code, 'KEPT', 'ordinary properties still revive')
+      assert.equal((error as { admin?: boolean }).admin, undefined)
+      assert.equal(({} as { admin?: boolean }).admin, undefined, 'and nothing leaked onto Object.prototype')
+      // The cause chain stops at the same depth serialization would write.
+      let depth = 0
+      let current: unknown = error
+      while (current instanceof Error && current.cause !== undefined) {
+        depth += 1
+        current = current.cause
+      }
+      assert.equal(depth, 5, `a forged chain revived ${depth} levels deep`)
+      // Revived properties are ordinary own data properties, not exotic
+      // ones: enumerable so they serialize and log, writable and
+      // configurable so callers can treat them like any error field.
+      const descriptor = Object.getOwnPropertyDescriptor(error, 'code')
+      assert.deepEqual(descriptor, { value: 'KEPT', writable: true, enumerable: true, configurable: true })
+      return true
+    })
+  })
+
+  test('a deep cause chain is serialized to exactly the documented depth', async () => {
+    // Measured on the STORED record, not the revived error: revival caps
+    // the chain too, so reading it back would hide a serializer that wrote
+    // one level more than it should.
+    const storage = new MemoryStorage()
+    const idempotency = new Idempotency({ storage, persistFailures: true })
+    let deepest = new Error('bottom')
+    for (let level = 0; level < 12; level += 1) {
+      deepest = new Error(`level ${level}`, { cause: deepest })
+    }
+    await assert.rejects(idempotency.execute('deep', async () => { throw deepest }), /level 11/)
+
+    const stored = await storage.get('deep')
+    assert.ok(stored?.error)
+    let depth = 0
+    let node = JSON.parse(stored.error) as { cause?: unknown }
+    while (node.cause !== undefined) {
+      depth += 1
+      node = node.cause as { cause?: unknown }
+    }
+    // Five levels below the top error: one more would mean the cap moved.
+    assert.equal(depth, 5, `the stored chain is ${depth} levels deep`)
+  })
+
   test('replayed failures preserve own properties and the cause chain', async () => {
     const idempotency = instance({ persistFailures: true })
     const fn = async () => {
