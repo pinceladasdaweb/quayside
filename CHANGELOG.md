@@ -1,5 +1,25 @@
 # CHANGELOG
 
+## 1.2.0 (2026-08-20)
+
+* fix: emit the expired-recovery event the type union always declared by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/b47b4f23a123bee2bbd5bab855f27e7a2677f35d)
+* fix: nestjs stops persisting server-status failures, kernel policy shared by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/039d9c26595d203a5cf5f09cbbf3206193796f47)
+* refactor: build the sql statements once, share the storage constants by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/17ef68975c613a944af519c75f1235afcad321de)
+* test: pin retry-after to the 409 alone across kernel and nestjs by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/5ef136d01eec5a8d6c6477e32e01bb4f765195f6)
+* docs: what persists under persistFailures in the nestjs adapter by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/37f5d772402df01beb09f69df31ec35169bbfaad)
+* feat: scope idempotency keys to a principal via a key extractor by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/48c3199f6daeebdad2c762a4f1d72b6fe4d20975)
+* docs: scope keys to the caller on shared endpoints by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/26349e06a6402e7bd7564ba0af6040cdd7747686)
+* fix: report an unparsed request body instead of degrading silently by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/7e1ec1b8988c25f5840190bd9e0a41debe3f6550)
+* fix: typed views fingerprint as interpreted values, not raw bytes by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/be09477e3336843c531b68ae384508f9a984148b)
+* fix: reject toJSON conversions the codec guard could never see by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/39456a05691299ed3ab9ef7bb4f1b8a60654a035)
+* fix: header lookups are case-insensitive on every adapter by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/5bf9b490bd14dc8d422e11e5308f29e568234863)
+* fix: hono streams flow to the client while the capture drains a clone by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/dea5c4ae27db47ed7934b3862f63c0564da50a3a)
+* fix: nestjs serves completed work and never caches a declared 5xx by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/9ea6419085874f3bbdf2b892d20773000dcf1e3f)
+* fix: bound the wait budget and stop reading data bugs as outages by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/dd8a463f316b14fc74d3e8add17a4388069f53fd)
+* fix: honest key-required diagnostics, hardened revival, one record decoder by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/ae06f59446c795635c8199bc4895e4208914f815)
+* fix: report an empty parsed body as the lost body it usually is by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/8f66e9ef193989c989cb3fda0cb9710b98ea5ea7)
+
+
 ## 1.1.1 (2026-08-19)
 
 * chore: update dev dependencies by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/25f655725990c53b5156370a39691a0cc2c44068)
