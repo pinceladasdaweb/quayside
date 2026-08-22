@@ -1,7 +1,7 @@
 {
   "name": "quayside",
   "version": "1.2.0",
-  "description": "Generic idempotency for Node.js — execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.",
+  "description": "Generic idempotency for Node.js \u2014 execute any operation exactly once per key, with pluggable storage, explicit concurrency semantics, and first-class observability.",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -55,6 +55,16 @@
       "require": {
         "types": "./dist/mysql.d.cts",
         "default": "./dist/mysql.cjs"
+      }
+    },
+    "./dynamodb": {
+      "import": {
+        "types": "./dist/dynamodb.d.ts",
+        "default": "./dist/dynamodb.mjs"
+      },
+      "require": {
+        "types": "./dist/dynamodb.d.cts",
+        "default": "./dist/dynamodb.cjs"
       }
     },
     "./express": {
@@ -132,6 +142,9 @@
       "mysql": [
         "dist/mysql.d.ts"
       ],
+      "dynamodb": [
+        "dist/dynamodb.d.ts"
+      ],
       "express": [
         "dist/express.d.ts"
       ],
@@ -185,9 +198,10 @@
     "fencing-token",
     "redis",
     "postgres",
-    "mysql"
+    "mysql",
+    "dynamodb"
   ],
-  "author": "Pedro Rogério",
+  "author": "Pedro Rog\u00e9rio",
   "license": "MIT",
   "repository": {
     "type": "git",

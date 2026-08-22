@@ -47,6 +47,7 @@ export default [
   ...entry('src/redis/index.ts', 'redis', { core: true }),
   ...entry('src/postgres/index.ts', 'postgres', { core: true }),
   ...entry('src/mysql/index.ts', 'mysql', { core: true }),
+  ...entry('src/dynamodb/index.ts', 'dynamodb', { core: true }),
   ...entry('src/express/index.ts', 'express', { core: true }),
   ...entry('src/fastify/index.ts', 'fastify', { core: true }),
   ...entry('src/hono/index.ts', 'hono', { core: true }),

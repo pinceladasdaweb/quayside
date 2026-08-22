@@ -4,22 +4,32 @@ import assert from 'node:assert/strict'
 import {
   CreateTableCommand,
   DeleteItemCommand,
+  DescribeTableCommand,
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
-  UpdateItemCommand
+  UpdateItemCommand,
+  UpdateTimeToLiveCommand
 } from '@aws-sdk/client-dynamodb'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 
 import { Idempotency } from '../../src/index'
-import { DynamoStorage, dynamoTableDefinition } from '../../src/dynamodb/index'
+import { DynamoStorage } from '../../src/dynamodb/index'
 import { runStorageContract } from '../contract/storage-contract'
 
 let container: StartedTestContainer
 let client: DynamoDBClient
 let storage: DynamoStorage
 
-const commands = { PutItemCommand, GetItemCommand, UpdateItemCommand, DeleteItemCommand }
+const commands = {
+  PutItemCommand,
+  GetItemCommand,
+  UpdateItemCommand,
+  DeleteItemCommand,
+  CreateTableCommand,
+  DescribeTableCommand,
+  UpdateTimeToLiveCommand
+}
 
 before(async () => {
   // -inMemory keeps the run fast and leaves nothing behind; -sharedDb is
@@ -39,8 +49,8 @@ before(async () => {
     // DynamoDB Local accepts any credential; these are never real.
     credentials: { accessKeyId: 'local', secretAccessKey: 'local' }
   })
-  await client.send(new CreateTableCommand(dynamoTableDefinition() as never))
   storage = new DynamoStorage(client, commands)
+  await storage.migrate()
 })
 
 after(async () => {
@@ -63,6 +73,29 @@ runStorageContract('DynamoStorage', async () => {
 })
 
 describe('DynamoStorage specifics', () => {
+  test('migrate is idempotent and leaves the table usable', async () => {
+    // Running it on every boot is the documented pattern, so the second
+    // call must be a no-op rather than a ResourceInUseException, and the
+    // already-enabled TTL must not fail either.
+    await storage.migrate()
+    await storage.migrate()
+    await storage.delete('after-migrate')
+    assert.equal(await storage.acquire({ key: 'after-migrate', token: 't', storedAt: Date.now() }, 1_000), null)
+
+    const ttl = await client.send(new DescribeTableCommand({ TableName: 'quayside_records' }))
+    assert.equal(ttl.Table?.TableStatus, 'ACTIVE')
+  })
+
+  test('migrate refuses to run without the management commands', async () => {
+    const limited = new DynamoStorage(client, {
+      PutItemCommand,
+      GetItemCommand,
+      UpdateItemCommand,
+      DeleteItemCommand
+    })
+    await assert.rejects(limited.migrate(), TypeError, 'the missing commands are named, not silently skipped')
+  })
+
   test('a key over the partition-key limit is rejected, never truncated', async () => {
     const tiny = new DynamoStorage(client, commands, { maxKeyBytes: 16 })
     await assert.rejects(
