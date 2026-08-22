@@ -224,6 +224,7 @@
     }
   },
   "devDependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1116.0",
     "@commitlint/cli": "^21.2.2",
     "@commitlint/config-conventional": "^21.2.2",
     "@microsoft/api-extractor": "^7.58.12",
