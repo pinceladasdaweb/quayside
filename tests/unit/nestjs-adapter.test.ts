@@ -471,14 +471,17 @@ describe('nestjs interceptor glue', () => {
     assert.ok(!('retry-after' in headersSet))
   })
 
-  test('only a complete http shape is rebuilt as an HttpException', async () => {
+  test('only a complete http shape is rebuilt as an HttpException on replay', async () => {
     // Both halves are required: a status with no body has nothing to answer
     // with, and a body with no numeric status has no status to answer under.
+    // The halves are REPLAYED (persisted, then retried): live errors never
+    // reach the shape check at all, they fail the replay mark first.
     const { HttpException } = await import('@nestjs/common')
     const { lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
     const interceptor = new IdempotencyInterceptor(
-      new Idempotency({ storage: new MemoryStorage() }),
-      { storage: new MemoryStorage() }
+      new Idempotency({ storage, persistFailures: true }),
+      { storage, persistFailures: true }
     )
     const handler = decorated()
 
@@ -491,12 +494,50 @@ describe('nestjs interceptor glue', () => {
       await assert.rejects(
         lastValueFrom(interceptor.intercept(context as never, { handle: () => { throw error } })),
         (thrown: unknown) => {
-          assert.equal(thrown, error, `${label} must pass through untouched`)
-          assert.ok(!(thrown instanceof HttpException))
+          assert.equal(thrown, error, `${label} is live on the first attempt and must pass through untouched`)
           return true
         }
       )
+      await assert.rejects(intercept(interceptor, context), (thrown: unknown) => {
+        assert.notEqual(thrown, error, `${label}: the replay is a reconstruction`)
+        assert.ok(!(thrown instanceof HttpException), `${label} must not be rebuilt on replay either`)
+        return true
+      })
     }
+  })
+
+  test('a live foreign error with an http shape is never rebuilt', async () => {
+    // An HTTP client's error object carries exactly the two fields the
+    // replay reconstruction looks for: axios attaches the upstream status
+    // and the entire upstream response (headers and request config
+    // included). Rebuilding a LIVE one would answer the client with the
+    // upstream's status and leak that whole shape; only an error decoded
+    // from a stored record is a replay.
+    const { HttpException } = await import('@nestjs/common')
+    const { lastValueFrom } = await import('rxjs')
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const context = fakeContext({ 'idempotency-key': 'nest-live-axios' }, {}, decorated())
+    const upstream = Object.assign(new Error('Request failed with status code 404'), {
+      status: 404,
+      response: {
+        status: 404,
+        data: { secret: 'internal detail' },
+        headers: { 'x-internal': 'yes' },
+        config: { headers: { Authorization: 'Bearer token' } }
+      }
+    })
+
+    await assert.rejects(
+      lastValueFrom(interceptor.intercept(context as never, { handle: () => { throw upstream } })),
+      (thrown: unknown) => {
+        assert.equal(thrown, upstream, 'the live error passes through untouched')
+        assert.ok(!(thrown instanceof HttpException), 'so Nest answers its sanitized 500, not the upstream 404')
+        return true
+      }
+    )
   })
 
   test('replayed errors without an http shape pass through untouched', async () => {
@@ -602,6 +643,17 @@ describe('nestjs interceptor glue', () => {
     assert.equal(bare.global, true)
     const bareOptionsProvider = (bare.providers ?? [])[0] as { inject?: unknown[] }
     assert.deepEqual(bareOptionsProvider.inject, [])
+
+    // The async builder must offer the same opt-out the sync one does.
+    const scopedAsync = QuaysideModule.forRootAsync({ useFactory: () => ({ storage: new MemoryStorage() }), global: false })
+    assert.equal(scopedAsync.global, false)
+
+    // Whichever way the options arrive, the assembled module is the same
+    // shape: a provider added to one path can never ship missing from the
+    // other.
+    const sync = QuaysideModule.forRoot({ storage: new MemoryStorage() })
+    assert.deepEqual(sync.exports, bare.exports)
+    assert.equal((sync.providers ?? []).length, (bare.providers ?? []).length)
   })
 
   test('a custom key extractor returning nothing runs unprotected', async () => {
