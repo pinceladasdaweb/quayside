@@ -3,7 +3,7 @@
 // acquire + run + complete) and a replay (hit: acquire finds the record).
 //
 //   npm run bench                # memory only
-//   npm run bench -- all         # memory + redis + postgres + mysql (Docker)
+//   npm run bench -- all         # every backend below (Docker)
 //   npm run bench -- redis mysql # a subset
 import { GenericContainer, Wait } from 'testcontainers'
 
@@ -114,11 +114,51 @@ async function mysqlTarget (): Promise<Target> {
   }
 }
 
+async function dynamodbTarget (): Promise<Target> {
+  const { DynamoStorage } = await import('../src/dynamodb/index')
+  const {
+    CreateTableCommand, DeleteItemCommand, DescribeTableCommand, DynamoDBClient,
+    GetItemCommand, PutItemCommand, UpdateItemCommand, UpdateTimeToLiveCommand
+  } = await import('@aws-sdk/client-dynamodb')
+  // -sharedDb is load-bearing: without it DynamoDB Local partitions its
+  // storage per credential+region pair.
+  const container = await new GenericContainer('amazon/dynamodb-local:2.5.2')
+    .withCommand(['-jar', 'DynamoDBLocal.jar', '-inMemory', '-sharedDb'])
+    .withExposedPorts(8000)
+    .withWaitStrategy(Wait.forListeningPorts())
+    .start()
+  const client = new DynamoDBClient({
+    endpoint: `http://${container.getHost()}:${container.getMappedPort(8000)}`,
+    region: 'local',
+    credentials: { accessKeyId: 'local', secretAccessKey: 'local' }
+  })
+  const storage = new DynamoStorage(client, {
+    PutItemCommand,
+    GetItemCommand,
+    UpdateItemCommand,
+    DeleteItemCommand,
+    CreateTableCommand,
+    DescribeTableCommand,
+    UpdateTimeToLiveCommand
+  })
+  await storage.migrate()
+  return {
+    name: 'dynamodb',
+    storage,
+    iterations: 2_000,
+    close: async () => {
+      client.destroy()
+      await container.stop()
+    }
+  }
+}
+
 const FACTORIES: Record<string, () => Promise<Target>> = {
   memory: memoryTarget,
   redis: redisTarget,
   postgres: postgresTarget,
-  mysql: mysqlTarget
+  mysql: mysqlTarget,
+  dynamodb: dynamodbTarget
 }
 
 const requested = process.argv.slice(2)
