@@ -89,9 +89,11 @@ reads as absent** — and a lock whose holder crashed would stay held for as
 long as the collector took to notice.
 
 So `expires_at` is the authority and every read compares against it, while
-the `ttl` attribute is written an hour past that, purely so the table does
-not grow forever. The adapter is correct with TTL disabled; it just
-accumulates dead items.
+the `ttl` attribute is written a day past that, purely so the table does
+not grow forever. The wide margin is deliberate: the stamp comes from the
+application's clock while the collector runs on AWS time, and a day absorbs
+any realistic skew at the cost of nothing but later garbage collection. The
+adapter is correct with TTL disabled; it just accumulates dead items.
 
 The same reasoning makes the acquire a single conditional write:
 
@@ -102,19 +104,46 @@ attribute_not_exists(record_key) OR expires_at <= :now
 Create-if-absent and expired-record takeover in one operation, so there is
 no window between reading a record and deciding to replace it.
 
+One thing to know about that takeover: the comparison runs inside DynamoDB
+against a timestamp *written by whichever client acquired last*, so the
+takeover is only as honest as the fleet's clocks. A client running far
+ahead of its peers can consider a live lock expired and steal it (fencing
+then stops the stale holder's *write*, never its side effects). This is the
+same convention the SQL adapters document; keep the fleet on NTP and give
+`lockTtl` comfortable margin over both the execution time and the plausible
+skew.
+
 ## Consistency
 
 Every read the lock depends on uses `ConsistentRead: true`. An eventually
 consistent read could show a stale record and let two callers believe they
 hold the same key, which is precisely the guarantee this library sells.
 
+## The 400 KB item limit
+
+DynamoDB rejects any item over 400 KB, and the stored outcome (the encoded
+result or error) lives inside the item. The adapter refuses an outcome that
+cannot fit *before* the write, with a `SerializationError`: the engine then
+releases the record so callers may retry, exactly as it does for a value
+the codec could not encode — this is not an outage (fail-open will not run
+unguarded over it) and not corruption (nothing stored is malformed), it is
+a value this storage cannot hold.
+
+On HTTP apps backed by this adapter, cap the replayable response body below
+the item limit so the refusal never triggers: `maxBodyBytes: 380_000` (the
+kernel serves larger responses fine; it just never caches them, which is
+the honest behavior for a body DynamoDB could not store anyway).
+
 ## Costs
 
 Each `execute` is one conditional write (the acquire) plus one write (the
-transition), and a replay is one strongly consistent read. A conflict adds
-a read; the wait policy adds one read per poll. Strongly consistent reads
-cost twice an eventually consistent one and cannot be served from DAX —
-budget accordingly on hot keys.
+transition), and a replay is one strongly consistent read. A conflict costs
+nothing extra: the blocking item rides back on the failed conditional write
+(`ReturnValuesOnConditionCheckFailure`), so the busy answer and the replay
+of a completed record are read straight off the exception. The wait policy
+adds one read per poll. Strongly consistent reads cost twice an eventually
+consistent one and cannot be served from DAX — budget accordingly on hot
+keys.
 
 ## Testing
 
