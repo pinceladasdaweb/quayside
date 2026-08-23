@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 1.3.0 (2026-08-23)
+
+* chore: spike a dynamodb adapter against the contract suite by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/31fb1c5e60fd984313c7080c76b38830680cb7b6)
+* feat: dynamodb storage adapter by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/c6b1a481de087546c0ff5442287f819e2b53f39a)
+* fix: restore error identity across built entry points by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/256141f4eb866c128e26ab3e304228d9dcbfdc03)
+* fix: never rebuild live foreign errors in the nestjs interceptor by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/410c66c3fbd6be21ddaf69c8a3b509b8f8c8f014)
+* fix: gate the unparsed-body warning on body-based fingerprint strategies by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/d499bd8897a2ba4f345899b10392aaa42a531137)
+* fix: harden the dynamodb adapter against retries, oversize outcomes and slow control planes by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/dd34be0a16f5d5c2e167b46c21d034f8696a23a8)
+* chore: cover the dynamodb adapter in the benchmark harness by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/8a80bd4927244ff9f20f8e742aa89353b422f442)
+
+
 ## 1.2.0 (2026-08-20)
 
 * fix: emit the expired-recovery event the type union always declared by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/b47b4f23a123bee2bbd5bab855f27e7a2677f35d)
