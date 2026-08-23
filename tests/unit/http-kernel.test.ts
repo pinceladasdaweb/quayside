@@ -157,7 +157,9 @@ describe('http kernel unparsed-body warning', () => {
     assert.equal(warnings.length, 1)
     assert.match(warnings[0] ?? '', /an empty object/, 'the warning names what it actually received')
 
-    // An empty array is the same story through a different parser.
+    // An empty array is the same story through a different parser, and the
+    // warning must name what it actually saw rather than calling every
+    // empty container an object.
     const arrays = kernelWith()
     const arrayWarnings = await warningsDuring(async () => {
       await arrays.handle(
@@ -166,6 +168,25 @@ describe('http kernel unparsed-body warning', () => {
       )
     })
     assert.equal(arrayWarnings.length, 1)
+    assert.match(arrayWarnings[0] ?? '', /an empty array/, 'an array is named as one')
+  })
+
+  test('a custom fingerprint strategy silences the warning entirely', async () => {
+    // A custom extractor may fingerprint headers or framework state and
+    // validate reuse fine with no parsed body at all: warning about the
+    // body would accuse a correctly configured app of misconfiguration.
+    const kernel = kernelWith({ fingerprint: (request) => request.header('x-payload-digest') })
+    const warnings = await warningsDuring(async () => {
+      await kernel.handle(
+        bodyless({ 'idempotency-key': 'c-1', 'content-length': '18', 'x-payload-digest': 'd' }),
+        async () => ok()
+      )
+      await kernel.handle(
+        { method: 'POST', path: '/p', body: {}, header: (name) => ({ 'idempotency-key': 'c-2', 'content-length': '31', 'x-payload-digest': 'd' })[name] },
+        async () => ok()
+      )
+    })
+    assert.equal(warnings.length, 0, 'a strategy that never reads the body is never warned about it')
   })
 
   test('an empty body the wire agrees is empty stays silent', async () => {

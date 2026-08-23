@@ -9,6 +9,7 @@ import {
   IdempotencyKeyInvalidError,
   IdempotencyKeyReuseError,
   QuaysideError,
+  SerializationError,
   StorageUnavailableError,
   WaitTimeoutError
 } from './errors'
@@ -127,6 +128,23 @@ interface SerializedError {
 
 const MAX_CAUSE_DEPTH = 5
 
+/**
+ * Everything one execution threads between run(), runOwned() and
+ * waitForOutcome(). One object instead of adjacent same-typed positionals:
+ * `key` and `storageKey` are both strings, and a silent swap at any of the
+ * call sites would compile clean and only fail behaviorally.
+ */
+interface ExecutionFrame {
+  input: ExecuteInput
+  /** The caller's key, as events and errors name it. */
+  key: string
+  /** The composed (namespaced, encoded) key the storage is addressed by. */
+  storageKey: string
+  fingerprint: string | undefined
+  correlationId: string
+  startedAt: number
+}
+
 // Last-resort record for failures whose own serialization throws (a hostile
 // getter, for instance); precomputed so this path cannot fail in turn.
 const UNSERIALIZABLE_FAILURE = JSON.stringify({ name: 'Error', message: 'failure could not be serialized' })
@@ -174,6 +192,23 @@ function encodeErrorValue (error: unknown, codec: Codec): string {
   }
 }
 
+// Registered rather than unique for the same reason as the NestJS metadata
+// key: this package ships dual CJS and ESM builds, and an error revived by
+// one copy must test true in the other.
+const REPLAYED_ERROR = Symbol.for('quayside:replayed-error')
+
+/**
+ * Whether an error was reconstructed from a stored record rather than
+ * thrown by live code. Adapters that rebuild richer error shapes on replay
+ * (the NestJS interceptor reviving an HttpException) must gate on this: a
+ * LIVE foreign error can carry the same fields by coincidence - an HTTP
+ * client error object, for instance - and rebuilding one of those would
+ * leak whatever its shape holds.
+ */
+export function isReplayedError (error: unknown): boolean {
+  return error instanceof Error && (error as unknown as Record<symbol, unknown>)[REPLAYED_ERROR] === true
+}
+
 function reviveError (serialized: SerializedError, depth = 0): Error {
   const options: ErrorOptions = {}
   // The same depth cap serialization applies: a record whose cause chain
@@ -198,6 +233,9 @@ function reviveError (serialized: SerializedError, depth = 0): Error {
       configurable: true
     })
   }
+  // Marked as a reconstruction (see isReplayedError). Non-enumerable so the
+  // mark never travels: it states how THIS object came to exist.
+  Object.defineProperty(error, REPLAYED_ERROR, { value: true })
   return error
 }
 
@@ -290,9 +328,16 @@ export class Idempotency {
     startedAt: number = this.clock.now()
   ): Promise<ExecutionResult<T>> {
     const { key, fingerprint } = this.resolveTarget(input)
-    const storageKey = this.composeKey(key)
+    const frame: ExecutionFrame = {
+      input,
+      key,
+      storageKey: this.composeKey(key),
+      fingerprint,
+      correlationId,
+      startedAt
+    }
     const token = randomUUID()
-    const pending = { key: storageKey, token, fingerprint, storedAt: this.clock.now() }
+    const pending = { key: frame.storageKey, token, fingerprint, storedAt: this.clock.now() }
 
     let existing: StoredRecord | null
     try {
@@ -305,7 +350,7 @@ export class Idempotency {
     }
 
     if (existing === null) {
-      return this.runOwned(storageKey, key, token, pending.storedAt, fn, correlationId, startedAt, this.resultTtlFor(input))
+      return this.runOwned(frame, token, pending.storedAt, fn, this.resultTtlFor(input))
     }
 
     if (!fingerprintsEqual(existing.fingerprint, fingerprint)) {
@@ -325,19 +370,17 @@ export class Idempotency {
     if (this.onConflict === 'reject') {
       throw new ConcurrentExecutionError(key)
     }
-    return this.waitForOutcome(input, storageKey, key, fingerprint, fn, correlationId, startedAt, existing)
+    return this.waitForOutcome(frame, fn, existing)
   }
 
   private async runOwned<T> (
-    storageKey: string,
-    key: string,
+    frame: ExecutionFrame,
     token: string,
     storedAt: number,
     fn: ExecuteFunction<T>,
-    correlationId: string,
-    startedAt: number,
     resultTtlMs: number
   ): Promise<ExecutionResult<T>> {
+    const { storageKey, key, correlationId, startedAt } = frame
     this.emit('acquired', key, correlationId)
     const controller = new AbortController()
     let stores = true
@@ -401,6 +444,13 @@ export class Idempotency {
         this.emit('storage-bypass', key, correlationId)
         return { value, replayed: false, storedAt }
       }
+      if (error instanceof SerializationError) {
+        // The storage refused the encoded outcome (too large for its
+        // record, say): the same contract as a codec that could not encode
+        // it - the record is released so callers may retry, and the error
+        // surfaces instead of leaving the key locked until the lock TTL.
+        await this.settle(storageKey, token, null, resultTtlMs)
+      }
       this.emit('failed', key, correlationId, this.clock.now() - startedAt)
       throw error
     }
@@ -430,15 +480,11 @@ export class Idempotency {
   }
 
   private async waitForOutcome<T> (
-    input: ExecuteInput,
-    storageKey: string,
-    key: string,
-    fingerprint: string | undefined,
+    frame: ExecutionFrame,
     fn: ExecuteFunction<T>,
-    correlationId: string,
-    startedAt: number,
     observed: StoredRecord
   ): Promise<ExecutionResult<T>> {
+    const { storageKey, key, fingerprint, correlationId, startedAt } = frame
     // The deadline is measured from the call, not from this entry: a
     // waiter that takes over and loses the re-acquire race lands in a new
     // wait, and restarting the clock there would let sustained holder
@@ -478,7 +524,7 @@ export class Idempotency {
         if (deadline - this.clock.now() <= 0) {
           throw new WaitTimeoutError(key, this.waitTimeoutMs)
         }
-        return this.run(input, fn, correlationId, startedAt)
+        return this.run(frame.input, fn, correlationId, startedAt)
       }
       observed = record
       // The record under the key can change identity while we wait: the

@@ -25,9 +25,10 @@ import { RedisStorage } from 'quayside/redis'
 export class AppModule {}
 ```
 
-`forRootAsync({ imports, inject, useFactory })` is available when the
-options depend on other providers (a config service, a connection pool).
-The module registers globally by default (`global: false` opts out) and
+`forRootAsync({ imports, inject, useFactory, global })` is available when
+the options depend on other providers (a config service, a connection pool).
+Both builders register the module globally by default (`global: false` opts
+out of either) and
 exports the `Idempotency` instance under the `QUAYSIDE_IDEMPOTENCY` token —
 inject it anywhere for raw `execute()` calls outside HTTP.
 

@@ -20,6 +20,7 @@
     "!src/redis/**",
     "!src/postgres/**",
     "!src/mysql/**",
+    "!src/dynamodb/**",
     "!src/sql/**"
   ],
   "coverageAnalysis": "perTest",

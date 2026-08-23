@@ -127,3 +127,30 @@ kernel and behave identically to the shipped adapters.
   still in flight, and the client's next retry executes it a second time.
   Leaving the record locked costs a bounded `lockTtl` of 409s; releasing it
   early costs the guarantee
+
+## Writing a storage adapter
+
+The storage contract lives on the `IdempotencyStorage` interface, and the
+contract suite (`tests/contract/storage-contract.ts`) is the executable
+spec: point it at your adapter and it enforces the fencing discipline plus
+the invariants the interface documents — most easily missed, an expired
+record must be reclaimed *in place* by `acquire` (create and takeover are
+one atomic operation) and must read as absent before physical reclaim.
+
+Three helpers are exported from `quayside` so adapters do not re-decide
+solved problems:
+
+- `buildStoredRecord(key, rawFields)` — the shared decoder: validates and
+  normalizes whatever your driver returned, classifying anything the
+  contract cannot describe as `StorageCorruptError`.
+- `contendAcquire(key, attempt)` — the bounded contention loop around your
+  atomic acquire: resolve `null` (acquired), a record (held) or `undefined`
+  (expired between steps — contend again), and it owns the retry bound and
+  the exhaustion classification.
+- `assertKeyBytes(key, maxBytes, limitName)` — the byte-cap guard for
+  bounded key columns: rejects with `IdempotencyKeyInvalidError` (a 400 in
+  the HTTP adapters), never truncates.
+
+Import all runtime values from `quayside` itself, never from deep module
+paths: error identity (`instanceof`) must hold across entry points, and
+only the package root is guaranteed to be a single shared module.

@@ -13,9 +13,13 @@ function pending (key: string, token = 'token-1'): PendingRecord {
 
 /**
  * Contract suite every storage adapter must pass. Covers the fencing
- * discipline plus the two invariants no adapter may violate: expired
- * records read as absent even before physical reclaim, and keys are stored
- * faithfully or rejected, never truncated.
+ * discipline plus the three invariants no adapter may violate: expired
+ * records read as absent even before physical reclaim, an expired record
+ * is reclaimed IN PLACE by acquire (create and takeover are one atomic
+ * operation, and the takeover returns null exactly like a fresh create -
+ * an adapter that only creates-if-absent permanently wedges every key
+ * whose holder died), and keys are stored faithfully or rejected, never
+ * truncated.
  */
 export function runStorageContract (name: string, createStorage: StorageFactory): void {
   describe(`storage contract: ${name}`, () => {

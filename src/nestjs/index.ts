@@ -13,7 +13,7 @@ import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } fr
 // paths: error identity (instanceof) must hold against errors thrown by the
 // user's Idempotency instance, so the build maps '../index' onto the shipped
 // core bundle instead of inlining a private copy.
-import { Idempotency } from '../index'
+import { Idempotency, isReplayedError } from '../index'
 import type { Duration, IdempotencyOptions } from '../index'
 import { KEY_REQUIRED_CODE, REPLAYED_HEADER, headerValue, httpErrorFacts, keyRequiredMessage } from '../http/kernel'
 
@@ -55,6 +55,8 @@ export interface QuaysideModuleAsyncOptions {
   imports?: DynamicModule['imports']
   inject?: unknown[]
   useFactory (...args: never[]): QuaysideModuleOptions | Promise<QuaysideModuleOptions>
+  /** Register the module globally. Default: true, matching forRoot. */
+  global?: boolean
 }
 
 /** Marks a handler as idempotent; enforced by the IdempotencyInterceptor. */
@@ -67,8 +69,18 @@ export function Idempotent (options: IdempotentOptions = {}): MethodDecorator {
 // answers 500 for anything that is not an instance. Rebuilding one restores
 // the status and body the first attempt already answered with: retries of
 // the same key must not change the response.
+//
+// Gated on isReplayedError: a LIVE foreign error can carry the same two
+// fields by coincidence - an AxiosError holds its upstream response and
+// status - and rebuilding one of those would answer the client with the
+// upstream's status and leak its entire response (headers and request
+// config included) instead of the sanitized 500 Nest gives unrecognized
+// errors. Only an error decoded from a stored record is a replay.
 function reviveHttpException (error: unknown): unknown {
-  if (!(error instanceof Error) || error instanceof HttpException) return error
+  // The mark subsumes the older instanceof guards: a non-Error is never
+  // marked, a live HttpException is never marked, and a reconstruction is
+  // never an HttpException instance (that is the problem being solved).
+  if (!isReplayedError(error)) return error
   const replayed = error as unknown as { status?: unknown, response?: unknown }
   if (typeof replayed.status !== 'number' || replayed.response === undefined) return error
   return new HttpException(replayed.response as string | Record<string, unknown>, replayed.status)
@@ -197,29 +209,41 @@ export class IdempotencyInterceptor implements NestInterceptor {
   }
 }
 
+// The Nest provider descriptor for the options, whichever way they arrive.
+type OptionsProvider =
+  | { provide: string, useValue: QuaysideModuleOptions }
+  | { provide: string, useFactory: QuaysideModuleAsyncOptions['useFactory'], inject: never[] }
+
 @Module({})
 export class QuaysideModule {
   static forRoot (options: QuaysideModuleOptions & { global?: boolean }): DynamicModule {
     const { global, ...moduleOptions } = options
-    return {
-      module: QuaysideModule,
-      global: global ?? true,
-      providers: [
-        { provide: QUAYSIDE_MODULE_OPTIONS, useValue: moduleOptions },
-        { provide: QUAYSIDE_IDEMPOTENCY, useFactory: (resolved: QuaysideModuleOptions) => new Idempotency(resolved), inject: [QUAYSIDE_MODULE_OPTIONS] },
-        IdempotencyInterceptor
-      ],
-      exports: [QUAYSIDE_IDEMPOTENCY, QUAYSIDE_MODULE_OPTIONS, IdempotencyInterceptor]
-    }
+    return QuaysideModule.assemble(
+      { provide: QUAYSIDE_MODULE_OPTIONS, useValue: moduleOptions },
+      { global }
+    )
   }
 
   static forRootAsync (options: QuaysideModuleAsyncOptions): DynamicModule {
+    return QuaysideModule.assemble(
+      { provide: QUAYSIDE_MODULE_OPTIONS, useFactory: options.useFactory, inject: options.inject as never[] ?? [] },
+      { global: options.global, imports: options.imports }
+    )
+  }
+
+  // Both statics differ only in how the options provider is built and what
+  // it needs imported; everything else is one module shape, assembled here
+  // so a provider added later cannot ship in one static and not the other.
+  private static assemble (
+    optionsProvider: OptionsProvider,
+    context: { global?: boolean, imports?: DynamicModule['imports'] }
+  ): DynamicModule {
     return {
       module: QuaysideModule,
-      global: true,
-      imports: options.imports ?? [],
+      global: context.global ?? true,
+      imports: context.imports ?? [],
       providers: [
-        { provide: QUAYSIDE_MODULE_OPTIONS, useFactory: options.useFactory, inject: options.inject as never[] ?? [] },
+        optionsProvider,
         { provide: QUAYSIDE_IDEMPOTENCY, useFactory: (resolved: QuaysideModuleOptions) => new Idempotency(resolved), inject: [QUAYSIDE_MODULE_OPTIONS] },
         IdempotencyInterceptor
       ],

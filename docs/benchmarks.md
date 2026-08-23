@@ -11,7 +11,7 @@ two hot paths:
 
 ```bash
 npm run bench            # memory only, no Docker needed
-npm run bench -- all     # + redis, postgres, mysql via Testcontainers
+npm run bench -- all     # + redis, postgres, mysql, dynamodb via Testcontainers
 ```
 
 ## Indicative numbers
@@ -31,6 +31,8 @@ near zero — real deployments pay their own RTT on top). Sequential calls,
 | postgres | hit | 503 | ~2,000 |
 | mysql | miss | 5,567 | ~180 |
 | mysql | hit | 573 | ~1,750 |
+| dynamodb | miss | 2,573 | ~390 |
+| dynamodb | hit | 842 | ~1,190 |
 
 ## How to read this
 
@@ -45,6 +47,10 @@ near zero — real deployments pay their own RTT on top). Sequential calls,
   MySQL ~5.6 ms locally). For high-throughput consumers prefer the Redis
   adapter; SQL shines where the operational win is *no extra
   infrastructure* — the idempotency table lives next to your data.
+- **The dynamodb rows measure DynamoDB Local**, a Java emulator: the real
+  service replaces its cost profile wholesale with your region's RTT
+  (single-digit milliseconds per call, twice per miss), plus the doubled
+  read units strongly consistent reads bill.
 
 Numbers are sequential per-operation latency; under concurrency the
 backends pipeline far higher aggregate throughput.

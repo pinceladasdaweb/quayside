@@ -50,7 +50,7 @@ Every company eventually hand-rolls this. Behind the one-liner hide lock acquisi
 | Separate lock TTL vs result TTL | ✅ | ➖ | ✅ | ❌ | ❌ |
 | Payload fingerprint (same key + different body ⇒ error) | ✅ constant-time | ➖ payload *is* the key | ✅ | ✅ | ➖ deep-equal, HTTP only |
 | Concurrency policy: reject **and** wait | ✅ + storage-assisted wake-up | ➖ poll-only wait | ➖ throws only | ➖ throws only | ❌ |
-| Storage: memory / Redis / Postgres / MySQL | ✅ all four, one contract suite | ✅ many, thin contract | ➖ DynamoDB-first | ➖ memory, redis | ➖ plugin-ish |
+| Storage: memory / Redis / Postgres / MySQL / DynamoDB | ✅ all five, one contract suite | ✅ many, thin contract | ➖ DynamoDB-first | ➖ memory, redis | ➖ plugin-ish |
 | HTTP adapters with IETF draft semantics (status/header replay, 409/422) | ✅ Express · Fastify · Hono | ➖ middleware, thinner | n/a | ✅ | ➖ stale |
 | NestJS module + `@Idempotent()` decorator | ✅ | ❌ | ✅ (Lambda) | ✅ | ❌ |
 | Typed events + pluggable metrics collector | ✅ native, `correlationId` | ➖ onHit/onMiss callbacks | ➖ CloudWatch-shaped | ❌ | ❌ |
@@ -60,11 +60,11 @@ Design principles:
 
 - **The core knows nothing about HTTP.** `execute(key, fn)` is the primitive; HTTP is one adapter among many, and the raw core works in any framework from day 1.
 - **Semantics borrowed from the best.** The state machine and payload-fingerprint validation follow AWS Powertools and Stripe — the two implementations that got the hard cases right.
-- **Atomicity lives in the storage, never in JavaScript.** Fenced transitions are Lua scripts on Redis and token-conditional statements on SQL; a stale holder's late write *fails*, it never overwrites.
+- **Atomicity lives in the storage, never in JavaScript.** Fenced transitions are Lua scripts on Redis, token-conditional statements on SQL and condition expressions on DynamoDB; a stale holder's late write *fails*, it never overwrites.
 - **Never magic.** Values that cannot be stored faithfully raise errors instead of being silently dropped; keys are rejected instead of truncated; failures degrade loudly.
 - **Zero runtime dependencies**, in the core and in every adapter — storage clients and frameworks are bring-your-own, typed structurally.
 
-Every claim above is enforced by the test suite — including a 50-way concurrency race, `SIGKILL` crash recovery and a split-brain fencing test against real Redis, Postgres and MySQL servers (Testcontainers).
+Every claim above is enforced by the test suite — including a 50-way concurrency race, `SIGKILL` crash recovery and a split-brain fencing test against real Redis, Postgres, MySQL and DynamoDB servers (Testcontainers).
 
 ## Install
 
@@ -164,11 +164,12 @@ import { MemoryStorage } from 'quayside/memory'     // tests and development
 import { RedisStorage } from 'quayside/redis'       // SET NX PX + fenced Lua transitions
 import { PostgresStorage } from 'quayside/postgres' // ON CONFLICT DO NOTHING + token-conditional updates
 import { MysqlStorage } from 'quayside/mysql'       // INSERT IGNORE equivalent
+import { DynamoStorage } from 'quayside/dynamodb'   // conditional PutItem + token-conditional updates
 ```
 
-Bring your own client — any ioredis instance or `@pinceladasdaweb/redis` RedisClient, any `pg` Pool, any `mysql2/promise` Pool. The SQL adapters ship `CREATE TABLE` migrations (`migrate()` or an exported DDL string) and clean up expired rows lazily — no cron required, with an optional `sweep()` for bulk housekeeping.
+Bring your own client — any ioredis instance or `@pinceladasdaweb/redis` RedisClient, any `pg` Pool, any `mysql2/promise` Pool, any `DynamoDBClient` (its command classes are passed in, so the AWS SDK is never bundled). The SQL adapters ship `CREATE TABLE` migrations (`migrate()` or an exported DDL string) and clean up expired rows lazily — no cron required, with an optional `sweep()` for bulk housekeeping. DynamoDB ships the same `migrate()` plus exported table and TTL definitions for CDK/Terraform, and treats its native TTL as a garbage collector only: expiry is decided on read, because the service deletes expired items on its own schedule ([docs/dynamodb.md](docs/dynamodb.md)).
 
-Every adapter passes the same storage-contract suite against a real server, including the two invariants that protect correctness: **expired-but-not-purged records read as absent**, and **keys are stored faithfully or rejected — never truncated**. Custom adapters implement one interface and inherit the suite: see [docs/sql.md](docs/sql.md) and [tests/contract](tests/contract/storage-contract.ts).
+Every adapter passes the same storage-contract suite against a real server, including the three invariants that protect correctness: **expired-but-not-purged records read as absent**, **an expired record is reclaimed in place by acquire** (a crashed holder can never wedge its key), and **keys are stored faithfully or rejected — never truncated**. Custom adapters implement one interface and inherit the suite: see [docs/sql.md](docs/sql.md), [docs/dynamodb.md](docs/dynamodb.md) and [tests/contract](tests/contract/storage-contract.ts).
 
 ## HTTP adapters
 
@@ -278,6 +279,7 @@ Methods: `execute(input, fn)` · `executeWithMetadata(input, fn)` · `wrap(fn, {
 - [Core semantics](docs/core.md) — state machine, TTLs, fingerprints, serialization rules, wait policy
 - [Observability](docs/observability.md) — events, Prometheus metrics, OpenTelemetry spans
 - [SQL storage](docs/sql.md) — migrations, lazy expiry, `sweep()`
+- [DynamoDB storage](docs/dynamodb.md) — table shape, why the native TTL is not the expiry, costs
 - [HTTP adapters](docs/http.md) — options, error mapping, cacheability rules
 - [NestJS](docs/nestjs.md) — module, interceptor, decorator
 - [Writing an adapter](docs/writing-an-adapter.md) — Koa as the worked example

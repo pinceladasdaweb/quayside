@@ -3,13 +3,11 @@ import { setTimeout as sleep } from 'node:timers/promises'
 
 // Runtime values come from the core entry point, never from deep module
 // paths: error identity (instanceof) must hold across entry points, so the
-// build maps '../index' onto the shipped core bundle instead of inlining a
-// private copy.
-import { FencingError, RECORD_STATUS, StorageCorruptError } from '../index'
+// build maps the core specifiers onto the shipped core bundle instead of
+// inlining private copies. That covers the shared storage helpers too -
+// contendAcquire and buildStoredRecord throw core error classes.
+import { FencingError, RECORD_STATUS, StorageCorruptError, buildStoredRecord, contendAcquire } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
-// Plain shared constants carry no identity requirement, so unlike the
-// errors above they may come straight from the module that defines them.
-import { MAX_ACQUIRE_ATTEMPTS, buildStoredRecord } from '../storage'
 
 /**
  * Minimal ioredis-shaped command surface. Structural on purpose: any
@@ -122,7 +120,17 @@ function isManagedClient (client: RedisStorageClient): client is ManagedRedisCli
 
 // The wire field names are this adapter's; the validation is everyone's.
 function parseWireRecord (key: string, raw: string): StoredRecord {
-  const wire = JSON.parse(raw) as Partial<WireRecord>
+  let wire: Partial<WireRecord>
+  try {
+    wire = JSON.parse(raw) as Partial<WireRecord>
+  } catch {
+    // A value under the key that is not even JSON (a shared-Redis neighbor,
+    // a manual SET) is the same defect as a record that parses but fails
+    // validation: data the contract cannot describe, on a storage that is
+    // answering fine. Classifying it as an outage would let fail-open run
+    // unguarded forever over a deterministic misread.
+    throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}": value is not valid JSON`)
+  }
   return buildStoredRecord(key, {
     token: wire.token,
     status: wire.status,
@@ -168,14 +176,14 @@ export class RedisStorage implements IdempotencyStorage {
     }
     if (record.fingerprint !== undefined) wire.fingerprint = record.fingerprint
     const encoded = JSON.stringify(wire)
-    for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt += 1) {
+    return contendAcquire(record.key, async () => {
       const outcome = await this.raw().set(record.key, encoded, 'PX', lockTtlMs, 'NX')
       if (outcome === 'OK') return null
       const current = await this.raw().get(record.key)
       if (current !== null) return parseWireRecord(record.key, current)
       // The holder expired between SET NX and GET: contend again.
-    }
-    throw new StorageCorruptError(record.key, `could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+      return undefined
+    })
   }
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
