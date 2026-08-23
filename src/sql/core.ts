@@ -1,12 +1,11 @@
 // Runtime values come from the core entry point, never from deep module
 // paths: error identity (instanceof) must hold across entry points, so the
-// build maps '../index' onto the shipped core bundle instead of inlining a
-// private copy.
-import { FencingError, IdempotencyKeyInvalidError, RECORD_STATUS, StorageCorruptError } from '../index'
+// build maps the core specifiers onto the shipped core bundle instead of
+// inlining private copies. That covers the shared storage helpers too -
+// contendAcquire, assertKeyBytes and buildStoredRecord throw core error
+// classes.
+import { FencingError, RECORD_STATUS, assertKeyBytes, buildStoredRecord, contendAcquire } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
-// Plain shared constants carry no identity requirement, so unlike the
-// errors above they may come straight from the module that defines them.
-import { MAX_ACQUIRE_ATTEMPTS, buildStoredRecord } from '../storage'
 
 /**
  * The dialect-specific SQL. Both adapters share one algorithm; only the
@@ -105,9 +104,12 @@ export class SqlStorageCore implements IdempotencyStorage {
   }
 
   async acquire (record: PendingRecord, lockTtlMs: number): Promise<StoredRecord | null> {
-    this.assertKeyFits(record.key)
+    // The key column is a bounded VARCHAR: anything the column cannot hold
+    // faithfully is rejected up front, never truncated (MySQL in non-strict
+    // mode truncates silently, and truncation aliases two keys into one).
+    assertKeyBytes(record.key, this.maxKeyBytes, 'key column')
     const fingerprint = record.fingerprint ?? null
-    for (let attempt = 0; attempt < MAX_ACQUIRE_ATTEMPTS; attempt += 1) {
+    return contendAcquire(record.key, async () => {
       const now = Date.now()
       const inserted = await this.run(this.statements.insert, [record.key, record.token, fingerprint, record.storedAt, now + lockTtlMs])
       if (inserted.affected === 1) return null
@@ -117,8 +119,8 @@ export class SqlStorageCore implements IdempotencyStorage {
       const row = selected.rows[0]
       if (row !== undefined) return mapRow(record.key, row)
       // The row expired or vanished between statements: contend again.
-    }
-    throw new StorageCorruptError(record.key, `could not acquire or observe key "${record.key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+      return undefined
+    })
   }
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
@@ -160,15 +162,5 @@ export class SqlStorageCore implements IdempotencyStorage {
   async sweep (): Promise<number> {
     const swept = await this.run(this.statements.sweep, [Date.now()])
     return swept.affected
-  }
-
-  // The key column is a bounded VARCHAR: anything the column cannot hold
-  // faithfully is rejected here, never truncated (truncation would alias
-  // two keys into one record, and MySQL in non-strict mode truncates
-  // silently).
-  private assertKeyFits (key: string): void {
-    if (Buffer.byteLength(key) > this.maxKeyBytes) {
-      throw new IdempotencyKeyInvalidError(key, `idempotency key is ${Buffer.byteLength(key)} bytes long and exceeds the ${this.maxKeyBytes}-byte key column; keys are rejected, never truncated`)
-    }
   }
 }

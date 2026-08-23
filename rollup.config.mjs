@@ -10,9 +10,16 @@ const external = (id) => !id.startsWith('.') && !id.startsWith('/')
 // private copy: instanceof checks on the error taxonomy have to hold across
 // entry points. Types are not affected; the dts bundles keep inlining,
 // interfaces have no identity.
-const CORE_SPECIFIER = '../index'
+//
+// '../storage' is on the list as a backstop, not a convention: adapters are
+// written against '../index', but a deep import that slipped through would
+// otherwise inline src/storage - whose decoder throws StorageCorruptError -
+// as a private copy per bundle, and every name it exports is re-exported by
+// the core entry, so mapping it there is always sound.
+const CORE_SPECIFIERS = ['../index', '../storage']
+const isCoreId = (id) => CORE_SPECIFIERS.includes(id) || id.endsWith('/src/index') || id.endsWith('/src/storage')
 const corePaths = (format) => (id) =>
-  id.endsWith('/src/index') || id === CORE_SPECIFIER ? (format === 'es' ? './index.mjs' : './index.cjs') : id
+  isCoreId(id) ? (format === 'es' ? './index.mjs' : './index.cjs') : id
 
 // One pair of configs per public entry point. Each subpath bundles its own
 // tree; `core: true` is the exception above: the code bundle then imports
@@ -25,7 +32,7 @@ const entry = (input, name, { core = false } = {}) => [
       { file: `dist/${name}.mjs`, format: 'es', exports: 'named', ...(core && { paths: corePaths('es') }) }
     ],
     plugins: [typescript({ include: ['src/**/*.ts'] })],
-    external: core ? (id) => external(id) || id === CORE_SPECIFIER : external
+    external: core ? (id) => external(id) || isCoreId(id) : external
   },
   {
     input,
@@ -47,6 +54,7 @@ export default [
   ...entry('src/redis/index.ts', 'redis', { core: true }),
   ...entry('src/postgres/index.ts', 'postgres', { core: true }),
   ...entry('src/mysql/index.ts', 'mysql', { core: true }),
+  ...entry('src/dynamodb/index.ts', 'dynamodb', { core: true }),
   ...entry('src/express/index.ts', 'express', { core: true }),
   ...entry('src/fastify/index.ts', 'fastify', { core: true }),
   ...entry('src/hono/index.ts', 'hono', { core: true }),
