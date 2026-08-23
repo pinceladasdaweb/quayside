@@ -7,7 +7,7 @@
  * @packageDocumentation
  */
 
-export { Idempotency } from './idempotency'
+export { Idempotency, isReplayedError } from './idempotency'
 export type {
   ExecuteFunction,
   ExecuteInput,
@@ -39,11 +39,17 @@ export type { Codec } from './codec'
 export { parseDuration } from './duration'
 export type { Duration } from './duration'
 
-export { RECORD_STATUS } from './storage'
+// The storage-authoring helpers are public API: adapters (in-tree and
+// external) must import their runtime values from this entry point, never
+// from deep module paths - the build externalizes only the core bundle, so
+// a deep import would inline a private copy of anything these helpers
+// throw and break `instanceof` across entry points.
+export { RECORD_STATUS, assertKeyBytes, buildStoredRecord, contendAcquire } from './storage'
 export type {
   IdempotencyStorage,
   Outcome,
   PendingRecord,
+  RawRecordFields,
   RecordStatus,
   StoredRecord
 } from './storage'

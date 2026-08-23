@@ -4,6 +4,16 @@
 
 ```ts
 
+// Warning: (ae-missing-release-tag) "assertKeyBytes" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function assertKeyBytes(key: string, maxBytes: number, limitName: string): void;
+
+// Warning: (ae-missing-release-tag) "buildStoredRecord" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function buildStoredRecord(key: string, fields: RawRecordFields): StoredRecord;
+
 // Warning: (ae-missing-release-tag) "Codec" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
 // @public (undocumented)
@@ -24,6 +34,11 @@ export class ConcurrentExecutionError extends QuaysideError {
     // (undocumented)
     readonly key: string;
 }
+
+// Warning: (ae-missing-release-tag) "contendAcquire" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function contendAcquire(key: string, attempt: () => Promise<StoredRecord | null | undefined>): Promise<StoredRecord | null>;
 
 // Warning: (ae-missing-release-tag) "Duration" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -218,11 +233,15 @@ export interface IdempotencyStorage {
     complete(key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void>;
     delete(key: string): Promise<void>;
     extend(key: string, token: string, lockTtlMs: number): Promise<void>;
-    // (undocumented)
     get(key: string): Promise<StoredRecord | null>;
     release(key: string, token: string): Promise<void>;
     waitForChange?(key: string, timeoutMs: number): Promise<void>;
 }
+
+// Warning: (ae-missing-release-tag) "isReplayedError" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export function isReplayedError(error: unknown): boolean;
 
 // Warning: (ae-missing-release-tag) "jsonCodec" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //
@@ -292,6 +311,26 @@ export class QuaysideError extends Error {
 //
 // @public (undocumented)
 export type QuaysideErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
+
+// Warning: (ae-missing-release-tag) "RawRecordFields" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
+//
+// @public
+export interface RawRecordFields {
+    // (undocumented)
+    error: unknown;
+    // (undocumented)
+    expiresAt: unknown;
+    // (undocumented)
+    fingerprint: unknown;
+    // (undocumented)
+    result: unknown;
+    // (undocumented)
+    status: unknown;
+    // (undocumented)
+    storedAt: unknown;
+    // (undocumented)
+    token: unknown;
+}
 
 // Warning: (ae-missing-release-tag) "RECORD_STATUS" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
 //

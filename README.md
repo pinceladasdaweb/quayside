@@ -169,7 +169,7 @@ import { DynamoStorage } from 'quayside/dynamodb'   // conditional PutItem + tok
 
 Bring your own client — any ioredis instance or `@pinceladasdaweb/redis` RedisClient, any `pg` Pool, any `mysql2/promise` Pool, any `DynamoDBClient` (its command classes are passed in, so the AWS SDK is never bundled). The SQL adapters ship `CREATE TABLE` migrations (`migrate()` or an exported DDL string) and clean up expired rows lazily — no cron required, with an optional `sweep()` for bulk housekeeping. DynamoDB ships the same `migrate()` plus exported table and TTL definitions for CDK/Terraform, and treats its native TTL as a garbage collector only: expiry is decided on read, because the service deletes expired items on its own schedule ([docs/dynamodb.md](docs/dynamodb.md)).
 
-Every adapter passes the same storage-contract suite against a real server, including the two invariants that protect correctness: **expired-but-not-purged records read as absent**, and **keys are stored faithfully or rejected — never truncated**. Custom adapters implement one interface and inherit the suite: see [docs/sql.md](docs/sql.md), [docs/dynamodb.md](docs/dynamodb.md) and [tests/contract](tests/contract/storage-contract.ts).
+Every adapter passes the same storage-contract suite against a real server, including the three invariants that protect correctness: **expired-but-not-purged records read as absent**, **an expired record is reclaimed in place by acquire** (a crashed holder can never wedge its key), and **keys are stored faithfully or rejected — never truncated**. Custom adapters implement one interface and inherit the suite: see [docs/sql.md](docs/sql.md), [docs/dynamodb.md](docs/dynamodb.md) and [tests/contract](tests/contract/storage-contract.ts).
 
 ## HTTP adapters
 

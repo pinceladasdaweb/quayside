@@ -9,7 +9,8 @@ import {
   IdempotencyKeyReuseError,
   SerializationError,
   StorageUnavailableError,
-  WaitTimeoutError
+  WaitTimeoutError,
+  isReplayedError
 } from '../../src/index'
 import type { IdempotencyEvent, IdempotencyStorage, StoredRecord } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
@@ -1149,5 +1150,102 @@ describe('failure cleanup and revival edges', () => {
     const bypassed = await new Idempotency({ storage: brokenWrite, onStorageError: 'open' })
       .executeWithMetadata('k', async () => 'v')
     assert.equal(bypassed.replayed, false)
+  })
+})
+
+describe('replayed-error marking', () => {
+  test('an error decoded from storage tests true; a live one tests false', async () => {
+    const idempotency = instance({ persistFailures: true })
+    const live = Object.assign(new Error('upstream said no'), { status: 404, response: { data: 'x' } })
+    await assert.rejects(
+      idempotency.execute('mark', async () => { throw live }),
+      (thrown: unknown) => {
+        assert.equal(thrown, live)
+        assert.equal(isReplayedError(thrown), false, 'the first throw is live code, not a reconstruction')
+        return true
+      }
+    )
+    await assert.rejects(
+      idempotency.execute('mark', async () => 'never runs'),
+      (thrown: unknown) => {
+        assert.notEqual(thrown, live, 'the replay is a reconstruction, not the original object')
+        assert.equal(isReplayedError(thrown), true, 'and it is marked as one')
+        // The mark lives under the REGISTERED symbol: this package ships
+        // dual CJS and ESM builds, and an error revived by one copy must
+        // test true in the other, so the global registry key is the
+        // contract, not the module-local symbol identity.
+        assert.equal(
+          (thrown as unknown as Record<symbol, unknown>)[Symbol.for('quayside:replayed-error')],
+          true
+        )
+        // Adapters branch on the mark to rebuild richer shapes; the fields
+        // they read must still be there.
+        assert.equal((thrown as { status?: number }).status, 404)
+        return true
+      }
+    )
+    assert.equal(isReplayedError('not an error'), false)
+  })
+
+  test('the mark is invisible to serialization and enumeration', async () => {
+    const idempotency = instance({ persistFailures: true })
+    await assert.rejects(idempotency.execute('mark-2', async () => { throw new Error('boom') }))
+    const record = await idempotency.get('mark-2')
+    assert.ok(record?.error)
+    assert.equal(isReplayedError(record.error), true)
+    // A symbol-keyed, non-enumerable mark: nothing that walks own string
+    // keys (JSON, structuredClone consumers, loggers) can see it.
+    assert.equal(Object.keys(record.error).includes('quayside:replayed-error'), false)
+    assert.equal(JSON.stringify(record.error).includes('replayed-error'), false)
+  })
+})
+
+describe('an outcome the storage refuses as unstorable', () => {
+  test('a SerializationError from complete releases the record so callers may retry', async () => {
+    // The same contract as a codec that could not encode the value: the
+    // caller keeps its error, nothing bogus is stored, and the key is not
+    // left locked until the lock TTL runs out.
+    const memory = new MemoryStorage()
+    const refusing: IdempotencyStorage = {
+      acquire: (record, ttl) => memory.acquire(record, ttl),
+      complete: async () => { throw new SerializationError('outcome exceeds the storage record limit') },
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, ttl) => memory.extend(key, token, ttl),
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const idempotency = new Idempotency({ storage: refusing })
+    await assert.rejects(
+      idempotency.execute('huge', async () => 'x'.repeat(64)),
+      (error: unknown) => {
+        assert.ok(error instanceof SerializationError, 'the refusal surfaces as itself, not dressed as an outage')
+        return true
+      }
+    )
+    assert.equal(await memory.get('huge'), null, 'the record was released, not left in progress')
+  })
+
+  test('an outage on the completion write does NOT release the record', async () => {
+    // The release-on-refusal above is reserved for the deterministic case.
+    // A storage that is down is a different animal: the record (and its
+    // lock) is the only thing still protecting concurrent callers, and
+    // fail-closed keeps it in place until the lock TTL decides.
+    const memory = new MemoryStorage()
+    let released = 0
+    const down: IdempotencyStorage = {
+      acquire: (record, ttl) => memory.acquire(record, ttl),
+      complete: async () => { throw new Error('connection reset') },
+      release: async (key, token) => { released += 1; await memory.release(key, token) },
+      extend: (key, token, ttl) => memory.extend(key, token, ttl),
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    await assert.rejects(
+      new Idempotency({ storage: down }).execute('outage', async () => 'v'),
+      StorageUnavailableError
+    )
+    assert.equal(released, 0, 'an outage is never answered with a release')
+    const record = await memory.get('outage')
+    assert.equal(record?.status, 'in-progress', 'the lock stays until its TTL decides')
   })
 })

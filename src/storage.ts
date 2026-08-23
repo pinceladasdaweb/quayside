@@ -1,4 +1,4 @@
-import { StorageCorruptError } from './errors'
+import { IdempotencyKeyInvalidError, StorageCorruptError } from './errors'
 
 export const RECORD_STATUS = {
   inProgress: 'in-progress',
@@ -68,6 +68,40 @@ export function buildStoredRecord (key: string, fields: RawRecordFields): Stored
   return record
 }
 
+/**
+ * The bounded acquire-contention loop every adapter shares. One `attempt`
+ * is the adapter's atomic acquire plus its conflict read; it resolves to
+ * `null` (acquired), a record (somebody live holds the key) or `undefined`
+ * (the holder expired between the two steps: contend again). Exhausting the
+ * attempts is corruption, not an outage - the storage answered every call,
+ * it just kept answering in a way the contract cannot describe - so
+ * fail-open must not run unguarded over it.
+ */
+export async function contendAcquire (
+  key: string,
+  attempt: () => Promise<StoredRecord | null | undefined>
+): Promise<StoredRecord | null> {
+  for (let turn = 0; turn < MAX_ACQUIRE_ATTEMPTS; turn += 1) {
+    const outcome = await attempt()
+    if (outcome !== undefined) return outcome
+  }
+  throw new StorageCorruptError(key, `could not acquire or observe key "${key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+}
+
+/**
+ * The byte-cap key guard every bounded storage shares. `limitName` names
+ * the limit that was broken (a key column, a partition key) so the failure
+ * reads in the storage's own terms; the classification is everyone's: the
+ * offending value is data, so the HTTP adapters answer 400, and the key is
+ * rejected rather than truncated (truncation is a silent collision).
+ */
+export function assertKeyBytes (key: string, maxBytes: number, limitName: string): void {
+  const size = Buffer.byteLength(key)
+  if (size > maxBytes) {
+    throw new IdempotencyKeyInvalidError(key, `idempotency key is ${size} bytes long and exceeds the ${maxBytes}-byte ${limitName}; keys are rejected, never truncated`)
+  }
+}
+
 export interface PendingRecord {
   key: string
   token: string
@@ -90,7 +124,15 @@ export interface StoredRecord {
 }
 
 export interface IdempotencyStorage {
-  /** Atomic create-if-absent. Returns the winning record (theirs) or null (ours). */
+  /**
+   * Atomic create-if-absent. Returns the winning record (theirs) or null
+   * (ours). Two clauses of this contract are load-bearing and easy to miss:
+   * an EXPIRED record must be reclaimed in place by this call (create and
+   * takeover are one atomic operation, so a holder that crashed can never
+   * block its key past the lock TTL), and the takeover is invisible to the
+   * caller - it returns null exactly like a fresh create. An adapter that
+   * only creates-if-absent permanently wedges every key whose holder died.
+   */
   acquire (record: PendingRecord, lockTtlMs: number): Promise<StoredRecord | null>
   /** Fenced transition to COMPLETED/FAILED. Throws FencingError on token mismatch. */
   complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void>
@@ -98,6 +140,11 @@ export interface IdempotencyStorage {
   release (key: string, token: string): Promise<void>
   /** Fenced lock-TTL extension. Throws FencingError on token mismatch. */
   extend (key: string, token: string, lockTtlMs: number): Promise<void>
+  /**
+   * Reads the live record under `key`. An expired record reads as null,
+   * whatever physical reclaim has got around to: expiry is a property of
+   * the read, never of the store's own garbage collection.
+   */
   get (key: string): Promise<StoredRecord | null>
   /** Unfenced delete (invalidate). */
   delete (key: string): Promise<void>

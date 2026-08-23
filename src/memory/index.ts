@@ -40,10 +40,7 @@ export class MemoryStorage implements IdempotencyStorage {
   }
 
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
-    const existing = this.lookup(key)
-    if (existing === undefined || existing.token !== token || existing.status !== RECORD_STATUS.inProgress) {
-      throw new FencingError(key)
-    }
+    const existing = this.held(key, token)
     const next: StoredRecord = {
       ...existing,
       status: outcome.status,
@@ -55,18 +52,12 @@ export class MemoryStorage implements IdempotencyStorage {
   }
 
   async release (key: string, token: string): Promise<void> {
-    const existing = this.lookup(key)
-    if (existing === undefined || existing.token !== token || existing.status !== RECORD_STATUS.inProgress) {
-      throw new FencingError(key)
-    }
+    this.held(key, token)
     this.records.delete(key)
   }
 
   async extend (key: string, token: string, lockTtlMs: number): Promise<void> {
-    const existing = this.lookup(key)
-    if (existing === undefined || existing.token !== token || existing.status !== RECORD_STATUS.inProgress) {
-      throw new FencingError(key)
-    }
+    const existing = this.held(key, token)
     this.records.set(key, { ...existing, expiresAt: this.now() + lockTtlMs })
   }
 
@@ -77,6 +68,17 @@ export class MemoryStorage implements IdempotencyStorage {
 
   async delete (key: string): Promise<void> {
     this.records.delete(key)
+  }
+
+  // The fencing guard every transition out of IN_PROGRESS shares: the
+  // record exists (and has not expired), the token still matches and the
+  // status is still in-progress. Anything else is a lost lock.
+  private held (key: string, token: string): StoredRecord {
+    const existing = this.lookup(key)
+    if (existing === undefined || existing.token !== token || existing.status !== RECORD_STATUS.inProgress) {
+      throw new FencingError(key)
+    }
+    return existing
   }
 
   private lookup (key: string): StoredRecord | undefined {

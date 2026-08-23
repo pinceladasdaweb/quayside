@@ -1,9 +1,9 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { StorageCorruptError } from '../../src/index'
-import { buildStoredRecord } from '../../src/storage'
-import type { RawRecordFields } from '../../src/storage'
+import { IdempotencyKeyInvalidError, StorageCorruptError } from '../../src/index'
+import { MAX_ACQUIRE_ATTEMPTS, assertKeyBytes, buildStoredRecord, contendAcquire } from '../../src/storage'
+import type { RawRecordFields, StoredRecord } from '../../src/storage'
 
 // The decoder every storage adapter shares. The adapters themselves are
 // covered against real servers by the integration suite; the validation
@@ -80,5 +80,76 @@ describe('buildStoredRecord', () => {
     for (const status of ['in-progress', 'completed', 'failed']) {
       assert.equal(buildStoredRecord('k', fields({ status })).status, status)
     }
+  })
+})
+
+// The contention loop every adapter delegates to. The adapters' own
+// attempt shapes are covered by the integration suite; the loop's bound
+// and its exhaustion classification are pinned here, where they are cheap
+// to state and where mutation can see them (the adapters are excluded).
+describe('contendAcquire', () => {
+  const held = buildStoredRecord('k', fields())
+
+  test('an acquired attempt resolves null without another turn', async () => {
+    let turns = 0
+    assert.equal(await contendAcquire('k', async () => { turns += 1; return null }), null)
+    assert.equal(turns, 1)
+  })
+
+  test('a live holder resolves as the winning record without another turn', async () => {
+    let turns = 0
+    const winner = await contendAcquire('k', async () => { turns += 1; return held })
+    assert.equal(winner, held)
+    assert.equal(turns, 1)
+  })
+
+  test('an expired-between-steps attempt contends again until it lands', async () => {
+    let turns = 0
+    const outcomes: Array<StoredRecord | null | undefined> = [undefined, undefined, null]
+    const winner = await contendAcquire('k', async () => outcomes[turns++])
+    assert.equal(winner, null)
+    assert.equal(turns, 3, 'the loop retried exactly as many times as the race demanded')
+  })
+
+  test('exhaustion is corruption, not an outage', async () => {
+    // A storage that answers every call but keeps answering in a way the
+    // contract cannot describe is broken data, not a broken connection:
+    // classifying it as unavailable would let fail-open run unguarded
+    // forever over a deterministic misread.
+    let turns = 0
+    await assert.rejects(
+      contendAcquire('k', async () => { turns += 1; return undefined }),
+      (error: unknown) => {
+        assert.ok(error instanceof StorageCorruptError)
+        assert.equal(error.code, 'IDEMPOTENCY_STORAGE_CORRUPT')
+        assert.equal(error.key, 'k')
+        assert.match(error.message, new RegExp(`after ${MAX_ACQUIRE_ATTEMPTS} attempts`))
+        return true
+      }
+    )
+    assert.equal(turns, MAX_ACQUIRE_ATTEMPTS, 'the loop is bounded, never infinite')
+  })
+})
+
+// The byte-cap guard the bounded storages share.
+describe('assertKeyBytes', () => {
+  test('a key within the limit passes, measured in bytes rather than characters', () => {
+    assert.doesNotThrow(() => assertKeyBytes('x'.repeat(16), 16, 'key column'))
+    // Two-byte characters: 9 of them fit 16 bytes as characters but not as bytes.
+    assert.throws(() => assertKeyBytes('é'.repeat(9), 16, 'key column'))
+  })
+
+  test('an oversized key is rejected naming the limit, never truncated', () => {
+    assert.throws(
+      () => assertKeyBytes('x'.repeat(17), 16, 'partition key limit'),
+      (error: unknown) => {
+        assert.ok(error instanceof IdempotencyKeyInvalidError)
+        assert.equal(error.code, 'IDEMPOTENCY_KEY_INVALID')
+        assert.equal(error.key, 'x'.repeat(17))
+        assert.match(error.message, /17 bytes long and exceeds the 16-byte partition key limit/)
+        assert.match(error.message, /rejected, never truncated/)
+        return true
+      }
+    )
   })
 })
