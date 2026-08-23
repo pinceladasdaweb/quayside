@@ -178,6 +178,7 @@ export class HttpIdempotencyKernel {
   private readonly methods: Set<string>
   private readonly enforce: boolean
   private readonly fingerprintPayload: (request: HttpRequestFacts) => unknown
+  private readonly fingerprintReadsBody: boolean
   private readonly keyOf: (request: HttpRequestFacts) => string | undefined
   private readonly derivesKey: boolean
   private readonly replayHeaders: string[]
@@ -196,6 +197,10 @@ export class HttpIdempotencyKernel {
       : fingerprint === 'body-and-path'
         ? (request) => ({ path: request.path, body: request.body ?? null })
         : (request) => request.body
+    // Only the built-in strategies read the body; a custom extractor may
+    // fingerprint headers or framework state and validate reuse fine with
+    // no body at all, so the unparsed-body warning must not accuse it.
+    this.fingerprintReadsBody = typeof fingerprint !== 'function'
     this.derivesKey = options.key !== undefined
     this.keyOf = options.key ?? ((request) => request.header(this.header))
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
@@ -246,10 +251,14 @@ export class HttpIdempotencyKernel {
     // key-only matching, and two different payloads under one key would
     // replay instead of answering 422. That is a mount-order or parser
     // misconfiguration, and staying quiet about it is the actual bug, so
-    // it is reported once per kernel.
-    if (!this.warnedUnparsedBody && this.bodyWentMissing(request)) {
+    // it is reported once per kernel - but only when the configured
+    // strategy actually reads the body, or the accusation is false.
+    if (this.fingerprintReadsBody && !this.warnedUnparsedBody && this.bodyWentMissing(request)) {
       this.warnedUnparsedBody = true
-      process.emitWarning(`quayside: a ${request.method.toUpperCase()} request carrying "${this.header}" declares a body that did not survive parsing (received ${request.body === undefined ? 'undefined' : 'an empty object'}), so the payload fingerprint cannot validate key reuse. Is a body parser mounted before the idempotency middleware, and does it handle this content type?`)
+      const received = request.body === undefined
+        ? 'undefined'
+        : Array.isArray(request.body) ? 'an empty array' : 'an empty object'
+      process.emitWarning(`quayside: a ${request.method.toUpperCase()} request carrying "${this.header}" declares a body that did not survive parsing (received ${received}), so the payload fingerprint cannot validate key reuse. Is a body parser mounted before the idempotency middleware, and does it handle this content type?`)
     }
 
     const payload = this.fingerprintPayload(request)
