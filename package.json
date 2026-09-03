@@ -244,7 +244,7 @@
     "@microsoft/api-extractor": "^7.58.12",
     "@nestjs/common": "^11.2.1",
     "@nestjs/core": "^11.2.1",
-    "@nestjs/platform-express": "^11.2.1",
+    "@nestjs/platform-express": "^12.0.1",
     "@nestjs/testing": "^11.2.1",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
