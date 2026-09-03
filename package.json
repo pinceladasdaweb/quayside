@@ -245,7 +245,7 @@
     "@nestjs/common": "^11.2.1",
     "@nestjs/core": "^11.2.1",
     "@nestjs/platform-express": "^11.2.1",
-    "@nestjs/testing": "^11.2.1",
+    "@nestjs/testing": "^12.0.1",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/sdk-trace-base": "^2.10.0",
     "@pinceladasdaweb/redis": "^4.2.0",
