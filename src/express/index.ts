@@ -8,7 +8,9 @@ export type { CapturedHttpResponse, FingerprintStrategy, HttpKernelOptions, Http
 // with no dependency on @types/express.
 export interface ExpressRequestLike {
   method: string
+  /** Mount-relative in Express: the prefix a `app.use('/v1', ...)` mounted under lives in `baseUrl`. */
   path: string
+  baseUrl?: string
   headers: Record<string, unknown>
   body?: unknown
 }
@@ -19,6 +21,8 @@ export interface ExpressResponseLike {
   getHeader (name: string): unknown
   write: (...args: unknown[]) => boolean
   end: (...args: unknown[]) => unknown
+  /** Node's writeHead: headers passed to it never reach getHeader(), so it is intercepted too. */
+  writeHead: (...args: unknown[]) => unknown
 }
 
 export type ExpressNext = (error?: unknown) => void
@@ -37,6 +41,24 @@ function captureResponse (
     let overflow = false
     const originalWrite = res.write.bind(res)
     const originalEnd = res.end.bind(res)
+    const writeHead = res.writeHead
+    const originalWriteHead = writeHead.bind(res)
+
+    // Headers can also travel through writeHead(status[, message], headers),
+    // which sends them without ever passing through setHeader, so getHeader()
+    // never sees them; they are recorded here and consulted first when the
+    // replay headers are selected. The headers object is always the last
+    // argument when present. Object() leaves an object as it is and wraps a
+    // trailing status code or message into one with no header-like entries
+    // (an array form yields index keys), so no replay header name can ever
+    // match them and there is no branch to get wrong.
+    const written: Record<string, unknown> = {}
+    res.writeHead = function (...args: unknown[]) {
+      for (const [name, value] of Object.entries(Object(args[args.length - 1]) as object)) {
+        written[name.toLowerCase()] = value
+      }
+      return originalWriteHead(...args)
+    }
 
     const record = (chunk: unknown, encoding: unknown): void => {
       if (overflow || chunk === undefined || chunk === null || typeof chunk === 'function') return
@@ -62,6 +84,7 @@ function captureResponse (
       const result = originalEnd(chunk, ...args)
       res.write = originalWrite
       res.end = originalEnd
+      res.writeHead = writeHead
       if (overflow) {
         resolve(null)
         return result
@@ -72,7 +95,7 @@ function captureResponse (
         ? null
         : {
             status: res.statusCode,
-            headers: kernel.selectHeaders((name) => res.getHeader(name)),
+            headers: kernel.selectHeaders((name) => written[name] ?? res.getHeader(name)),
             body
           })
       return result
@@ -96,7 +119,12 @@ export function ExpressMiddleware (
     kernel.handle(
       {
         method: req.method,
-        path: req.path,
+        // Express strips the mount prefix from req.path before a mounted
+        // middleware runs; the full path is what Fastify and Hono report
+        // and what a 'body-and-path' fingerprint must see, or the same key
+        // under two mounts would replay across them instead of answering
+        // 422.
+        path: (req.baseUrl ?? '') + req.path,
         body: req.body,
         // Node lowercases incoming header keys; lowering the lookup name
         // makes header() case-insensitive, so a custom key or fingerprint

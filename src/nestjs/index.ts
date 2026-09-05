@@ -9,13 +9,22 @@ import type { Observable } from 'rxjs'
 import { defaultIfEmpty, from, lastValueFrom } from 'rxjs'
 import type { CallHandler, DynamicModule, ExecutionContext, NestInterceptor } from '@nestjs/common'
 
-// Runtime values come from the core entry point, never from deep module
-// paths: error identity (instanceof) must hold against errors thrown by the
-// user's Idempotency instance, so the build maps '../index' onto the shipped
-// core bundle instead of inlining a private copy.
+// Runtime imports come from '../index' on purpose: see the note above the
+// storage exports in src/index.ts.
 import { Idempotency, isReplayedError } from '../index'
 import type { Duration, IdempotencyOptions } from '../index'
-import { KEY_REQUIRED_CODE, REPLAYED_HEADER, headerValue, httpErrorFacts, keyRequiredMessage } from '../http/kernel'
+import {
+  DEFAULT_HEADER,
+  DEFAULT_RETRY_AFTER_SECONDS,
+  KEY_REQUIRED_CODE,
+  REPLAYED_HEADER,
+  hasKey,
+  headerValue,
+  httpErrorFacts,
+  isServerError,
+  keyRequiredMessage,
+  settlementWarning
+} from '../http/kernel'
 
 /** Injection token for the Idempotency instance built by QuaysideModule. */
 export const QUAYSIDE_IDEMPOTENCY = 'QUAYSIDE_IDEMPOTENCY'
@@ -31,6 +40,8 @@ const IDEMPOTENT_METADATA = Symbol.for('quayside:idempotent')
 export interface NestRequestLike {
   headers: Record<string, unknown>
   body?: unknown
+  /** The HTTP method, when the platform exposes it; names the scope in the enforce message. */
+  method?: string
 }
 
 export interface IdempotentOptions {
@@ -104,10 +115,10 @@ export class IdempotencyInterceptor implements NestInterceptor {
 
   constructor (
     @Inject(QUAYSIDE_IDEMPOTENCY) private readonly idempotency: Idempotency,
-    @Inject(QUAYSIDE_MODULE_OPTIONS) private readonly options: QuaysideModuleOptions
+    @Inject(QUAYSIDE_MODULE_OPTIONS) options: QuaysideModuleOptions
   ) {
-    this.headerName = (this.options.header ?? 'Idempotency-Key').toLowerCase()
-    this.retryAfterSeconds = this.options.retryAfterSeconds ?? 1
+    this.headerName = (options.header ?? DEFAULT_HEADER).toLowerCase()
+    this.retryAfterSeconds = options.retryAfterSeconds ?? DEFAULT_RETRY_AFTER_SECONDS
   }
 
   intercept (context: ExecutionContext, next: CallHandler): Observable<unknown> {
@@ -124,13 +135,13 @@ export class IdempotencyInterceptor implements NestInterceptor {
     const key = options.key !== undefined
       ? options.key(request)
       : headerValue(request.headers[this.headerName])
-    if (key === undefined || key === '') {
+    if (!hasKey(key)) {
       if (options.enforce === true) {
         throw new HttpException(
           {
             statusCode: 400,
             error: KEY_REQUIRED_CODE,
-            message: keyRequiredMessage(this.headerName, { derived: options.key !== undefined })
+            message: keyRequiredMessage(this.headerName, { method: request.method, derived: options.key !== undefined })
           },
           400
         )
@@ -156,27 +167,22 @@ export class IdempotencyInterceptor implements NestInterceptor {
             const value = await lastValueFrom(next.handle().pipe(defaultIfEmpty(undefined)))
             handlerValue = value
             responded = true
-            // The kernel gates on the captured status; the value-level
-            // equivalent reads the platform response the interceptor
-            // already holds. A passthrough handler that declared a server
-            // status (res.status(503) and a returned body) is answering
-            // with a transient error, which must never persist as a
-            // replayable success.
-            // Number() rather than a type guard: a platform whose status
-            // reads as 5xx is answering with a server error however it
-            // spells it, and an absent status is NaN, which compares false.
-            if (Number((response as { statusCode?: unknown }).statusCode) >= 500) ctx.doNotStore()
+            // The kernel's rule at the value level: the platform response
+            // the interceptor already holds carries the status. A
+            // passthrough handler that declared a server status
+            // (res.status(503) and a returned body) is answering with a
+            // transient error, which must never persist as a replayable
+            // success.
+            if (isServerError((response as { statusCode?: unknown }).statusCode)) ctx.doNotStore()
             return value
           } catch (error) {
-            // The kernel's rule, applied at the value level: a response
-            // that declares a server status is transient by definition and
-            // must never persist as a replayable failure. Under
-            // persistFailures a stored 500 would answer every retry until
-            // the result TTL ran out; releasing instead lets the retry
-            // re-execute under a fresh lock. A plain thrown error keeps the
-            // core persistFailures contract (domain failures replay): only
-            // an exception that names its own server status is overruled.
-            if (error instanceof HttpException && error.getStatus() >= 500) ctx.doNotStore()
+            // The same rule for a thrown exception: under persistFailures a
+            // stored 500 would answer every retry until the result TTL ran
+            // out; releasing instead lets the retry re-execute under a
+            // fresh lock. A plain thrown error keeps the core
+            // persistFailures contract (domain failures replay): only an
+            // exception that names its own server status is overruled.
+            if (error instanceof HttpException && isServerError(error.getStatus())) ctx.doNotStore()
             throw error
           }
         }
@@ -185,16 +191,17 @@ export class IdempotencyInterceptor implements NestInterceptor {
       return outcome.value
     } catch (error) {
       if (responded) {
-        // A settlement failure after the handler succeeded (a lock that
-        // outlived a slow execution, a storage that died on the completion
-        // write). Answering 500 would discard work that completed, and the
-        // retry would run the side effect again believing nothing happened.
-        // The computed value is the truthful answer; the failure is
-        // reported, and since nothing was stored a retry re-executes,
-        // exactly the kernel's rule after a response was sent.
-        process.emitWarning(`quayside could not settle the record for "${key}" after the handler completed: ${String(error)}`)
+        // A settlement failure after the handler succeeded. Answering 500
+        // would discard work that completed, and the retry would run the
+        // side effect again believing nothing happened: the computed value
+        // is the truthful answer, exactly the kernel's rule.
+        process.emitWarning(settlementWarning(key, error))
         return handlerValue
       }
+      // A persisted failure replays as a throw, and a replay is a replay
+      // whatever its outcome: the marker goes out with it, as it does with
+      // a replayed value.
+      if (isReplayedError(error)) setResponseHeader(response, REPLAYED_HEADER, 'true')
       throw this.mapError(error, response)
     }
   }

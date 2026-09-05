@@ -228,6 +228,7 @@ describe('hono adapter', () => {
           method,
           path: '/fake',
           header: (name: string) => headers[name],
+          text: async () => '{"amount":1}',
           raw: {
             clone () {
               clones += 1
@@ -276,6 +277,7 @@ describe('hono adapter', () => {
       method: 'POST',
       path: '/sse',
       header: (name: string) => (name === 'idempotency-key' ? key : undefined),
+      text: async () => '',
       raw: { clone () { return { text: async () => '' } } } as unknown as Request
     })
     const context = { req: requestFacts('hon-sse'), res: new Response('unset') }
@@ -312,7 +314,7 @@ describe('hono adapter', () => {
     })
     let ran = 0
     const context = {
-      req: { method: 'GET', path: '/public', header: () => undefined, raw: {} as Request },
+      req: { method: 'GET', path: '/public', header: () => undefined, text: async () => '', raw: {} as Request },
       res: new Response('ok')
     }
     await middleware(context as never, async () => { ran += 1 })
@@ -340,6 +342,7 @@ describe('hono adapter', () => {
         method: 'POST',
         path: '/fake',
         header: (name: string) => (name === 'idempotency-key' ? 'hon-scope' : undefined),
+        text: async () => '{"amount":1}',
         raw: {
           clone () {
             clones += 1
@@ -371,6 +374,7 @@ describe('hono adapter', () => {
         method: 'POST',
         path: '/fake',
         header: () => undefined,
+        text: async () => '{"amount":1}',
         raw: {
           clone () {
             clones += 1
@@ -383,6 +387,96 @@ describe('hono adapter', () => {
     const response = await middleware(context, async () => {})
     assert.equal(response?.status, 400)
     assert.equal(clones, 0, 'the 400 needs no fingerprint, so the body is never buffered')
+  })
+
+  test('a body an earlier middleware already read is fingerprinted from Hono\'s cache', async () => {
+    // Request.clone() throws once the raw body was consumed; Hono's own
+    // c.req.json()/text() consume it and cache the result. A validator or
+    // logger mounted ahead of quayside is the everyday case, and it must
+    // not turn every keyed POST into a 500.
+    const upstream = new Hono()
+    const instance = new Idempotency({ storage: new MemoryStorage() })
+    const seenBodies: string[] = []
+    upstream.use(async (c, next) => {
+      // A JSON reader ahead of the middleware: the raw body is now used.
+      await c.req.json()
+      await next()
+    })
+    upstream.use(HonoMiddleware(instance, {
+      fingerprint: (request) => {
+        seenBodies.push(String(request.body))
+        return request.body
+      }
+    }) as never)
+    let runs = 0
+    upstream.post('/orders', async (c) => {
+      runs += 1
+      // Downstream still reads the body through the same cache.
+      const body = await c.req.json<{ n: number }>()
+      return c.json({ n: body.n }, 201)
+    })
+
+    const first = await upstream.request('/orders', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'idempotency-key': 'hon-consumed' },
+      body: JSON.stringify({ n: 7 })
+    })
+    assert.equal(first.status, 201, 'the consumed body is read from the cache, not cloned')
+    assert.deepEqual(seenBodies, ['{"n":7}'], 'and the fingerprint still covers the payload')
+    await settled(instance, 'hon-consumed')
+
+    const different = await upstream.request('/orders', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'idempotency-key': 'hon-consumed' },
+      body: JSON.stringify({ n: 8 })
+    })
+    assert.equal(different.status, 422, 'a different payload under the same key is still caught')
+    assert.equal(runs, 1)
+  })
+
+  test('the unread body is cloned so downstream code can read the raw request', async () => {
+    // The clone path stays for the everyday case: quayside is first to look
+    // at the body, and a handler reading c.req.raw directly must find it
+    // intact.
+    const direct = new Hono()
+    direct.use(HonoMiddleware(new Idempotency({ storage: new MemoryStorage() })) as never)
+    direct.post('/raw', async (c) => c.text(await c.req.raw.text(), 200))
+    const response = await direct.request('/raw', {
+      method: 'POST',
+      headers: { 'idempotency-key': 'hon-raw' },
+      body: 'payload'
+    })
+    assert.equal(response.status, 200)
+    assert.equal(await response.text(), 'payload')
+  })
+
+  test('a capture that fails after the response was dispatched caches nothing and persists nothing', async () => {
+    // proceed() hands c.res to the client before the clone is drained. A
+    // drain that fails (the source stream errored) cannot change what was
+    // served, and must not be mistaken for the handler's own failure: with
+    // persistFailures on, that would store the stream error and replay it
+    // as a 500 for the whole result TTL.
+    const instance = new Idempotency({ storage: new MemoryStorage(), persistFailures: true })
+    const middleware = HonoMiddleware(instance)
+    const broken = new ReadableStream<Uint8Array>({
+      pull (controller) { controller.error(new Error('source exploded')) }
+    })
+    const context = {
+      req: {
+        method: 'POST',
+        path: '/stream',
+        header: (name: string) => (name === 'idempotency-key' ? 'hon-broken-capture' : undefined),
+        text: async () => '',
+        raw: { clone () { return { text: async () => '' } } } as unknown as Request
+      },
+      res: new Response('unset')
+    }
+    const returned = await middleware(context as never, async () => {
+      context.res = new Response(broken, { status: 200, headers: { 'content-type': 'text/plain' } })
+    })
+    assert.equal(returned, undefined, 'downstream answered; the middleware lets it flow')
+    await settled(instance, 'hon-broken-capture')
+    assert.equal(await instance.get('hon-broken-capture'), null, 'the record was released, never persisted as a failure')
   })
 
   test('enforce reads nothing and still answers 400 without a key', async () => {

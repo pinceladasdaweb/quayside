@@ -123,6 +123,23 @@ auth guard's `request.user` is reachable by casting. Scope keys per principal
 whenever an endpoint serves more than one caller; leave the plain header read
 for single-tenant or internal services where every caller is equally trusted.
 
+**Fastify: authenticate before the plugin's hook runs.** The plugin is an
+instance-level `preHandler`, and Fastify runs instance hooks before
+route-level hooks of the same phase, so a route declared with
+`preHandler: [app.authenticate]` authenticates *after* the key was derived:
+`request.user` is still undefined, the extractor returns `undefined`, and
+the request passes through unprotected (or answers `400` under `enforce`)
+without a word. The same ordering lets a route-level auth hook's `401` be
+captured and replayed to the client's authenticated retry. Run auth in
+`onRequest` or `preValidation`, or as an instance-level `preHandler`
+registered *before* `quayside/fastify`; all three run first.
+
+**Express: the path includes the mount point.** A middleware mounted with
+`app.use('/v1', ...)` sees a mount-relative `req.path`; the facts carry
+`req.baseUrl + req.path`, so `'body-and-path'` and custom extractors see
+the same full path Fastify and Hono report, and the same key under two
+mounts answers `422` instead of replaying across them.
+
 ## What is cached — and what deliberately is not
 
 A response is stored for replay only when it is **UTF-8 text**, **within

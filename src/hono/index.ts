@@ -12,14 +12,22 @@ export interface HonoContextLike {
     path: string
     raw: Request
     header (name: string): string | undefined
+    /** Hono's cached body read; serves a body an earlier middleware already consumed. */
+    text (): Promise<string>
   }
   res: Response
 }
 
 export type HonoNext = () => Promise<void>
 
-async function requestBody (request: Request): Promise<string | undefined> {
-  const text = await request.clone().text()
+async function requestBody (req: HonoContextLike['req']): Promise<string | undefined> {
+  // A middleware ahead of this one may already have read the body through
+  // Hono (a validator's c.req.json(), a logger's c.req.text()): the raw
+  // Request is then consumed and clone() would throw, but Hono serves every
+  // later reader from its cache, this one included. An unread body is
+  // cloned instead, so the raw request stays intact for downstream code
+  // that reads it directly.
+  const text = req.raw.bodyUsed ? await req.text() : await req.raw.clone().text()
   // A bodyless request must fingerprint as absent, not as the empty
   // string, so it stays interchangeable with non-HTTP callers of the same
   // key that pass no payload.
@@ -80,13 +88,9 @@ export function HonoMiddleware (
     }
     // Fingerprinting is the only reason to read the body, and reading it
     // clones and buffers the whole request: requests the kernel would only
-    // wave through never pay for it. The method gate comes first so the
-    // key extractor never runs for a method the kernel ignores: handle()
-    // checks the method before deriving the key, and a GET on a public
-    // route must not be able to crash an extractor that assumes
-    // protected-route context.
-    if (kernel.shouldHandle(c.req.method) && kernel.handles(c.req.method, kernel.keyFor(facts))) {
-      facts.body = await requestBody(c.req.raw)
+    // wave through never pay for it.
+    if (kernel.handles(facts)) {
+      facts.body = await requestBody(c.req)
     }
     // Hono only dispatches c.res after the middleware chain returns, so
     // awaiting the whole kernel outcome would hold every streamed byte
@@ -103,7 +107,12 @@ export function HonoMiddleware (
     const outcome = kernel.handle(facts, async () => {
       await next()
       proceed()
-      return captureWebResponse(kernel, c.res)
+      // The client already holds c.res when this drain runs, so a capture
+      // that fails (the source stream errored, the client left mid-body)
+      // cannot change what was served: it reads as "served, not cacheable"
+      // and the kernel releases the record, instead of the failure being
+      // mistaken for the handler's own and persisted as a replayable one.
+      return captureWebResponse(kernel, c.res).catch(() => null)
     })
     const first = await Promise.race([proceeded, outcome])
     if (first.kind === 'handled') {
