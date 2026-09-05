@@ -1,5 +1,13 @@
 import type { SqlDialect, SqlRunner } from '../sql/core'
-import { SqlStorageCore, assertSafeTableName, buildStatements } from '../sql/core'
+import {
+  DEFAULT_MAX_KEY_BYTES,
+  DEFAULT_TABLE,
+  KEY_COLUMN,
+  SqlStorageCore,
+  assertKeyCapacity,
+  assertSafeTableName,
+  buildStatements
+} from '../sql/core'
 
 export type { SqlRunResult, SqlRunner, SqlStatements } from '../sql/core'
 
@@ -15,17 +23,27 @@ export interface MysqlClientLike {
 export interface MysqlStorageOptions {
   /** Table holding the records. Default: 'quayside_records'. */
   tableName?: string
-  /** Byte capacity of the key column; longer keys are rejected. Default: 512. */
+  /**
+   * Byte capacity of the key column; longer keys are rejected. Default:
+   * 512. `migrate()` declares the column from this value, so the guard and
+   * the column it protects can never disagree.
+   */
   maxKeyBytes?: number
 }
 
-const DEFAULT_TABLE = 'quayside_records'
-
-/** The DDL executed by migrate(), for external migration tools. */
-export function mysqlMigration (tableName: string = DEFAULT_TABLE): string {
+/**
+ * The DDL executed by migrate(), for external migration tools. The key
+ * column is sized from `maxKeyBytes` (characters, so at least that many
+ * bytes under utf8mb4) and compared byte for byte: MySQL's default
+ * collations are case- and accent-insensitive, and under one of those
+ * `Key-1` and `key-1`, distinct keys on every other storage, would be one
+ * row here, replaying one caller's response as another's.
+ */
+export function mysqlMigration (tableName: string = DEFAULT_TABLE, maxKeyBytes: number = DEFAULT_MAX_KEY_BYTES): string {
   assertSafeTableName(tableName)
+  assertKeyCapacity(maxKeyBytes)
   return `CREATE TABLE IF NOT EXISTS ${tableName} (
-  record_key VARCHAR(512) NOT NULL PRIMARY KEY,
+  ${KEY_COLUMN} VARCHAR(${maxKeyBytes}) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
   token VARCHAR(64) NOT NULL,
   status VARCHAR(16) NOT NULL,
   fingerprint TEXT NULL,
@@ -64,13 +82,13 @@ export class MysqlStorage extends SqlStorageCore {
       const header = result as { affectedRows?: number }
       return { affected: header.affectedRows ?? 0, rows: [] }
     }
-    super(run, buildStatements(tableName, MYSQL_DIALECT), options.maxKeyBytes ?? 512)
+    super(run, buildStatements(tableName, MYSQL_DIALECT), options.maxKeyBytes ?? DEFAULT_MAX_KEY_BYTES)
     this.client = client
     this.tableName = tableName
   }
 
   /** Creates the table and its expiry index when they do not exist. */
   async migrate (): Promise<void> {
-    await this.client.query(mysqlMigration(this.tableName))
+    await this.client.query(mysqlMigration(this.tableName, this.maxKeyBytes))
   }
 }
