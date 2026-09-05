@@ -1,9 +1,19 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { HttpIdempotencyKernel } from '../../src/http/kernel'
+import { HttpIdempotencyKernel, hasKey, httpErrorFacts, isServerError, settlementWarning } from '../../src/http/kernel'
 import type { CapturedHttpResponse, HttpKernelOptions, HttpRequestFacts } from '../../src/http/kernel'
-import { FencingError, Idempotency } from '../../src/index'
+import {
+  ConcurrentExecutionError,
+  FencingError,
+  Idempotency,
+  IdempotencyKeyInvalidError,
+  IdempotencyKeyReuseError,
+  SerializationError,
+  StorageCorruptError,
+  StorageUnavailableError,
+  WaitTimeoutError
+} from '../../src/index'
 import type { IdempotencyStorage } from '../../src/index'
 import { MemoryStorage } from '../../src/memory/index'
 import { warningsDuring } from '../helpers/warnings'
@@ -107,13 +117,73 @@ describe('http kernel key extraction', () => {
     assert.match(derivedProblem.detail, /POST/, 'and the method still scopes it')
   })
 
-  test('keyFor exposes the extractor to adapters, and defaults to the header read', async () => {
-    const custom = kernelWith({ key: scoped })
-    assert.equal(custom.keyFor(postAs('alice', 'abc')), 'alice:abc')
-    assert.equal(custom.keyFor(postAs(undefined)), undefined)
+  test('handles() gates on the method first and the derived key second', async () => {
+    // The one call adapters make before buffering a body: a protected
+    // method with a usable key. The extractor never runs for other methods
+    // (it may assume protected-route context), and an empty key is no key.
+    let extractions = 0
+    const custom = kernelWith({
+      key: (request) => {
+        extractions += 1
+        return scoped(request)
+      }
+    })
+    assert.equal(custom.handles(postAs('alice', 'abc')), true)
+    assert.equal(custom.handles(postAs(undefined)), false, 'an extractor yielding nothing means no key')
+    assert.equal(custom.handles({ ...postAs('alice', 'abc'), method: 'GET' }), false)
+    assert.equal(extractions, 2, 'the extractor never ran for the GET')
 
     const plain = kernelWith()
-    assert.equal(plain.keyFor(post({ key: 'abc' })), 'abc')
+    assert.equal(plain.handles(post({ key: 'abc' })), true, 'defaults to the header read')
+    assert.equal(plain.handles(post({ key: '' })), false, 'an empty header value is no key')
+    assert.equal(plain.handles({ ...post(), header: () => undefined }), false)
+  })
+
+  test('hasKey is the one key-presence rule: present and not empty', () => {
+    assert.equal(hasKey('k'), true)
+    assert.equal(hasKey(''), false)
+    assert.equal(hasKey(undefined), false)
+  })
+
+  test('isServerError reads any status spelling and treats an absent status as none', () => {
+    assert.equal(isServerError(500), true)
+    assert.equal(isServerError(503), true)
+    assert.equal(isServerError('502'), true)
+    assert.equal(isServerError(499), false)
+    assert.equal(isServerError(200), false)
+    assert.equal(isServerError(undefined), false)
+    assert.equal(isServerError(null), false, 'Number(null) is 0, not a server error')
+  })
+
+  test('the settlement warning names the key and the failure', () => {
+    const text = settlementWarning('k-9', new Error('lock lost'))
+    assert.match(text, /"k-9"/)
+    assert.match(text, /lock lost/)
+    assert.match(text, /after the response was served/)
+  })
+
+  test('every quayside error code has an HTTP policy, and foreign errors have none', () => {
+    // The table is total by construction; this pins the rows a client sees.
+    assert.deepEqual(httpErrorFacts(new ConcurrentExecutionError('k')), {
+      status: 409, code: 'IDEMPOTENCY_IN_PROGRESS', message: 'another request with this idempotency key is still in progress', retryAfter: true
+    })
+    assert.deepEqual(httpErrorFacts(new WaitTimeoutError('k', 10)), {
+      status: 409, code: 'IDEMPOTENCY_WAIT_TIMEOUT', message: 'another request with this idempotency key is still in progress', retryAfter: true
+    })
+    assert.deepEqual(httpErrorFacts(new IdempotencyKeyReuseError('k')), {
+      status: 422, code: 'IDEMPOTENCY_KEY_REUSE', message: 'this idempotency key was already used with a different payload', retryAfter: false
+    })
+    const invalid = httpErrorFacts(new IdempotencyKeyInvalidError('k', 'too long by 3 bytes'))
+    assert.deepEqual(invalid, { status: 400, code: 'IDEMPOTENCY_KEY_INVALID', message: 'too long by 3 bytes', retryAfter: false })
+    assert.equal(httpErrorFacts(new FencingError('k'))?.status, 500)
+    assert.equal(httpErrorFacts(new SerializationError('nope'))?.status, 500)
+    assert.equal(httpErrorFacts(new SerializationError('nope'))?.message, 'nope', 'rows without fixed wording pass the message through')
+    assert.equal(httpErrorFacts(new StorageCorruptError('k', 'bad row'))?.status, 500)
+    assert.deepEqual(httpErrorFacts(new StorageUnavailableError('down')), {
+      status: 503, code: 'IDEMPOTENCY_STORAGE_UNAVAILABLE', message: 'down', retryAfter: false
+    })
+    assert.equal(httpErrorFacts(new Error('foreign')), null)
+    assert.equal(httpErrorFacts('not even an error'), null)
   })
 })
 

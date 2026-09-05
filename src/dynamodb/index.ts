@@ -1,10 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises'
 
-// Runtime values come from the core entry point, never from deep module
-// paths: error identity (instanceof) must hold across entry points, so the
-// build maps the core specifiers onto the shipped core bundle instead of
-// inlining private copies. That covers the shared storage helpers too -
-// contendAcquire and buildStoredRecord throw core error classes.
+// Runtime imports come from '../index' on purpose: see the note above the
+// storage exports in src/index.ts.
 import {
   FencingError,
   RECORD_STATUS,
@@ -221,7 +218,7 @@ export class DynamoStorage implements IdempotencyStorage {
     // DynamoDB expressions, so every attribute this update touches goes
     // through a name placeholder.
     const payloadField = outcome.status === 'completed' ? 'result' : 'error'
-    await this.fenced(key, token, {
+    await this.fenced(key, token, now, {
       UpdateExpression: 'SET #status = :status, expires_at = :expires, #ttl = :ttl, #payload = :payload',
       ExpressionAttributeNames: { '#ttl': TTL_ATTRIBUTE, '#payload': payloadField },
       ExpressionAttributeValues: {
@@ -240,7 +237,7 @@ export class DynamoStorage implements IdempotencyStorage {
         Key: { [KEY]: { S: key } },
         ConditionExpression: FENCED_CONDITION,
         ExpressionAttributeNames: this.fencedNames(),
-        ExpressionAttributeValues: this.fencedValues(token)
+        ExpressionAttributeValues: this.fencedValues(token, Date.now())
       })
     } catch (error) {
       this.rethrowFenced(key, error)
@@ -248,8 +245,9 @@ export class DynamoStorage implements IdempotencyStorage {
   }
 
   async extend (key: string, token: string, lockTtlMs: number): Promise<void> {
-    const expiresAt = Date.now() + lockTtlMs
-    await this.fenced(key, token, {
+    const now = Date.now()
+    const expiresAt = now + lockTtlMs
+    await this.fenced(key, token, now, {
       UpdateExpression: 'SET expires_at = :expires, #ttl = :ttl',
       ExpressionAttributeNames: { '#ttl': TTL_ATTRIBUTE },
       ExpressionAttributeValues: {
@@ -371,7 +369,7 @@ export class DynamoStorage implements IdempotencyStorage {
   // and value placeholders are all built here, so a caller only supplies
   // what its own update expression adds and cannot forget (or misname) a
   // guard ingredient.
-  private async fenced (key: string, token: string, update: {
+  private async fenced (key: string, token: string, now: number, update: {
     UpdateExpression: string
     ExpressionAttributeNames?: Record<string, string>
     ExpressionAttributeValues?: Record<string, AttributeValue>
@@ -383,7 +381,7 @@ export class DynamoStorage implements IdempotencyStorage {
         ConditionExpression: FENCED_CONDITION,
         UpdateExpression: update.UpdateExpression,
         ExpressionAttributeNames: { ...this.fencedNames(), ...update.ExpressionAttributeNames },
-        ExpressionAttributeValues: { ...this.fencedValues(token), ...update.ExpressionAttributeValues }
+        ExpressionAttributeValues: { ...this.fencedValues(token, now), ...update.ExpressionAttributeValues }
       })
     } catch (error) {
       this.rethrowFenced(key, error)
@@ -396,11 +394,13 @@ export class DynamoStorage implements IdempotencyStorage {
     return { '#key': KEY, '#token': 'token', '#status': 'status' }
   }
 
-  private fencedValues (token: string): Record<string, AttributeValue> {
+  // `now` is the caller's single clock sample for the operation, so the
+  // expiry it writes and the lease check the fence applies agree.
+  private fencedValues (token: string, now: number): Record<string, AttributeValue> {
     return {
       ':token': { S: token },
       ':inProgress': { S: RECORD_STATUS.inProgress },
-      ':now': { N: String(Date.now()) }
+      ':now': { N: String(now) }
     }
   }
 

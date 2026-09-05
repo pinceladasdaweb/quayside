@@ -8,8 +8,8 @@ import RedisClient from '@pinceladasdaweb/redis'
 import { Redis } from 'ioredis'
 import { GenericContainer, type StartedTestContainer } from 'testcontainers'
 
-import { Idempotency } from '../../src/index'
-import { RedisStorage, type ManagedRedisClient } from '../../src/redis/index'
+import { Idempotency, StorageCorruptError } from '../../src/index'
+import { RedisStorage, type ManagedRedisClient, type RedisCommandClient } from '../../src/redis/index'
 import { runStorageContract } from '../contract/storage-contract'
 
 let container: StartedTestContainer
@@ -243,5 +243,47 @@ describe('RedisStorage under fire', () => {
     assert.equal(await winner, 'winner')
     assert.equal(await waiter, 'winner')
     assert.equal(calls, 1)
+  })
+
+  test('a channel that does not come up within the budget falls back to polling for that wait', async () => {
+    // A subscriber connection mid-reconnect keeps SUBSCRIBE in the driver's
+    // offline queue for far longer than a poll; the engine trusts
+    // waitForChange to return within its pause, or waitTimeout stops being
+    // the upper bound it is documented as.
+    let subscribeCalls = 0
+    const hanging: RedisCommandClient = {
+      options: { db: 0 },
+      set: async () => 'OK',
+      get: async () => null,
+      del: async () => 0,
+      eval: async () => 1,
+      duplicate: () => ({
+        subscribe: async () => {
+          subscribeCalls += 1
+          await new Promise(() => {})
+        },
+        unsubscribe: async () => {},
+        on: () => {},
+        quit: async () => {}
+      })
+    }
+    const slow = new RedisStorage(hanging)
+    const started = Date.now()
+    await slow.waitForChange('hanging-key', 60)
+    const elapsed = Date.now() - started
+    assert.ok(elapsed >= 55 && elapsed < 1_000, `the wait honoured its 60ms budget, took ${elapsed}ms`)
+    await slow.waitForChange('hanging-key', 60)
+    assert.equal(subscribeCalls, 1, 'the pending subscription is reused, not re-issued')
+    await slow.close()
+  })
+
+  test('a value under the key that is not a record is corruption, not an outage', async () => {
+    await client.flushdb()
+    await client.set('not-a-record', 'null')
+    await assert.rejects(storage.get('not-a-record'), StorageCorruptError)
+    await client.set('not-a-record', '42')
+    await assert.rejects(storage.get('not-a-record'), StorageCorruptError)
+    await client.set('not-a-record', 'hello')
+    await assert.rejects(storage.get('not-a-record'), StorageCorruptError)
   })
 })

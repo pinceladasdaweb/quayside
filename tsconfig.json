@@ -16,5 +16,8 @@
     "declaration": false,
     "sourceMap": false
   },
-  "include": ["src", "tests", "examples", "bench"]
+  "include": ["src", "tests", "examples", "bench"],
+  // The consumer check compiles against dist/ with its own resolution; see
+  // tests/consumer/tsconfig.json.
+  "exclude": ["tests/consumer"]
 }
