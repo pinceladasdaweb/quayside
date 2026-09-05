@@ -1,5 +1,18 @@
 # CHANGELOG
 
+## 1.4.0 (2026-09-05)
+
+* fix: externalize the core declarations in the adapter type bundles by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/473021c3baa5c4896f1bf748f15a1fd630c25f1a)
+* fix: validate caller input before the lock and recognize the engine's own record by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/23ee7365ef0201f0afe0468f4069a101f0a87910)
+* fix: refuse shapes the json codec would silently flatten by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/0cb81c692b0557f677e11ce386c0811c9107842e)
+* fix: compare mysql keys byte for byte and size the key column from maxKeyBytes by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/c1e6440b12e0786f810b492b78c80b947d3e06c4)
+* fix: bound the redis subscription wait and classify non-record values by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/3c4da2158d125759b824a4683092fe4cca593a11)
+* fix: share the request policy across the http adapters and close their body and header gaps by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/1a07bdc7094417fb3ca4216ebabfc82ed905e2ac)
+* perf: skip path building when no fingerprint filter is configured by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/c216275e57b2374b504889a52da1ed47ec167eaa)
+* refactor: one clock sample per fenced dynamodb operation by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/b719b359ef0b1c890321b008b6e2d86c1f772063)
+* chore: update dependencies by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/34890ad5d7c29f5438e3492de607814e6853ae12)
+
+
 ## 1.3.0 (2026-08-23)
 
 * chore: spike a dynamodb adapter against the contract suite by Pedro Rogério [View](https://github.com/pinceladasdaweb/quayside/commit/31fb1c5e60fd984313c7080c76b38830680cb7b6)
