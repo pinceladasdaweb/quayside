@@ -143,6 +143,12 @@ interface ExecutionFrame {
   fingerprint: string | undefined
   correlationId: string
   startedAt: number
+  /**
+   * Resolved BEFORE the lock is taken: an invalid per-call TTL is caller
+   * input, and rejecting it after acquire would leave the record in
+   * progress with nothing to release it until the lock TTL ran out.
+   */
+  resultTtlMs: number
 }
 
 // Last-resort record for failures whose own serialization throws (a hostile
@@ -206,7 +212,7 @@ const REPLAYED_ERROR = Symbol.for('quayside:replayed-error')
  * leak whatever its shape holds.
  */
 export function isReplayedError (error: unknown): boolean {
-  return error instanceof Error && (error as unknown as Record<symbol, unknown>)[REPLAYED_ERROR] === true
+  return error instanceof Error && Reflect.get(error, REPLAYED_ERROR) === true
 }
 
 function reviveError (serialized: SerializedError, depth = 0): Error {
@@ -225,13 +231,8 @@ function reviveError (serialized: SerializedError, depth = 0): Error {
   // setter and leave the revived error failing `instanceof Error`, which
   // the adapters branch on. Own data properties are what was serialized,
   // so own data properties are what comes back.
-  for (const field of Object.keys(serialized.properties ?? {})) {
-    Object.defineProperty(error, field, {
-      value: (serialized.properties as Record<string, unknown>)[field],
-      writable: true,
-      enumerable: true,
-      configurable: true
-    })
+  for (const [field, value] of Object.entries(serialized.properties ?? {})) {
+    Object.defineProperty(error, field, { value, writable: true, enumerable: true, configurable: true })
   }
   // Marked as a reconstruction (see isReplayedError). Non-enumerable so the
   // mark never travels: it states how THIS object came to exist.
@@ -302,7 +303,10 @@ export class Idempotency {
   }
 
   async get (key: string): Promise<IdempotencyRecord | null> {
-    const record = await this.storageCall(() => this.storage.get(this.composeKey(this.normalizeKey(key))))
+    // Argument validation stays outside storageCall: a TypeError about the
+    // caller's key is not a storage outage and must not be dressed as one.
+    const storageKey = this.composeKey(this.normalizeKey(key))
+    const record = await this.storageCall(() => this.storage.get(storageKey))
     if (record === null) return null
     const result: IdempotencyRecord = {
       key,
@@ -318,7 +322,8 @@ export class Idempotency {
   }
 
   async invalidate (key: string): Promise<void> {
-    await this.storageCall(() => this.storage.delete(this.composeKey(this.normalizeKey(key))))
+    const storageKey = this.composeKey(this.normalizeKey(key))
+    await this.storageCall(() => this.storage.delete(storageKey))
   }
 
   private async run<T> (
@@ -334,7 +339,8 @@ export class Idempotency {
       storageKey: this.composeKey(key),
       fingerprint,
       correlationId,
-      startedAt
+      startedAt,
+      resultTtlMs: this.resultTtlFor(input)
     }
     const token = randomUUID()
     const pending = { key: frame.storageKey, token, fingerprint, storedAt: this.clock.now() }
@@ -343,28 +349,21 @@ export class Idempotency {
     try {
       existing = await this.storageCall(() => this.storage.acquire(pending, this.lockTtlMs))
     } catch (error) {
-      if (error instanceof StorageUnavailableError && this.failOpen) {
-        return this.runUnguarded(key, fn, correlationId)
-      }
+      if (this.bypasses(error)) return this.runUnguarded(key, fn, correlationId)
       throw error
     }
 
-    if (existing === null) {
-      return this.runOwned(frame, token, pending.storedAt, fn, this.resultTtlFor(input))
+    // A record carrying OUR token is ours: a driver that resent the acquire
+    // after losing its reply (ioredis does so by default) reads the record
+    // the first attempt wrote back as a conflict, and a per-call random
+    // token can never coincide with a foreign record's. The adapters need
+    // no knowledge of this; the engine minted the token, so it decides.
+    if (existing === null || existing.token === token) {
+      return this.runOwned(frame, token, pending.storedAt, fn)
     }
 
-    if (!fingerprintsEqual(existing.fingerprint, fingerprint)) {
-      throw new IdempotencyKeyReuseError(key)
-    }
-
-    if (existing.status === RECORD_STATUS.completed) {
-      this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-      return { value: this.decodeResult(existing) as T, replayed: true, storedAt: existing.storedAt }
-    }
-    if (existing.status === RECORD_STATUS.failed) {
-      this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-      throw decodeErrorValue(existing.error ?? '', this.codec)
-    }
+    const replay = this.settled<T>(frame, existing)
+    if (replay !== undefined) return replay
 
     this.emit('conflict', key, correlationId)
     if (this.onConflict === 'reject') {
@@ -377,10 +376,9 @@ export class Idempotency {
     frame: ExecutionFrame,
     token: string,
     storedAt: number,
-    fn: ExecuteFunction<T>,
-    resultTtlMs: number
+    fn: ExecuteFunction<T>
   ): Promise<ExecutionResult<T>> {
-    const { storageKey, key, correlationId, startedAt } = frame
+    const { storageKey, key, correlationId, startedAt, resultTtlMs } = frame
     this.emit('acquired', key, correlationId)
     const controller = new AbortController()
     let stores = true
@@ -389,13 +387,16 @@ export class Idempotency {
       replayed: false,
       signal: controller.signal,
       extend: async (ttl) => {
+        // Parsed outside storageCall: an invalid duration is the caller's
+        // mistake, not an outage for fail-open to wave through.
+        const lockTtlMs = ttl === undefined ? this.lockTtlMs : parseDuration(ttl)
         try {
-          await this.storageCall(() => this.storage.extend(storageKey, token, ttl === undefined ? this.lockTtlMs : parseDuration(ttl)))
+          await this.storageCall(() => this.storage.extend(storageKey, token, lockTtlMs))
         } catch (error) {
           // Fail-open covers every storage interaction, not only the ones
           // around the execution: an outage mid-heartbeat must not abort a
           // function the instance chose to keep running unguarded.
-          if (error instanceof StorageUnavailableError && this.failOpen) {
+          if (this.bypasses(error)) {
             this.emit('storage-bypass', key, correlationId)
             return
           }
@@ -411,7 +412,7 @@ export class Idempotency {
     } catch (error) {
       const persisted = this.persistFailures && stores
       await this.settle(storageKey, token, persisted ? { status: 'failed', error: encodeErrorValue(error, this.codec) } : null, resultTtlMs)
-      this.emit('failed', key, correlationId, this.clock.now() - startedAt)
+      this.emit('failed', key, correlationId, startedAt)
       throw error
     }
 
@@ -419,7 +420,7 @@ export class Idempotency {
       // The execution opted out of storage: the caller gets its value, the
       // record is released, and nothing is left for anyone to replay.
       await this.settle(storageKey, token, null, resultTtlMs)
-      this.emit('completed', key, correlationId, this.clock.now() - startedAt)
+      this.emit('completed', key, correlationId, startedAt)
       return { value, replayed: false, storedAt }
     }
 
@@ -431,14 +432,14 @@ export class Idempotency {
       // is released so callers may retry, and the error surfaces instead of
       // silently storing something else.
       await this.settle(storageKey, token, null, resultTtlMs)
-      this.emit('failed', key, correlationId, this.clock.now() - startedAt)
+      this.emit('failed', key, correlationId, startedAt)
       throw error
     }
 
     try {
       await this.storageCall(() => this.storage.complete(storageKey, token, { status: 'completed', result: encoded }, resultTtlMs))
     } catch (error) {
-      if (error instanceof StorageUnavailableError && this.failOpen) {
+      if (this.bypasses(error)) {
         // The function already ran; in fail-open mode the caller gets its
         // result even though it could not be stored for replay.
         this.emit('storage-bypass', key, correlationId)
@@ -451,11 +452,39 @@ export class Idempotency {
         // surfaces instead of leaving the key locked until the lock TTL.
         await this.settle(storageKey, token, null, resultTtlMs)
       }
-      this.emit('failed', key, correlationId, this.clock.now() - startedAt)
+      this.emit('failed', key, correlationId, startedAt)
       throw error
     }
-    this.emit('completed', key, correlationId, this.clock.now() - startedAt)
+    this.emit('completed', key, correlationId, startedAt)
     return { value, replayed: false, storedAt }
+  }
+
+  /**
+   * What a record somebody else owns means for this call: a different
+   * payload under the key is a reuse error, a terminal record is a replay
+   * (the stored value, or the stored failure rethrown), and a record still
+   * in progress is `undefined`: the caller decides whether to reject or
+   * wait. One reading serves the acquire path and every poll of the wait
+   * loop, so the two can never disagree on what a record means.
+   */
+  private settled<T> (frame: ExecutionFrame, record: StoredRecord): ExecutionResult<T> | undefined {
+    const { key, fingerprint, correlationId, startedAt } = frame
+    if (!fingerprintsEqual(record.fingerprint, fingerprint)) {
+      throw new IdempotencyKeyReuseError(key)
+    }
+    if (record.status === RECORD_STATUS.inProgress) return undefined
+    this.emit('replayed', key, correlationId, startedAt)
+    if (record.status === RECORD_STATUS.failed) {
+      throw decodeErrorValue(record.error ?? '', this.codec)
+    }
+    return { value: this.decodeResult(record) as T, replayed: true, storedAt: record.storedAt }
+  }
+
+  // The fail-open trade: an instance that chose availability treats a
+  // genuine storage outage as permission to run unguarded. Only outages:
+  // corruption and every other quayside error keep their meaning.
+  private bypasses (error: unknown): boolean {
+    return error instanceof StorageUnavailableError && this.failOpen
   }
 
   // Fail-open execution: the storage is unreachable and the instance opted
@@ -484,7 +513,7 @@ export class Idempotency {
     fn: ExecuteFunction<T>,
     observed: StoredRecord
   ): Promise<ExecutionResult<T>> {
-    const { storageKey, key, fingerprint, correlationId, startedAt } = frame
+    const { storageKey, key, correlationId, startedAt } = frame
     // The deadline is measured from the call, not from this entry: a
     // waiter that takes over and loses the re-acquire race lands in a new
     // wait, and restarting the clock there would let sustained holder
@@ -502,9 +531,7 @@ export class Idempotency {
         // The same trade-off the acquire path takes: an instance that
         // chose availability must not answer a storage outage with an
         // error just because it happened to be waiting when it hit.
-        if (error instanceof StorageUnavailableError && this.failOpen) {
-          return this.runUnguarded(key, fn, correlationId)
-        }
+        if (this.bypasses(error)) return this.runUnguarded(key, fn, correlationId)
         throw error
       }
       if (record === null) {
@@ -530,17 +557,8 @@ export class Idempotency {
       // The record under the key can change identity while we wait: the
       // holder's lock may expire and another payload take the key over. Its
       // outcome is not ours to replay, exactly as in the acquire path.
-      if (!fingerprintsEqual(record.fingerprint, fingerprint)) {
-        throw new IdempotencyKeyReuseError(key)
-      }
-      if (record.status === RECORD_STATUS.completed) {
-        this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-        return { value: this.decodeResult(record) as T, replayed: true, storedAt: record.storedAt }
-      }
-      if (record.status === RECORD_STATUS.failed) {
-        this.emit('replayed', key, correlationId, this.clock.now() - startedAt)
-        throw decodeErrorValue(record.error ?? '', this.codec)
-      }
+      const replay = this.settled<T>(frame, record)
+      if (replay !== undefined) return replay
       const remaining = deadline - this.clock.now()
       if (remaining <= 0) {
         throw new WaitTimeoutError(key, this.waitTimeoutMs)
@@ -579,8 +597,18 @@ export class Idempotency {
     try {
       if (outcome === null) await this.storage.release(storageKey, token)
       else await this.storage.complete(storageKey, token, outcome, resultTtlMs)
-    } catch {
-      // Swallowed by design: see above.
+    } catch (error) {
+      // An outcome the storage refuses as unstorable (too large for its
+      // record) is released so callers may retry, the same contract the
+      // success path applies to a codec that could not encode the value:
+      // a persisted failure must not leave the key locked until the lock
+      // TTL. Everything else (an outage, a lost lock) stays swallowed by
+      // design: see above.
+      if (error instanceof SerializationError) {
+        try {
+          await this.storage.release(storageKey, token)
+        } catch {}
+      }
     }
   }
 
@@ -650,10 +678,14 @@ export class Idempotency {
     return composed
   }
 
-  private emit (type: IdempotencyEventType, key: string, correlationId: string, durationMs?: number): void {
-    const event: IdempotencyEvent = { type, key, correlationId, timestamp: this.clock.now() }
+  // Terminal events pass the instant the call started; one clock sample
+  // then serves both fields, so `timestamp - durationMs` is exactly that
+  // instant (the OTel collector backdates its spans by it).
+  private emit (type: IdempotencyEventType, key: string, correlationId: string, startedAt?: number): void {
+    const timestamp = this.clock.now()
+    const event: IdempotencyEvent = { type, key, correlationId, timestamp }
     if (this.namespace !== undefined) event.namespace = this.namespace
-    if (durationMs !== undefined) event.durationMs = durationMs
+    if (startedAt !== undefined) event.durationMs = timestamp - startedAt
 
     const listeners: Array<(event: IdempotencyEvent) => void> = []
     if (this.onEvent !== undefined) listeners.push(this.onEvent)

@@ -89,4 +89,37 @@ describe('jsonCodec', () => {
   test('throws SerializationError on corrupt stored values', () => {
     assert.throws(() => jsonCodec.decode('{not json'), SerializationError)
   })
+
+  test('objects JSON would flatten into {} or an index object are rejected, not silently stored', () => {
+    // None of these carry a toJSON, so the conversion check never sees
+    // them; JSON.stringify turns them into `{}` (or `{"0":1}` for a typed
+    // array) and every replay would serve that instead of the value.
+    const lossy: Array<[string, unknown]> = [
+      ['Map', new Map([['a', 1]])],
+      ['Set', new Set([1])],
+      ['WeakMap', new WeakMap()],
+      ['WeakSet', new WeakSet()],
+      ['ArrayBuffer', new ArrayBuffer(2)],
+      ['SharedArrayBuffer', new SharedArrayBuffer(2)],
+      ['DataView', new DataView(new ArrayBuffer(2))],
+      ['Uint16Array', new Uint16Array([1, 2])],
+      ['Float64Array', new Float64Array([1.5])],
+      ['RegExp', /x/],
+      ['Promise', Promise.resolve(1)],
+      ['Error', new Error('boom')]
+    ]
+    for (const [name, value] of lossy) {
+      assert.throws(() => jsonCodec.encode(value), (error: unknown) => {
+        assert.ok(error instanceof SerializationError, `${name} at the top level`)
+        assert.match(error.message, new RegExp(name), 'the offending type is named')
+        return true
+      })
+      assert.throws(() => jsonCodec.encode({ nested: value }), SerializationError, `${name} nested`)
+      assert.throws(() => jsonCodec.encode([value]), SerializationError, `${name} in an array`)
+    }
+    // Plain objects, arrays and class instances with own data keep working:
+    // their JSON form IS their value.
+    class Plain { constructor (readonly id: number) {} }
+    assert.equal(jsonCodec.encode({ list: [new Plain(1)] }), '{"list":[{"id":1}]}')
+  })
 })

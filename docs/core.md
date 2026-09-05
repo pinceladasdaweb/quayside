@@ -68,11 +68,14 @@ The default codec is JSON with two deliberate hardenings:
   can never collide with the string `'undefined'`.
 - Values JSON would silently drop or mangle **fail loudly** with
   `SerializationError` instead: functions, symbols, `bigint`, non-finite
-  numbers (`NaN`, `Infinity`), *nested* `undefined`, circular references —
-  and any value whose own `toJSON` would transform it (a `Buffer`, an ORM
-  entity), because the first caller would receive the real value and every
-  replayed caller the converted one. A stored result that differs from what
-  the function returned would be a silent correctness bug. The one accepted
+  numbers (`NaN`, `Infinity`), *nested* `undefined`, circular references,
+  objects whose JSON form is not their value (`Map`, `Set`, `WeakMap`,
+  `WeakSet`, `ArrayBuffer`, `DataView`, typed arrays, `RegExp`, `Promise`,
+  `Error`, which all stringify to `{}` or an index object) — and any value
+  whose own `toJSON` would transform it (a `Buffer`, an ORM entity),
+  because the first caller would receive the real value and every replayed
+  caller the converted one. A stored result that differs from what the
+  function returned would be a silent correctness bug. The one accepted
   conversion is `Date`, which stores as its ISO instant and **replays as a
   string** — the JSON convention every consumer already expects.
 
@@ -209,9 +212,11 @@ A storage that *answers* with something the record contract cannot
 describe raises `StorageCorruptError` instead, and **fail-open does not
 cover it**: the storage is healthy, the record decodes the same way on
 every attempt, so running unguarded would duplicate side effects for as
-long as the record lived rather than for as long as an outage lasted.
-Same for an acquire that exhausted its bounded contention retries. Two
-subtleties:
+long as the record lived rather than for as long as an outage lasted. An
+acquire that exhausts its bounded contention retries (the key kept being
+taken and released between its two steps) raises `ConcurrentExecutionError`:
+the key was in use at every attempt, so the caller gets the same retryable
+conflict a live holder would have produced. Two subtleties:
 
 - If the **completion write** fails after your function ran, fail-closed
   throws (the caller cannot know the result was registered) and fail-open

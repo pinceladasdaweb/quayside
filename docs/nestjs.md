@@ -73,8 +73,8 @@ no-op everywhere else.
 
 The interceptor wraps the handler's *return value* (what Nest serializes),
 so replays go through the route's own status code and headers — a `201`
-route replays as `201`. Replays add `Idempotency-Replayed: true`. Errors map
-to Nest `HttpException`s:
+route replays as `201`. Replays add `Idempotency-Replayed: true`, a replayed
+persisted failure included. Errors map to Nest `HttpException`s:
 
 | Situation | Response |
 |---|---|

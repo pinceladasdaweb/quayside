@@ -24,17 +24,17 @@ const outcome = await kernel.handle(requestFacts, runDownstream)
 
 `runDownstream` runs the rest of the pipeline and resolves with a
 `CapturedHttpResponse` — or `null` when the response must be served without
-being cached. Four helpers do the heavy lifting: `kernel.cacheableBody(data)`
+being cached. Three helpers do the heavy lifting: `kernel.cacheableBody(data)`
 applies the UTF-8 and `maxBodyBytes` gates, `kernel.selectHeaders(get)`
-collects the replay-relevant headers, `kernel.handles(method, key)`
-answers whether this request gets anything but a pass-through — adapters
-that must buffer the request body to fingerprint it call it first, so an
-unprotected method or a keyless request never pays for the read — and
-`kernel.keyFor(facts)` derives the key through whatever the application
-configured, which is what a pre-gate must use so it cannot disagree with
-`handle()`. Check `kernel.shouldHandle(method)` before deriving: a custom
-extractor may assume protected-route context and must not run for methods
-the kernel ignores.
+collects the replay-relevant headers, and `kernel.handles(facts)` answers
+whether this request gets anything but a pass-through — adapters that must
+buffer the request body to fingerprint it call it first, so an unprotected
+method or a keyless request never pays for the read. It checks the method
+before deriving the key (a custom extractor may assume protected-route
+context and must not run for methods the kernel ignores) and derives the
+key through whatever the application configured, so a pre-gate cannot
+disagree with `handle()`; the facts carry no body yet at that point, which
+is why extractors must not read it.
 
 Two obligations on the facts you build:
 
@@ -145,8 +145,11 @@ solved problems:
   contract cannot describe as `StorageCorruptError`.
 - `contendAcquire(key, attempt)` — the bounded contention loop around your
   atomic acquire: resolve `null` (acquired), a record (held) or `undefined`
-  (expired between steps — contend again), and it owns the retry bound and
-  the exhaustion classification.
+  (the holder vanished between steps — contend again), and it owns the
+  retry bound and the exhaustion classification (`ConcurrentExecutionError`:
+  the key was in use at every attempt). Your adapter need not recognize its
+  own record after a driver-level resend either: the engine compares the
+  returned token with the one it minted.
 - `assertKeyBytes(key, maxBytes, limitName)` — the byte-cap guard for
   bounded key columns: rejects with `IdempotencyKeyInvalidError` (a 400 in
   the HTTP adapters), never truncates.

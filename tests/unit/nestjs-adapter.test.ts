@@ -802,4 +802,55 @@ describe('nestjs interceptor glue', () => {
       'rpc-result'
     )
   })
+
+  test('a replayed persisted failure carries the replay marker too', async () => {
+    // A replay is a replay whatever its outcome: docs promise the header on
+    // every replay, and metrics already count the failed one as such.
+    const { HttpException } = await import('@nestjs/common')
+    const { lastValueFrom } = await import('rxjs')
+    const storage = new MemoryStorage()
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage, persistFailures: true }),
+      { storage, persistFailures: true }
+    )
+    const handler = decorated()
+    const headers: Record<string, string> = {}
+    const response = { setHeader (name: string, value: string) { headers[name] = value } }
+    const context = fakeContext({ 'idempotency-key': 'nest-failed-replay' }, response, handler)
+    const failing = { handle: () => { throw new HttpException({ message: 'declined' }, 402) } }
+
+    await assert.rejects(lastValueFrom(interceptor.intercept(context as never, failing)), HttpException)
+    assert.equal(headers['idempotency-replayed'], undefined, 'the first attempt is not a replay')
+
+    await assert.rejects(intercept(interceptor, context), (thrown: unknown) => {
+      assert.ok(thrown instanceof HttpException)
+      assert.equal(thrown.getStatus(), 402, 'the stored failure answers again')
+      return true
+    })
+    assert.equal(headers['idempotency-replayed'], 'true', 'and says so')
+  })
+
+  test('the enforce message scopes itself to the method when the platform exposes it', async () => {
+    // The kernel names the method ('on POST requests'); the interceptor
+    // reads the same message builder, so a client is told the same thing
+    // whichever adapter answered.
+    const interceptor = new IdempotencyInterceptor(
+      new Idempotency({ storage: new MemoryStorage() }),
+      { storage: new MemoryStorage() }
+    )
+    const handler = decorated({ enforce: true })
+    const context = {
+      getType: () => 'http',
+      getHandler: () => handler,
+      switchToHttp: () => ({
+        getRequest: () => ({ headers: {}, body: {}, method: 'post' }),
+        getResponse: () => ({})
+      })
+    }
+    await assert.rejects(intercept(interceptor, context as never), (thrown: unknown) => {
+      const body = (thrown as { getResponse (): { message: string } }).getResponse()
+      assert.equal(body.message, 'the idempotency-key header is required on POST requests')
+      return true
+    })
+  })
 })

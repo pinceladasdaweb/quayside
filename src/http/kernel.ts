@@ -1,15 +1,7 @@
-// Runtime values come from the core entry point, never from deep module
-// paths: error identity (instanceof) must hold against errors thrown by the
-// user's Idempotency instance, so the build maps '../index' onto the shipped
-// core bundle instead of inlining a private copy.
-import {
-  ConcurrentExecutionError,
-  IdempotencyKeyInvalidError,
-  IdempotencyKeyReuseError,
-  QuaysideError,
-  WaitTimeoutError
-} from '../index'
-import type { Idempotency } from '../index'
+// Runtime imports come from '../index' on purpose: see the note above the
+// storage exports in src/index.ts.
+import { ERROR_CODES, QuaysideError } from '../index'
+import type { Idempotency, QuaysideErrorCode } from '../index'
 
 export interface HttpRequestFacts {
   method: string
@@ -82,6 +74,39 @@ export const REPLAYED_HEADER = 'idempotency-replayed'
 /** Stable code for a protected request that carries no usable key. */
 export const KEY_REQUIRED_CODE = 'IDEMPOTENCY_KEY_REQUIRED'
 
+// The request policy's defaults, shared with the NestJS interceptor so the
+// two HTTP faces of the library cannot drift apart on them.
+export const DEFAULT_HEADER = 'Idempotency-Key'
+export const DEFAULT_RETRY_AFTER_SECONDS = 1
+
+/** A key the request can execute under: present and not the empty string. */
+export function hasKey (key: string | undefined): key is string {
+  return key !== undefined && key !== ''
+}
+
+/**
+ * Whether a response status declares a server error. Server errors are
+ * transient by definition and must never persist as a replayable outcome;
+ * this is the one predicate behind that rule, at the kernel (a captured
+ * status) and at the NestJS value level (a platform response's statusCode,
+ * an HttpException's status). Number() rather than a type guard: a status
+ * that reads as 5xx is a server error however the platform spells it, and
+ * an absent one is NaN, which compares false.
+ */
+export function isServerError (status: unknown): boolean {
+  return Number(status) >= 500
+}
+
+/**
+ * The warning for a settlement that failed after the response was already
+ * served (a lock that outlived a slow execution, a storage that died on the
+ * completion write). The response stands: overwriting it would be a lie,
+ * and since nothing was stored a retry re-executes.
+ */
+export function settlementWarning (key: string, error: unknown): string {
+  return `quayside could not settle the record for "${key}" after the response was served: ${String(error)}`
+}
+
 /**
  * What to tell a client whose request produced no key. Naming the header
  * is only truthful when the header is what was read: under a custom
@@ -124,23 +149,30 @@ export interface HttpErrorFacts {
   retryAfter: boolean
 }
 
+// One row per error code, and `satisfies` makes the table total: a new
+// code cannot compile without deciding what clients are told. A row with a
+// fixed message hides an internal detail behind client-facing wording; a
+// row without one passes the error's own message through, because it
+// names the client's mistake (an invalid key) or a condition the operator
+// needs verbatim.
+const IN_PROGRESS = { status: 409, retryAfter: true, message: 'another request with this idempotency key is still in progress' }
+const HTTP_ERROR_POLICY = {
+  [ERROR_CODES.inProgress]: IN_PROGRESS,
+  [ERROR_CODES.waitTimeout]: IN_PROGRESS,
+  [ERROR_CODES.keyReuse]: { status: 422, retryAfter: false, message: 'this idempotency key was already used with a different payload' },
+  // The offending value came from the request, so this is a client error:
+  // answering 5xx would blame the server and page someone.
+  [ERROR_CODES.keyInvalid]: { status: 400, retryAfter: false },
+  [ERROR_CODES.fencing]: { status: 500, retryAfter: false },
+  [ERROR_CODES.serialization]: { status: 500, retryAfter: false },
+  [ERROR_CODES.storageCorrupt]: { status: 500, retryAfter: false },
+  [ERROR_CODES.storageUnavailable]: { status: 503, retryAfter: false }
+} as const satisfies Record<QuaysideErrorCode, { status: number, retryAfter: boolean, message?: string }>
+
 export function httpErrorFacts (error: unknown): HttpErrorFacts | null {
-  if (error instanceof ConcurrentExecutionError || error instanceof WaitTimeoutError) {
-    return { status: 409, code: error.code, message: 'another request with this idempotency key is still in progress', retryAfter: true }
-  }
-  if (error instanceof IdempotencyKeyReuseError) {
-    return { status: 422, code: error.code, message: 'this idempotency key was already used with a different payload', retryAfter: false }
-  }
-  if (error instanceof IdempotencyKeyInvalidError) {
-    // The offending value came from the request, so this is a client
-    // error: answering 5xx would blame the server and page someone.
-    return { status: 400, code: error.code, message: error.message, retryAfter: false }
-  }
-  if (error instanceof QuaysideError) {
-    const status = error.code === 'IDEMPOTENCY_STORAGE_UNAVAILABLE' ? 503 : 500
-    return { status, code: error.code, message: error.message, retryAfter: false }
-  }
-  return null
+  if (!(error instanceof QuaysideError)) return null
+  const policy: { status: number, retryAfter: boolean, message?: string } = HTTP_ERROR_POLICY[error.code]
+  return { status: policy.status, code: error.code, message: policy.message ?? error.message, retryAfter: policy.retryAfter }
 }
 
 // A non-streaming decode keeps no state between calls, so one decoder
@@ -187,7 +219,7 @@ export class HttpIdempotencyKernel {
 
   constructor (idempotency: Idempotency, options: HttpKernelOptions = {}) {
     this.idempotency = idempotency
-    this.header = (options.header ?? 'Idempotency-Key').toLowerCase()
+    this.header = (options.header ?? DEFAULT_HEADER).toLowerCase()
     this.methods = new Set((options.methods ?? DEFAULT_METHODS).map((method) => method.toUpperCase()))
     this.enforce = options.enforce ?? false
     // The strategy normalizes to a function once; the default is the body.
@@ -205,7 +237,7 @@ export class HttpIdempotencyKernel {
     this.keyOf = options.key ?? ((request) => request.header(this.header))
     this.maxBodyBytes = options.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES
     this.replayHeaders = (options.replayHeaders ?? DEFAULT_REPLAY_HEADERS).map((name) => name.toLowerCase())
-    this.retryAfterSeconds = options.retryAfterSeconds ?? 1
+    this.retryAfterSeconds = options.retryAfterSeconds ?? DEFAULT_RETRY_AFTER_SECONDS
   }
 
   shouldHandle (method: string): boolean {
@@ -217,19 +249,15 @@ export class HttpIdempotencyKernel {
    * carrying a key is ever fingerprinted. Adapters that must buffer the
    * request body call this first, so nothing else pays for the buffering:
    * a missing key under `enforce` is answered without reading anything.
+   * The method is checked before the key is derived, so a custom extractor
+   * never runs for a method the kernel ignores (a GET on a public route
+   * must not be able to crash an extractor that assumes protected-route
+   * context). The facts carry no body yet at this point, which is why
+   * extractors must not read it; handle() derives the key again on the
+   * full facts, so extractors must also be cheap and pure.
    */
-  handles (method: string, key: string | undefined): boolean {
-    return this.shouldHandle(method) && key !== undefined && key !== ''
-  }
-
-  /**
-   * The storage key this request executes under: the configured extractor,
-   * or the plain header read. Adapters that gate work before calling
-   * handle() derive the key here so both paths agree; the facts may carry
-   * no body yet at that point, which is why extractors must not read it.
-   */
-  keyFor (request: HttpRequestFacts): string | undefined {
-    return this.keyOf(request)
+  handles (request: HttpRequestFacts): boolean {
+    return this.shouldHandle(request.method) && hasKey(this.keyOf(request))
   }
 
   async handle (
@@ -238,7 +266,7 @@ export class HttpIdempotencyKernel {
   ): Promise<KernelOutcome> {
     if (!this.shouldHandle(request.method)) return { kind: 'passthrough' }
     const key = this.keyOf(request)
-    if (key === undefined || key === '') {
+    if (!hasKey(key)) {
       if (!this.enforce) return { kind: 'passthrough' }
       return {
         kind: 'respond',
@@ -275,7 +303,7 @@ export class HttpIdempotencyKernel {
           // cannot be replayed faithfully must not be cached: the response
           // is served and the record is released without ever holding an
           // outcome, so a client retry re-executes under a fresh lock.
-          if (captured === null || captured.status >= 500) ctx.doNotStore()
+          if (captured === null || isServerError(captured.status)) ctx.doNotStore()
           return captured
         }
       )
@@ -301,7 +329,7 @@ export class HttpIdempotencyKernel {
         // write). Overwriting the delivered response with a 5xx would be a
         // lie, so the failure is reported and the response stands; the
         // record was not stored, so a retry re-executes.
-        process.emitWarning(`quayside could not settle the record for "${key}" after the response was sent: ${String(error)}`)
+        process.emitWarning(settlementWarning(key, error))
         return { kind: 'handled' }
       }
       const facts = httpErrorFacts(error)

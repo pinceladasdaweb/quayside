@@ -14,12 +14,20 @@ export interface CanonicalizeOptions {
 // allocation and a join at every node of every payload, which is most of
 // what fingerprinting a request body costs.
 class PathFilter {
-  private readonly ignore: Set<string>
-  private readonly picks: string[] | undefined
+  private constructor (
+    private readonly ignored: Set<string>,
+    // Each pick with its trailing dot alongside, built once here rather
+    // than once per node visited: `pick.` is what "the subtree under the
+    // pick" tests.
+    private readonly picks: Array<{ path: string, subtree: string }> | undefined
+  ) {}
 
-  constructor (options: CanonicalizeOptions) {
-    this.ignore = new Set(options.ignoreFields ?? [])
-    this.picks = options.pickFields
+  static ignoring (paths: string[]): PathFilter {
+    return new PathFilter(new Set(paths), undefined)
+  }
+
+  static picking (paths: string[]): PathFilter {
+    return new PathFilter(new Set(), paths.map((pick) => ({ path: pick, subtree: `${pick}.` })))
   }
 
   // Only called for object entries and array items, whose paths are never
@@ -27,12 +35,24 @@ class PathFilter {
   // either path is a prefix of the other: the ancestors that lead to it,
   // and the subtree under it.
   includes (path: string): boolean {
-    if (this.ignore.has(path)) return false
+    if (this.ignored.has(path)) return false
     if (this.picks === undefined) return true
+    const subtree = `${path}.`
     return this.picks.some((pick) =>
-      pick === path || path.startsWith(`${pick}.`) || pick.startsWith(`${path}.`)
+      pick.path === path || path.startsWith(pick.subtree) || pick.path.startsWith(subtree)
     )
   }
+}
+
+// No filter at all is the common case (every request through the HTTP
+// kernel), and it must cost nothing: with a null filter the walk below
+// never builds a path and never probes. The two options are mutually
+// exclusive (the engine rejects both together), so each gets its own
+// filter shape.
+function filterFor (options: CanonicalizeOptions): PathFilter | null {
+  if (options.ignoreFields !== undefined) return PathFilter.ignoring(options.ignoreFields)
+  if (options.pickFields !== undefined) return PathFilter.picking(options.pickFields)
+  return null
 }
 
 // The root path is empty, so the first level is the bare key: 'customer',
@@ -47,7 +67,7 @@ function childPath (path: string, segment: string): string {
 // data). Type tags keep values JSON would conflate apart (1 vs '1', array
 // vs object). Values that cannot be canonicalized deterministically fail
 // loudly instead of hashing to a colliding representation.
-function canonicalizeValue (value: unknown, path: string, filter: PathFilter, seen: WeakSet<object>): string {
+function canonicalizeValue (value: unknown, path: string, filter: PathFilter | null, seen: WeakSet<object>): string {
   if (value === null) return 'null'
   if (value === undefined) return 'undefined'
   const type = typeof value
@@ -97,11 +117,18 @@ function canonicalizeValue (value: unknown, path: string, filter: PathFilter, se
   }
   seen.add(object)
   try {
+    // Path building and the probe live under ONE condition: without a
+    // filter the path is never extended (it stays the root's empty string,
+    // which nothing reads), and with one the extended path is exactly what
+    // the probe and the recursion need.
     if (Array.isArray(object)) {
       const items: string[] = []
       for (let index = 0; index < object.length; index += 1) {
-        const itemPath = childPath(path, String(index))
-        if (!filter.includes(itemPath)) continue
+        let itemPath = path
+        if (filter !== null) {
+          itemPath = childPath(path, String(index))
+          if (!filter.includes(itemPath)) continue
+        }
         items.push(canonicalizeValue(object[index], itemPath, filter, seen))
       }
       return `arr:[${items.join(',')}]`
@@ -109,8 +136,11 @@ function canonicalizeValue (value: unknown, path: string, filter: PathFilter, se
     const keys = Object.keys(object).sort()
     const entries: string[] = []
     for (const key of keys) {
-      const entryPath = childPath(path, key)
-      if (!filter.includes(entryPath)) continue
+      let entryPath = path
+      if (filter !== null) {
+        entryPath = childPath(path, key)
+        if (!filter.includes(entryPath)) continue
+      }
       const entryValue = (object as Record<string, unknown>)[key]
       entries.push(`${JSON.stringify(key)}:${canonicalizeValue(entryValue, entryPath, filter, seen)}`)
     }
@@ -121,7 +151,7 @@ function canonicalizeValue (value: unknown, path: string, filter: PathFilter, se
 }
 
 export function canonicalize (value: unknown, options: CanonicalizeOptions = {}): string {
-  return canonicalizeValue(value, '', new PathFilter(options), new WeakSet())
+  return canonicalizeValue(value, '', filterFor(options), new WeakSet())
 }
 
 export function hashCanonical (value: unknown, options: CanonicalizeOptions = {}): string {

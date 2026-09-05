@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { IdempotencyKeyInvalidError, StorageCorruptError } from '../../src/index'
+import { ConcurrentExecutionError, IdempotencyKeyInvalidError, StorageCorruptError } from '../../src/index'
 import { MAX_ACQUIRE_ATTEMPTS, assertKeyBytes, buildStoredRecord, contendAcquire } from '../../src/storage'
 import type { RawRecordFields, StoredRecord } from '../../src/storage'
 
@@ -111,19 +111,19 @@ describe('contendAcquire', () => {
     assert.equal(turns, 3, 'the loop retried exactly as many times as the race demanded')
   })
 
-  test('exhaustion is corruption, not an outage', async () => {
-    // A storage that answers every call but keeps answering in a way the
-    // contract cannot describe is broken data, not a broken connection:
-    // classifying it as unavailable would let fail-open run unguarded
-    // forever over a deterministic misread.
+  test('exhaustion is contention, never corruption or an outage', async () => {
+    // Every lost turn means somebody held the key and let go a moment
+    // later (a burst of fast-failing requests releasing within one round
+    // trip). That is a key in use, so it surfaces as the retryable conflict
+    // the HTTP adapters answer with 409, not as a 500 on a healthy store;
+    // and being a quayside error, fail-open never runs unguarded over it.
     let turns = 0
     await assert.rejects(
       contendAcquire('k', async () => { turns += 1; return undefined }),
       (error: unknown) => {
-        assert.ok(error instanceof StorageCorruptError)
-        assert.equal(error.code, 'IDEMPOTENCY_STORAGE_CORRUPT')
+        assert.ok(error instanceof ConcurrentExecutionError)
+        assert.equal(error.code, 'IDEMPOTENCY_IN_PROGRESS')
         assert.equal(error.key, 'k')
-        assert.match(error.message, new RegExp(`after ${MAX_ACQUIRE_ATTEMPTS} attempts`))
         return true
       }
     )

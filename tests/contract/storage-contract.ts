@@ -192,6 +192,20 @@ export function runStorageContract (name: string, createStorage: StorageFactory)
       assert.equal(await storage.get('k1'), null)
     })
 
+    test('keys are compared byte for byte: case is significant', async () => {
+      // A store whose key comparison folds case (a MySQL column under a
+      // case-insensitive collation) would hand one caller's record to
+      // another whose key differs only by case: a spurious reuse error, or
+      // a replayed response that belongs to a different intent.
+      const storage = await createStorage()
+      await storage.delete('K1')
+      assert.equal(await storage.acquire(pending('k1', 'lower'), 1_000), null)
+      assert.equal(await storage.acquire(pending('K1', 'upper'), 1_000), null, 'a case variant is a different key')
+      assert.equal((await storage.get('k1'))?.token, 'lower')
+      assert.equal((await storage.get('K1'))?.token, 'upper')
+      await storage.delete('K1')
+    })
+
     test('keys are stored faithfully or rejected, never truncated', async () => {
       const storage = await createStorage()
       const longKey = `ns:${'x'.repeat(600)}:suffix`

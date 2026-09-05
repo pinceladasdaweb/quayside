@@ -1,11 +1,22 @@
-// Runtime values come from the core entry point, never from deep module
-// paths: error identity (instanceof) must hold across entry points, so the
-// build maps the core specifiers onto the shipped core bundle instead of
-// inlining private copies. That covers the shared storage helpers too -
-// contendAcquire, assertKeyBytes and buildStoredRecord throw core error
-// classes.
+// Runtime imports come from '../index' on purpose: see the note above the
+// storage exports in src/index.ts.
 import { FencingError, RECORD_STATUS, assertKeyBytes, buildStoredRecord, contendAcquire } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
+
+// The schema both dialects share, stated once: the DDL builders, the
+// statements and the constructor defaults all read these, so the key
+// column's declared capacity and the byte guard protecting it can never
+// be configured apart.
+export const DEFAULT_TABLE = 'quayside_records'
+export const KEY_COLUMN = 'record_key'
+export const DEFAULT_MAX_KEY_BYTES = 512
+
+/** The key column capacity is interpolated into DDL, so it must be a whole positive number. */
+export function assertKeyCapacity (maxKeyBytes: number): void {
+  if (!Number.isInteger(maxKeyBytes) || maxKeyBytes <= 0) {
+    throw new TypeError(`maxKeyBytes must be a positive integer, got ${String(maxKeyBytes)}`)
+  }
+}
 
 /**
  * The dialect-specific SQL. Both adapters share one algorithm; only the
@@ -54,15 +65,16 @@ export interface SqlDialect {
 export function buildStatements (table: string, dialect: SqlDialect): SqlStatements {
   const p = (index: number): string => dialect.placeholder(index)
   const inProgress = `'${RECORD_STATUS.inProgress}'`
+  const key = KEY_COLUMN
   return {
-    insert: dialect.insertIfAbsent(`${table} (record_key, token, status, fingerprint, stored_at, expires_at) VALUES (${p(1)}, ${p(2)}, ${inProgress}, ${p(3)}, ${p(4)}, ${p(5)})`),
-    takeover: `UPDATE ${table} SET token = ${p(1)}, status = ${inProgress}, fingerprint = ${p(2)}, result = NULL, error = NULL, stored_at = ${p(3)}, expires_at = ${p(4)} WHERE record_key = ${p(5)} AND expires_at <= ${p(6)}`,
-    select: `SELECT record_key, token, status, fingerprint, result, error, stored_at, expires_at FROM ${table} WHERE record_key = ${p(1)} AND expires_at > ${p(2)}`,
-    completeResult: `UPDATE ${table} SET status = '${RECORD_STATUS.completed}', result = ${p(1)}, expires_at = ${p(2)} WHERE record_key = ${p(3)} AND token = ${p(4)} AND status = ${inProgress} AND expires_at > ${p(5)}`,
-    completeError: `UPDATE ${table} SET status = '${RECORD_STATUS.failed}', error = ${p(1)}, expires_at = ${p(2)} WHERE record_key = ${p(3)} AND token = ${p(4)} AND status = ${inProgress} AND expires_at > ${p(5)}`,
-    release: `DELETE FROM ${table} WHERE record_key = ${p(1)} AND token = ${p(2)} AND status = ${inProgress} AND expires_at > ${p(3)}`,
-    extend: `UPDATE ${table} SET expires_at = ${p(1)} WHERE record_key = ${p(2)} AND token = ${p(3)} AND status = ${inProgress} AND expires_at > ${p(4)}`,
-    remove: `DELETE FROM ${table} WHERE record_key = ${p(1)}`,
+    insert: dialect.insertIfAbsent(`${table} (${key}, token, status, fingerprint, stored_at, expires_at) VALUES (${p(1)}, ${p(2)}, ${inProgress}, ${p(3)}, ${p(4)}, ${p(5)})`),
+    takeover: `UPDATE ${table} SET token = ${p(1)}, status = ${inProgress}, fingerprint = ${p(2)}, result = NULL, error = NULL, stored_at = ${p(3)}, expires_at = ${p(4)} WHERE ${key} = ${p(5)} AND expires_at <= ${p(6)}`,
+    select: `SELECT ${key}, token, status, fingerprint, result, error, stored_at, expires_at FROM ${table} WHERE ${key} = ${p(1)} AND expires_at > ${p(2)}`,
+    completeResult: `UPDATE ${table} SET status = '${RECORD_STATUS.completed}', result = ${p(1)}, expires_at = ${p(2)} WHERE ${key} = ${p(3)} AND token = ${p(4)} AND status = ${inProgress} AND expires_at > ${p(5)}`,
+    completeError: `UPDATE ${table} SET status = '${RECORD_STATUS.failed}', error = ${p(1)}, expires_at = ${p(2)} WHERE ${key} = ${p(3)} AND token = ${p(4)} AND status = ${inProgress} AND expires_at > ${p(5)}`,
+    release: `DELETE FROM ${table} WHERE ${key} = ${p(1)} AND token = ${p(2)} AND status = ${inProgress} AND expires_at > ${p(3)}`,
+    extend: `UPDATE ${table} SET expires_at = ${p(1)} WHERE ${key} = ${p(2)} AND token = ${p(3)} AND status = ${inProgress} AND expires_at > ${p(4)}`,
+    remove: `DELETE FROM ${table} WHERE ${key} = ${p(1)}`,
     sweep: `DELETE FROM ${table} WHERE expires_at <= ${p(1)}`
   }
 }
@@ -95,9 +107,11 @@ function mapRow (key: string, row: Record<string, unknown>): StoredRecord {
 export class SqlStorageCore implements IdempotencyStorage {
   private readonly run: SqlRunner
   private readonly statements: SqlStatements
-  private readonly maxKeyBytes: number
+  /** The key column's byte capacity; the dialect's migrate() declares the column from it. */
+  protected readonly maxKeyBytes: number
 
   constructor (run: SqlRunner, statements: SqlStatements, maxKeyBytes: number) {
+    assertKeyCapacity(maxKeyBytes)
     this.run = run
     this.statements = statements
     this.maxKeyBytes = maxKeyBytes
@@ -126,7 +140,10 @@ export class SqlStorageCore implements IdempotencyStorage {
   async complete (key: string, token: string, outcome: Outcome, resultTtlMs: number): Promise<void> {
     const statement = outcome.status === 'completed' ? this.statements.completeResult : this.statements.completeError
     const payload = outcome.status === 'completed' ? outcome.result : outcome.error
-    const applied = await this.run(statement, [payload, Date.now() + resultTtlMs, key, token, Date.now()])
+    // One clock sample per statement: the expiry written and the fence's
+    // `now` are the same instant, not two.
+    const now = Date.now()
+    const applied = await this.run(statement, [payload, now + resultTtlMs, key, token, now])
     if (applied.affected !== 1) throw new FencingError(key)
   }
 
@@ -136,7 +153,8 @@ export class SqlStorageCore implements IdempotencyStorage {
   }
 
   async extend (key: string, token: string, lockTtlMs: number): Promise<void> {
-    const applied = await this.run(this.statements.extend, [Date.now() + lockTtlMs, key, token, Date.now()])
+    const now = Date.now()
+    const applied = await this.run(this.statements.extend, [now + lockTtlMs, key, token, now])
     if (applied.affected === 1) return
     // MySQL reports zero affected rows for a no-change update (two extends
     // inside the same millisecond); a held lock makes the extend a no-op

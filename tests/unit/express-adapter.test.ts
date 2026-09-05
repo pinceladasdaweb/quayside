@@ -254,10 +254,88 @@ describe('express adapter glue', () => {
         if (chunk !== undefined && chunk !== null && typeof chunk !== 'function') res.body += String(chunk)
         return res
       },
+      // Node's writeHead sends headers without recording them in the
+      // header map, exactly the behaviour the adapter has to work around.
+      writeHead (status: unknown, ..._args: unknown[]) {
+        res.statusCode = status as number
+        return res
+      },
       headers
     }
     return res
   }
+
+  test('headers passed only to writeHead are replayed', async () => {
+    // Express's own X-Powered-By setHeader normally initializes the header
+    // map, but with it disabled a handler doing writeHead(201, { Location })
+    // sends headers getHeader() never sees; the replay must still carry them.
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency)
+    const request = { method: 'POST', path: '/fake', body: { n: 1 }, headers: { 'idempotency-key': 'write-head' } }
+    let handled = 0
+    const roundTrip = async () => await new Promise<ReturnType<typeof fakeResponse>>((resolve) => {
+      const res = fakeResponse()
+      middleware(request, res, () => {
+        handled += 1
+        res.writeHead(201, 'Created', { Location: '/orders/9', 'Content-Type': 'text/plain' })
+        res.end('created')
+        setImmediate(() => resolve(res))
+      })
+      setImmediate(() => setImmediate(() => resolve(res)))
+    })
+    await roundTrip()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const replayed = await roundTrip()
+    assert.equal(handled, 1)
+    assert.equal(replayed.statusCode, 201)
+    assert.equal(replayed.headers.location, '/orders/9', 'the Location only writeHead saw is replayed')
+    assert.equal(replayed.headers['content-type'], 'text/plain')
+    assert.equal(replayed.headers['idempotency-replayed'], 'true')
+  })
+
+  test('writeHead without a headers object records nothing and still answers', async () => {
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const middleware = ExpressMiddleware(idempotency)
+    const request = { method: 'POST', path: '/fake', body: undefined, headers: { 'idempotency-key': 'write-head-bare' } }
+    const res = fakeResponse()
+    const original = res.writeHead
+    await new Promise<void>((resolve) => {
+      middleware(request, res, () => {
+        assert.notEqual(res.writeHead, original, 'the capture wraps writeHead while the chain runs')
+        res.writeHead(204)
+        res.end()
+        setImmediate(resolve)
+      })
+    })
+    assert.equal(res.statusCode, 204)
+    assert.equal(res.writeHead, original, 'and restores it once the response ended')
+  })
+
+  test('the request path handed to the kernel includes the mount point', async () => {
+    // Express strips the mount prefix before a mounted middleware runs, so
+    // req.path alone would let the same key + body under /v1 and /v2 replay
+    // across mounts instead of answering 422 with 'body-and-path'.
+    const idempotency = new Idempotency({ storage: new MemoryStorage() })
+    const seen: string[] = []
+    const middleware = ExpressMiddleware(idempotency, {
+      fingerprint: (facts) => {
+        seen.push(facts.path)
+        return facts.body
+      }
+    })
+    const mounted = { method: 'POST', path: '/orders', baseUrl: '/v1', body: {}, headers: { 'idempotency-key': 'mounted' } }
+    const bare = { method: 'POST', path: '/orders', body: {}, headers: { 'idempotency-key': 'bare' } }
+    for (const request of [mounted, bare]) {
+      const res = fakeResponse()
+      await new Promise<void>((resolve) => {
+        middleware(request, res, () => {
+          res.end('ok')
+          setImmediate(resolve)
+        })
+      })
+    }
+    assert.deepEqual(seen, ['/v1/orders', '/orders'])
+  })
 
   test('takes the first value of an array header', async () => {
     const idempotency = new Idempotency({ storage: new MemoryStorage() })
