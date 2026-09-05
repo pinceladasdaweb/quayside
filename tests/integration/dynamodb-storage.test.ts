@@ -13,7 +13,7 @@ import {
 } from '@aws-sdk/client-dynamodb'
 import { GenericContainer, Wait, type StartedTestContainer } from 'testcontainers'
 
-import { Idempotency, SerializationError, StorageCorruptError } from '../../src/index'
+import { ConcurrentExecutionError, Idempotency, SerializationError, StorageCorruptError } from '../../src/index'
 import { DynamoStorage } from '../../src/dynamodb/index'
 import { runStorageContract } from '../contract/storage-contract'
 
@@ -179,7 +179,7 @@ describe('DynamoStorage specifics', () => {
     )
   })
 
-  test('exhausting the contention loop is corruption, not an outage', async () => {
+  test('exhausting the contention loop is contention, never corruption or an outage', async () => {
     // A structural stub whose put always loses its condition and whose get
     // never sees a record: the storage answers every call, so the failure
     // is data the contract cannot describe, never an outage fail-open may
@@ -202,9 +202,10 @@ describe('DynamoStorage specifics', () => {
     await assert.rejects(
       stub.acquire({ key: 'starved', token: 't', storedAt: Date.now() }, 1_000),
       (error: unknown) => {
-        assert.ok(error instanceof StorageCorruptError)
-        assert.equal(error.code, 'IDEMPOTENCY_STORAGE_CORRUPT')
-        assert.match(error.message, /after 5 attempts/)
+        // Every lost turn means the key was held by someone who let go a
+        // moment later: a key in use, so the retryable conflict, not a 500.
+        assert.ok(error instanceof ConcurrentExecutionError)
+        assert.equal(error.code, 'IDEMPOTENCY_IN_PROGRESS')
         return true
       }
     )

@@ -1,4 +1,4 @@
-import { IdempotencyKeyInvalidError, StorageCorruptError } from './errors'
+import { ConcurrentExecutionError, IdempotencyKeyInvalidError, StorageCorruptError } from './errors'
 
 export const RECORD_STATUS = {
   inProgress: 'in-progress',
@@ -72,10 +72,12 @@ export function buildStoredRecord (key: string, fields: RawRecordFields): Stored
  * The bounded acquire-contention loop every adapter shares. One `attempt`
  * is the adapter's atomic acquire plus its conflict read; it resolves to
  * `null` (acquired), a record (somebody live holds the key) or `undefined`
- * (the holder expired between the two steps: contend again). Exhausting the
- * attempts is corruption, not an outage - the storage answered every call,
- * it just kept answering in a way the contract cannot describe - so
- * fail-open must not run unguarded over it.
+ * (the holder vanished between the two steps: contend again). Every lost
+ * turn means the key WAS held by someone who released or expired a moment
+ * later, so exhausting the attempts is contention, not corruption or an
+ * outage: it surfaces as ConcurrentExecutionError, which the HTTP adapters
+ * answer with a retryable 409, and which fail-open never runs unguarded
+ * over (it is a QuaysideError, not a storage failure).
  */
 export async function contendAcquire (
   key: string,
@@ -85,7 +87,7 @@ export async function contendAcquire (
     const outcome = await attempt()
     if (outcome !== undefined) return outcome
   }
-  throw new StorageCorruptError(key, `could not acquire or observe key "${key}" after ${MAX_ACQUIRE_ATTEMPTS} attempts`)
+  throw new ConcurrentExecutionError(key)
 }
 
 /**

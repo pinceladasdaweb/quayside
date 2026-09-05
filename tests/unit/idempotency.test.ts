@@ -1248,4 +1248,118 @@ describe('an outcome the storage refuses as unstorable', () => {
     const record = await memory.get('outage')
     assert.equal(record?.status, 'in-progress', 'the lock stays until its TTL decides')
   })
+
+  test('a persisted failure the storage refuses as unstorable is released, an outage is not', async () => {
+    // The failure path mirrors the success path: a SerializationError from
+    // complete() (DynamoDB's item limit applies to error payloads too)
+    // releases the record so callers may retry, while the caller's own
+    // failure still surfaces. An outage on the same write keeps the lock.
+    const refused = async (behaviour: 'refuse' | 'outage') => {
+      const memory = new MemoryStorage()
+      let released = 0
+      const storage: IdempotencyStorage = {
+        acquire: (record, ttl) => memory.acquire(record, ttl),
+        complete: async () => {
+          throw behaviour === 'refuse' ? new SerializationError('too large') : new Error('connection reset')
+        },
+        release: async (key, token) => { released += 1; await memory.release(key, token) },
+        extend: (key, token, ttl) => memory.extend(key, token, ttl),
+        get: (key) => memory.get(key),
+        delete: (key) => memory.delete(key)
+      }
+      const idempotency = new Idempotency({ storage, persistFailures: true })
+      await assert.rejects(idempotency.execute('failing', async () => { throw new Error('boom') }), /boom/)
+      return { released, record: await memory.get('failing') }
+    }
+    const refusedOutcome = await refused('refuse')
+    assert.equal(refusedOutcome.released, 1, 'the unstorable failure released the record')
+    assert.equal(refusedOutcome.record, null, 'so a retry re-executes')
+    const outageOutcome = await refused('outage')
+    assert.equal(outageOutcome.released, 0, 'an outage on the failure path is not answered with a release')
+    assert.equal(outageOutcome.record?.status, 'in-progress')
+  })
+})
+
+describe('caller-input validation never dresses as storage trouble', () => {
+  test('an invalid per-call resultTtl is rejected before the lock is taken', async () => {
+    const storage = new MemoryStorage()
+    const events: string[] = []
+    const idempotency = new Idempotency({ storage, onEvent: (event) => events.push(event.type) })
+    let ran = 0
+    for (const bad of ['1w', 0, 'nonsense'] as const) {
+      await assert.rejects(
+        idempotency.execute({ key: 'ttl-bad', resultTtl: bad as never }, async () => { ran += 1 }),
+        (error: unknown) => error instanceof TypeError || error instanceof RangeError
+      )
+    }
+    assert.equal(ran, 0)
+    assert.deepEqual(events, [], 'nothing was acquired, so nothing was reported')
+    assert.equal(await storage.get('ttl-bad'), null, 'no record was left in progress')
+    // The corrected retry runs instead of meeting its own stale lock.
+    assert.equal(await idempotency.execute({ key: 'ttl-bad', resultTtl: '1h' }, async () => 'ran'), 'ran')
+  })
+
+  test('get() and invalidate() reject an empty key as a TypeError, like execute()', async () => {
+    const idempotency = instance()
+    await assert.rejects(idempotency.get(''), TypeError)
+    await assert.rejects(idempotency.invalidate(''), TypeError)
+    await assert.rejects(idempotency.get(''), (error: unknown) => !(error instanceof StorageUnavailableError))
+  })
+
+  test('an invalid extend() duration is the caller\'s error, not an outage fail-open may wave through', async () => {
+    const events: string[] = []
+    const idempotency = instance({ onStorageError: 'open', onEvent: (event) => events.push(event.type) })
+    await assert.rejects(
+      idempotency.execute('extend-bad', async (ctx) => { await ctx.extend('60') }),
+      TypeError
+    )
+    assert.ok(!events.includes('storage-bypass'), 'a typo in a duration is not a storage outage')
+  })
+})
+
+describe('own record after a resent acquire', () => {
+  test('a record carrying the caller\'s own token counts as acquired, not as a competitor', async () => {
+    // A driver that resends an acquire whose reply was lost (ioredis does
+    // by default) reads the record the first attempt wrote back as a
+    // conflict. The engine minted the token, so the engine recognizes it.
+    const memory = new MemoryStorage()
+    const storage: IdempotencyStorage = {
+      acquire: async (record, ttl) => {
+        // The first write lands; the "resent" second write meets its own record.
+        await memory.acquire(record, ttl)
+        return memory.acquire(record, ttl)
+      },
+      complete: (key, token, outcome, ttl) => memory.complete(key, token, outcome, ttl),
+      release: (key, token) => memory.release(key, token),
+      extend: (key, token, ttl) => memory.extend(key, token, ttl),
+      get: (key) => memory.get(key),
+      delete: (key) => memory.delete(key)
+    }
+    const events: string[] = []
+    const idempotency = new Idempotency({ storage, onEvent: (event) => events.push(event.type) })
+    assert.equal(await idempotency.execute('resent', async () => 'ran'), 'ran')
+    assert.deepEqual(events, ['acquired', 'completed'], 'no conflict was ever reported')
+    assert.equal(await idempotency.execute('resent', async () => 'again'), 'ran', 'and the result replays')
+  })
+})
+
+describe('event timing', () => {
+  test('a terminal event\'s timestamp minus its duration is exactly the instant the call started', async () => {
+    // One clock sample serves both fields; the OTel collector backdates its
+    // spans by exactly this subtraction.
+    const clock = new ManualClock(10_000)
+    const events: IdempotencyEvent[] = []
+    const idempotency = instance({ clock, onEvent: (event) => events.push(event) })
+    await idempotency.execute('timed', async () => { clock.advance(250) })
+    const completed = events.find((event) => event.type === 'completed')
+    assert.ok(completed)
+    assert.equal(completed.durationMs, 250)
+    assert.equal(completed.timestamp - (completed.durationMs ?? 0), 10_000)
+    clock.advance(40)
+    await idempotency.execute('timed', async () => {})
+    const replayed = events.find((event) => event.type === 'replayed')
+    assert.ok(replayed)
+    assert.equal(replayed.durationMs, 0, 'the replay took no clock time')
+    assert.equal(replayed.timestamp, 10_290)
+  })
 })

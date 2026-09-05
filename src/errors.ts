@@ -86,8 +86,8 @@ export class SerializationError extends QuaysideError {
 
 /**
  * The storage answered, but with something the record contract cannot
- * describe: a row or wire record whose status is not a known state, or an
- * acquire that kept losing its race until the bounded retries ran out.
+ * describe: a row or wire record whose status is not a known state, a
+ * token that is not a string, a value under the key that is not a record.
  * Deliberately not a StorageUnavailableError: the storage is healthy, so
  * fail-open must not treat it as an outage and run unguarded forever on a
  * key whose record will keep decoding the same way.
