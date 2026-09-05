@@ -1,7 +1,5 @@
-// Runtime values come from the core entry point, never from deep module
-// paths: error identity (instanceof) must hold across entry points, so the
-// build maps '../index' onto the shipped core bundle instead of inlining a
-// private copy.
+// Runtime imports come from '../index' on purpose: see the note above the
+// storage exports in src/index.ts.
 import { FencingError, RECORD_STATUS } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
 
