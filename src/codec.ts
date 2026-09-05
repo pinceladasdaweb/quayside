@@ -10,10 +10,30 @@ export interface Codec {
 // '"undefined"').
 const UNDEFINED_TOMBSTONE = 'undefined'
 
+// Objects whose JSON form is not their value: no toJSON to catch, no own
+// enumerable keys to speak of (or index keys that lose the type), so
+// JSON.stringify quietly turns them into `{}` or an index object and the
+// replay hands back something the function never returned. Buffer is
+// absent from the list only because its own toJSON already trips the
+// conversion check. Every test here is false for primitives and null, so
+// the caller needs no object guard in front.
+function isLossyInJson (value: unknown): boolean {
+  return value instanceof Map ||
+    value instanceof Set ||
+    value instanceof WeakMap ||
+    value instanceof WeakSet ||
+    value instanceof ArrayBuffer ||
+    value instanceof SharedArrayBuffer ||
+    ArrayBuffer.isView(value) ||
+    value instanceof RegExp ||
+    value instanceof Promise ||
+    value instanceof Error
+}
+
 // JSON.stringify silently drops or mangles these (omitted properties,
-// NaN turned into null): a stored result that differs from what the
-// function returned is a silent correctness bug, so encoding fails loudly
-// instead.
+// NaN turned into null, collections turned into `{}`): a stored result
+// that differs from what the function returned is a silent correctness
+// bug, so encoding fails loudly instead.
 function assertReplaceable (value: unknown): unknown {
   if (typeof value === 'function' || typeof value === 'symbol') {
     throw new SerializationError(`value of type ${typeof value} is not JSON-serializable`)
@@ -26,6 +46,12 @@ function assertReplaceable (value: unknown): unknown {
   }
   if (value === undefined) {
     throw new SerializationError('nested undefined values are not JSON-serializable; only a top-level undefined result is supported')
+  }
+  if (isLossyInJson(value)) {
+    // Every shape on the list is a built-in class instance, so the
+    // constructor name is always there to blame.
+    const name = (value as { constructor: { name: string } }).constructor.name
+    throw new SerializationError(`${name} values are not JSON-serializable: JSON would store them as an empty or index object, not as the value the function returned; convert them to plain arrays or objects first`)
   }
   return value
 }
