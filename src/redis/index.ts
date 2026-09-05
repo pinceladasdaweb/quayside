@@ -1,11 +1,8 @@
 import { createHash } from 'node:crypto'
 import { setTimeout as sleep } from 'node:timers/promises'
 
-// Runtime values come from the core entry point, never from deep module
-// paths: error identity (instanceof) must hold across entry points, so the
-// build maps the core specifiers onto the shipped core bundle instead of
-// inlining private copies. That covers the shared storage helpers too -
-// contendAcquire and buildStoredRecord throw core error classes.
+// Runtime imports come from '../index' on purpose: see the note above the
+// storage exports in src/index.ts.
 import { FencingError, RECORD_STATUS, StorageCorruptError, buildStoredRecord, contendAcquire } from '../index'
 import type { IdempotencyStorage, Outcome, PendingRecord, StoredRecord } from '../index'
 
@@ -131,6 +128,12 @@ function parseWireRecord (key: string, raw: string): StoredRecord {
     // unguarded forever over a deterministic misread.
     throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}": value is not valid JSON`)
   }
+  // Valid JSON that is not an object (`null`, a number, a string) is the
+  // same defect: reading fields off it would throw a bare TypeError, which
+  // the engine could only classify as an outage.
+  if (wire === null || typeof wire !== 'object') {
+    throw new StorageCorruptError(key, `corrupt idempotency record under key "${key}": value is not a record`)
+  }
   return buildStoredRecord(key, {
     token: wire.token,
     status: wire.status,
@@ -222,14 +225,27 @@ export class RedisStorage implements IdempotencyStorage {
       await sleep(timeoutMs)
       return
     }
-    let channel: string
+    const started = Date.now()
+    let channel: string | undefined
     try {
-      channel = await this.ensureSubscribed(key)
+      channel = await this.subscribedWithin(key, timeoutMs)
     } catch {
       // No subscription support (no duplicate(), subscribe refused):
       // degrade permanently to plain polling.
       this.subscribeEnabled = false
       await sleep(timeoutMs)
+      return
+    }
+    // timeoutMs is the caller's whole budget for this wait (the engine's
+    // polling pause, measured against its deadline), so whatever the
+    // subscription took comes out of it.
+    const remaining = timeoutMs - (Date.now() - started)
+    if (channel === undefined || remaining <= 0) {
+      // The channel did not come up in time (a subscriber connection mid-
+      // reconnect keeps SUBSCRIBE in the driver's offline queue for far
+      // longer than a poll): this wait falls back to plain polling and the
+      // next one finds the subscription warm, or tries again.
+      if (remaining > 0) await sleep(remaining)
       return
     }
     await new Promise<void>((resolve) => {
@@ -238,7 +254,7 @@ export class RedisStorage implements IdempotencyStorage {
         this.waiters.get(channel)?.delete(waiter)
         resolve()
       }
-      const timer = setTimeout(waiter, timeoutMs)
+      const timer = setTimeout(waiter, remaining)
       let channelWaiters = this.waiters.get(channel)
       if (channelWaiters === undefined) {
         channelWaiters = new Set()
@@ -319,6 +335,22 @@ export class RedisStorage implements IdempotencyStorage {
     return `__keyspace@${db}__:${prefix}${key}`
   }
 
+  /**
+   * The channel for `key`, or undefined when the subscription is not up
+   * within `timeoutMs`. A late subscription is not abandoned: it keeps
+   * settling in the background so the next waiter finds it warm, and if
+   * nobody is waiting by then it lingers and unsubscribes like any other.
+   * Its eventual rejection is observed here so a lost race never surfaces
+   * as an unhandled rejection; the next waiter meets the same failure
+   * through its own await.
+   */
+  private async subscribedWithin (key: string, timeoutMs: number): Promise<string | undefined> {
+    const subscription = this.ensureSubscribed(key)
+    subscription.then((channel) => { this.releaseChannel(channel) }, () => {})
+    const budget = sleep(timeoutMs, undefined, { ref: false }).then(() => undefined)
+    return Promise.race([subscription, budget])
+  }
+
   private async ensureSubscribed (key: string): Promise<string> {
     const channel = this.channelFor(key)
     const linger = this.lingering.get(channel)
@@ -342,8 +374,9 @@ export class RedisStorage implements IdempotencyStorage {
 
   private async subscribeTo (channel: string): Promise<unknown> {
     if (this.managed !== undefined) {
-      return this.managed.subscribe(channel, (_message, notified) => {
-        this.notify(notified ?? channel)
+      // An exact-channel subscription only ever fires for its own channel.
+      return this.managed.subscribe(channel, () => {
+        this.notify(channel)
       })
     }
     const subscriber = this.subscriber()
