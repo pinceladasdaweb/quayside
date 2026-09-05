@@ -52,6 +52,12 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The declaration bundles are checked the way a consumer sees them:
+      # the unit suite loads src/, so only a compile against dist/ catches a
+      # class inlined twice across entry points (nominal types, TS2345).
+      - name: Consumer type check (built declarations)
+        run: npx tsc -p tests/consumer/tsconfig.json
+
       # The public API is frozen: the build fails when exports drift from
       # the committed API report (etc/quayside.api.md).
       - name: API report check
